@@ -1,0 +1,17 @@
+<!-- Changelog for the ModDB file upload of Komet_v1.1.0.zip. Paste into the file's
+     changelog field; works as plain text too if the field strips markup. -->
+<p><strong>New</strong></p>
+<ul>
+<li><strong>Visible border holes close first.</strong> While chunks stream in, the repair of an already-visible chunk border used to wait at the back of the tesselation queue, behind thousands of chunks nobody can see yet &mdash; up to several seconds of staring at a hole in the terrain (most obvious on the ocean surface). These repairs now jump the queue and upload immediately. Capped so block edits are never delayed noticeably; toggle live with <code>.komet toggle edgeprio</code>.</li>
+<li><strong>Allocation attribution.</strong> The F7 HUD and <code>.komet report</code> now split the process allocation rate by thread (main / network / prefetch / tesselation / rest) &mdash; the number that matters when hunting GC stutter.</li>
+</ul>
+<p><strong>Changed</strong></p>
+<ul>
+<li><strong>Minimum game version is now 1.22.0</strong> (was 1.22.7). Built and verified against 1.22.7; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually &mdash; the game keeps running vanilla in that spot.</li>
+<li><strong>Config layout is now version 2</strong> (new setting <code>EdgeRetessPriority</code>). An existing <code>komet.json</code> is backed up next to itself and regenerated with defaults &mdash; re-apply any custom values afterwards.</li>
+<li><strong>KometBaseline is now its own download</strong> on this page: the measurement-only twin with the same F7 HUD and none of the optimisations. Disable Komet, enable the baseline, and read the same numbers for vanilla on your own world.</li>
+</ul>
+<p><strong>Internals</strong></p>
+<ul>
+<li>The edge-priority stat row always shows its sweep count while the feature is on, so a healthy-but-idle feature can never look like a broken one.</li>
+</ul>

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>KometVerify</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <VsInstall Condition="'$(VsInstall)' == ''">/opt/vintagestory</VsInstall>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- KometModSystem is compiled in on purpose: the "every patch class is reachable"
+         check reflects over its IL. Excluding it is what let a dead patch ship. -->
+    <Compile Include="../src/**/*.cs" Exclude="../src/AssemblyInfo.cs" />
+    <Compile Include="../shared/**/*.cs" LinkBase="shared" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI"><HintPath>$(VsInstall)/VintagestoryAPI.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="VintagestoryLib"><HintPath>$(VsInstall)/VintagestoryLib.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Core"><HintPath>$(VsInstall)/Lib/OpenTK.Core.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(VsInstall)/Lib/0Harmony.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="cairo-sharp"><HintPath>$(VsInstall)/Lib/cairo-sharp.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="SkiaSharp"><HintPath>$(VsInstall)/Lib/SkiaSharp.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="protobuf-net"><HintPath>$(VsInstall)/Lib/protobuf-net.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(VsInstall)/Lib/Newtonsoft.Json.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Graphics"><HintPath>$(VsInstall)/Lib/OpenTK.Graphics.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Mathematics"><HintPath>$(VsInstall)/Lib/OpenTK.Mathematics.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Windowing.Desktop"><HintPath>$(VsInstall)/Lib/OpenTK.Windowing.Desktop.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Windowing.GraphicsLibraryFramework"><HintPath>$(VsInstall)/Lib/OpenTK.Windowing.GraphicsLibraryFramework.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="OpenTK.Windowing.Common"><HintPath>$(VsInstall)/Lib/OpenTK.Windowing.Common.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,94 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Komet</AssemblyName>
+    <RootNamespace>Komet</RootNamespace>
+    <Version>1.1.0</Version>
+    <!-- Build stamp: the minute this DLL was compiled, carried in the InformationalVersion and
+         shown next to the version in HUD, report and chat line (see shared/KometVersion.cs).
+         Computed here rather than kept in a file, so it can never disagree with the binary. -->
+    <KometBuild Condition="'$(KometBuild)' == ''">$([System.DateTime]::Now.ToString('yyMMdd.HHmm'))</KometBuild>
+    <InformationalVersion>$(Version)+$(KometBuild)</InformationalVersion>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Optimize>true</Optimize>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <VsInstall Condition="'$(VsInstall)' == ''">/opt/vintagestory</VsInstall>
+    <VsData Condition="'$(VsData)' == ''">$(HOME)/.config/VintagestoryData</VsData>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="baseline/**" />
+    <Compile Remove="bench/**" />
+    <Compile Remove="verify/**" />
+    <Compile Remove="_analysis/**" />
+    <Compile Remove="**/bin/**" />
+    <Compile Remove="**/obj/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VsInstall)/VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VsInstall)/VintagestoryLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Graphics">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Graphics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Mathematics">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Core">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Windowing.Desktop">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Windowing.Desktop.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Windowing.GraphicsLibraryFramework">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Windowing.GraphicsLibraryFramework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OpenTK.Windowing.Common">
+      <HintPath>$(VsInstall)/Lib/OpenTK.Windowing.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(VsInstall)/Lib/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="cairo-sharp">
+      <HintPath>$(VsInstall)/Lib/cairo-sharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SkiaSharp">
+      <HintPath>$(VsInstall)/Lib/SkiaSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="protobuf-net">
+      <HintPath>$(VsInstall)/Lib/protobuf-net.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(VsInstall)/Lib/Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- "dotnet build -t:Deploy" drops the mod straight into the game's Mods folder -->
+  <Target Name="Deploy" AfterTargets="Build" Condition="'$(DeployToGame)' == 'true'">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(VsData)/Mods" />
+    <Message Importance="high" Text="deployed $(TargetFileName) -> $(VsData)/Mods" />
+  </Target>
+
+</Project>

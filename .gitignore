@@ -1,0 +1,36 @@
+# Build output
+bin/
+obj/
+dist/
+
+# Local analysis workspace (decompiled game assemblies — must never be published)
+_analysis/
+
+# Agent / AI tool state
+.claude/
+.aider*
+.cursor/
+# Agent memory notes live outside the repo (~/.claude/...); these names must never
+# land in it, not even via an accidental copy into the working tree
+MEMORY.md
+komet-mod.md
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+*.pfx
+*.snk
