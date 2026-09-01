@@ -179,10 +179,16 @@ public partial class KometModSystem : ModSystem
             HitchLog.TopRendererProvider = Patches.RendererProfiler.TopOfCurrentFrame;
 
             Patches.RendererProfiler.Enabled = config.ProfileRenderers;
+            // The Before stage (a handful of system renderers: entities, chunk uploads,
+            // liquid depth, camera ...) stays attributed even with the profiler off - it is
+            // where the unnamed world-join bursts live, and naming a hitch must not depend
+            // on having armed the profiler before it happened.
+            Patches.RendererProfiler.AttributeBeforeStage = config.AttributeBeforeStage;
             WrapRenderers();
         }, config.ProfileRenderers
             ? "per renderer profiling"
-            : "per renderer profiling off (vanilla dispatch); '.komet toggle profiler' enables it live");
+            : "per renderer profiling off (vanilla dispatch), before-stage attribution "
+              + (config.AttributeBeforeStage ? "on" : "off") + "; '.komet toggle profiler' enables the full set live");
 
         // Hitch log: every frame over the threshold is booked with its bucket breakdown and
         // the camera's turn/move rate for exactly that frame, so a stutter complaint can be
@@ -332,6 +338,16 @@ public partial class KometModSystem : ModSystem
                 Patches.UploadBudgetPatches.Apply(harmony);
                 uploadBudgetHooked = true;
             }, "adaptive chunk upload budget");
+
+        // Always applied, gated at runtime: whether a relight storm's uploads may be spread
+        // over frames is exactly the kind of question '.komet toggle prioupload' answers live.
+        Patch(() =>
+        {
+            Patches.PrioUploadPatches.Apply(harmony);
+            Patches.PrioUploadPatches.Enabled = config.BudgetPriorityUploads;
+        }, config.BudgetPriorityUploads
+            ? "priority chunk upload budget (storms spread over frames, player edits unaffected)"
+            : "priority chunk uploads unbudgeted (vanilla); '.komet toggle prioupload' enables the budget live");
 
         if (config.TesselationNoIdleSleep || config.TesselationThreadPriority || config.TesselationNeighbourPrefetch)
             Patch(() => Patches.TesselationPatches.Apply(harmony,
@@ -528,7 +544,8 @@ public partial class KometModSystem : ModSystem
         try
         {
             if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
-                Patches.RendererProfiler.Unwrap(EventManagerRef(game));
+                Patches.RendererProfiler.Unwrap(EventManagerRef(game),
+                    keepBeforeAttribution: Patches.RendererProfiler.AttributeBeforeStage);
         }
         catch (Exception e)
         {

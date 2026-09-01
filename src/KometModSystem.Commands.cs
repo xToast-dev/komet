@@ -310,6 +310,20 @@ public partial class KometModSystem
                     ? "AN (" + Patches.RendererProfiler.StatWrapped + " renderer gewickelt - kostet frame-zeit)"
                     : "AUS (vanilla-dispatch)");
                 break;
+            case "prioupload":
+                Patches.PrioUploadPatches.Enabled = !Patches.PrioUploadPatches.Enabled;
+                state = "prio-upload-budget " + (Patches.PrioUploadPatches.Enabled
+                    ? "AN (stuerme verteilen sich auf mehrere frames)"
+                    : "AUS (vanilla: prio-queue komplett in einem frame)");
+                break;
+            case "beforeattr":
+                Patches.RendererProfiler.AttributeBeforeStage = !Patches.RendererProfiler.AttributeBeforeStage;
+                if (Patches.RendererProfiler.AttributeBeforeStage) WrapRenderers();
+                else if (!Patches.RendererProfiler.Enabled) UnwrapRenderers();
+                state = "before-stage-attribution " + (Patches.RendererProfiler.AttributeBeforeStage
+                    ? "AN (ruckler-zeilen koennen den before-renderer nennen)"
+                    : "AUS (vanilla-dispatch in der before-stage)");
+                break;
             case "retess":
                 Patches.RetessSourcePatches.SampleSources = !Patches.RetessSourcePatches.SampleSources;
                 state = "dirty-mark-quellensampling " + (Patches.RetessSourcePatches.SampleSources
@@ -414,8 +428,8 @@ public partial class KometModSystem
                 break;
             default:
                 return "unbekannt. Systeme: cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
-                     + "prebuild, firepit, enttess, edgecoal, edgeprio, profiler, retess, cullcheck, cellsize, "
-                     + "shadowbox, shadowfade, shadowdist, shadowlod, shadowstab, shadowthrottle";
+                     + "prebuild, firepit, enttess, edgecoal, edgeprio, prioupload, profiler, beforeattr, retess, "
+                     + "cullcheck, cellsize, shadowbox, shadowfade, shadowdist, shadowlod, shadowstab, shadowthrottle";
         }
 
         string world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
@@ -531,6 +545,7 @@ public partial class KometModSystem
         Patches.MeshUploadPatches.StatBulkCalls = 0;
         Patches.MeshUploadPatches.StatFallbackCalls = 0;
         UploadBudget.Reset();
+        Patches.PrioUploadPatches.ResetStats();
         Patches.MeshRecyclerPatches.ResetStats();
         Patches.TightClonePatches.ResetStats();
         Patches.EdgeRetessPriorityPatches.StatPromoted = 0;
