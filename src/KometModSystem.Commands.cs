@@ -324,6 +324,12 @@ public partial class KometModSystem
                     ? "AN (ruckler-zeilen koennen den before-renderer nennen)"
                     : "AUS (vanilla-dispatch in der before-stage)");
                 break;
+            case "uploaddruck":
+                UploadBudget.FramePressureInput = !UploadBudget.FramePressureInput;
+                state = "upload-frame-druck " + (UploadBudget.FramePressureInput
+                    ? "AN (heisse frames mit laufenden uploads druecken das budget)"
+                    : "AUS (drossel sieht nur die upload-uhr, wie vor 01.09.)");
+                break;
             case "hudraster":
                 DebugHud.BackgroundRaster = !DebugHud.BackgroundRaster;
                 state = "hud-raster " + (DebugHud.BackgroundRaster
@@ -434,9 +440,9 @@ public partial class KometModSystem
                 break;
             default:
                 return "unbekannt. Systeme: cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
-                     + "prebuild, firepit, enttess, edgecoal, edgeprio, prioupload, profiler, beforeattr, retess, "
-                     + "hudraster, cullcheck, cellsize, shadowbox, shadowfade, shadowdist, shadowlod, shadowstab, "
-                     + "shadowthrottle";
+                     + "prebuild, firepit, enttess, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
+                     + "beforeattr, retess, hudraster, cullcheck, cellsize, shadowbox, shadowfade, shadowdist, "
+                     + "shadowlod, shadowstab, shadowthrottle";
         }
 
         string world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "

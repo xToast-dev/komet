@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "4";
+    public const string Current = "5";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -168,6 +168,15 @@ public class KometConfig
 
     /// <summary>Milliseconds per frame the upload throttle aims for.</summary>
     public double UploadBudgetTargetMs { get; set; } = 6.0;
+
+    /// <summary>
+    /// Let the upload throttle also react to the whole frame running hot (minus its GC
+    /// pause) while uploads are in flight. Under mesa_glthread the upload clock only sees
+    /// command recording - the driver pays the real copy later in opaque/swap, which is
+    /// where a field log's eight-hitch streaming burst lived while the throttle read 100 %.
+    /// '.komet toggle uploaddruck' flips it live.
+    /// </summary>
+    public bool UploadFramePressure { get; set; } = true;
 
     /// <summary>
     /// Also budget the PRIORITY chunk upload queue, which vanilla drains completely in a

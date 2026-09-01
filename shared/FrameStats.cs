@@ -102,6 +102,15 @@ public static class FrameStats
     public static double LastSwapMs { get; private set; }
     public static double LastShadowMs { get; private set; }
 
+    /// <summary>
+    /// Raised once per frame boundary, after the warmup gate, with the finished frame's
+    /// totals: (frameMs, avgFrameMs, gcPauseMs, uploadMs). For consumers that steer off
+    /// whole-frame pressure - the upload budget's second input lives here, because under a
+    /// threaded GL driver the cost of an upload surfaces in the frame, not in the upload
+    /// clock. Null in the baseline.
+    /// </summary>
+    public static Action<double, double, double, double> FrameSummary;
+
     // ---- garbage collector ---------------------------------------------------------
     // Sampled by the HUD once a second. The pause total is the number that matters: it is
     // time the runtime stopped every thread at once, which is the only mechanism that can
@@ -417,6 +426,11 @@ public static class FrameStats
                 HitchLog.OnFrame(frameMs, AvgFrameMs, gcPauseMs, hitchBuckets, gcTag,
                                  cullMs, uploadMsThisFrame, cullWaitTicks * TicksToMs,
                                  hudMsThisFrame, entityTessMsThisFrame);
+
+                // The finished frame's totals for anyone steering off them (the upload
+                // budget's frame-pressure input). Same warmup gate as the hitch log: the
+                // first frames after a join all look choked against a newborn average.
+                FrameSummary?.Invoke(frameMs, AvgFrameMs, gcPauseMs, uploadMsThisFrame);
             }
 
             if (TotalFrames >= WarmupFrames) HasData = true;
