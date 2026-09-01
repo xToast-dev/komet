@@ -30,7 +30,31 @@ public static class UploadBudget
     /// <summary>Milliseconds of chunk uploading per frame to aim for.</summary>
     public static double TargetMs = 6.0;
 
+    /// <summary>
+    /// Second pressure input: the frame itself. Under a threaded GL driver (mesa_glthread)
+    /// glBufferSubData only *records* - the driver thread pays the real copy later, wherever
+    /// its queue must drain: opaque, the swap, the event loop. The upload clock around
+    /// OnBeforeFrame then reads 0,6 ms while the frame chokes at 30. A field log showed
+    /// exactly that: an eight-hitch burst at second 64, opaque 16-26 ms each, and
+    /// "throttle 100 %" the whole way through - the controller could not see the cost it was
+    /// supposed to bound. This input cuts the budget when a frame ran hot in its own work
+    /// while uploads were in flight; GC pauses are subtracted first, because a frozen frame
+    /// is not upload pressure and must not be "fixed" by starving the terrain.
+    /// </summary>
+    public static bool FramePressureInput = true;
+
+    /// <summary>A frame counts as choked from this multiple of the rolling average on.</summary>
+    public static double PressureFactor = 1.75;
+
+    /// <summary>Frames the cheap-upload raise stays suppressed after a pressure cut - the
+    /// upload clock reads "under target" during the very burst the cut is answering, and
+    /// would otherwise raise the budget straight back within a frame or two.</summary>
+    public const int PressureHoldFrames = 8;
+
+    public static long StatPressureCuts { get; private set; }
+
     private static double gain = 1.0;
+    private static int pressureHold;
     private static readonly Stopwatch Watch = new();
 
     public static double Gain => gain;
@@ -83,11 +107,51 @@ public static class UploadBudget
         if (ms > TargetMs) correction = Math.Max(MaxCut, TargetMs / ms);
         else if (ms < TargetMs * 0.75) correction = ms > 0.05 ? Math.Min(MaxRaise, TargetMs / ms) : MaxRaise;
         else correction = 1.0;
+
+        // A frame that choked on deferred driver work outranks a cheap upload clock: while
+        // the pressure hold runs, "uploads were under target" may not raise the budget.
+        if (correction > 1.0 && pressureHold > 0)
+        {
+            pressureHold--;
+            correction = 1.0;
+        }
         gain *= correction;
 
         // Capped at 1.0 so the throttle can only ever reduce vanilla's budget.
         if (gain > 1.0) gain = 1.0;
         else if (gain < 0.02) gain = 0.02;
+    }
+
+    /// <summary>
+    /// Fed once per frame boundary with the finished frame's totals (via
+    /// FrameStats.FrameSummary). Applies the pure rule below and remembers the cut so the
+    /// upload-clock raise cannot immediately undo it.
+    /// </summary>
+    public static void NotePressure(double frameMs, double avgFrameMs, double gcPauseMs, double uploadMs)
+    {
+        if (!Enabled || !FramePressureInput) return;
+        double correction = PressureCorrection(frameMs, avgFrameMs, gcPauseMs, uploadMs, PressureFactor);
+        if (correction >= 1.0) return;
+        gain *= Math.Max(MaxCut, correction);
+        if (gain < 0.02) gain = 0.02;
+        pressureHold = PressureHoldFrames;
+        StatPressureCuts++;
+    }
+
+    /// <summary>
+    /// The pure pressure rule: 1.0 = leave the budget alone. A frame counts as choked when
+    /// its own work - the frame minus its GC pause, because GC freezes every thread and no
+    /// upload cut can shorten one - exceeds factor x the rolling average, and only while
+    /// uploads were actually in flight (an idle-queue frame that spikes is not this
+    /// controller's business). The cut aims proportionally at the limit, like FrameEnd does.
+    /// </summary>
+    internal static double PressureCorrection(double frameMs, double avgFrameMs, double gcPauseMs,
+                                              double uploadMs, double factor)
+    {
+        if (avgFrameMs <= 0 || uploadMs <= 0.05) return 1.0;
+        double work = frameMs - Math.Max(0, gcPauseMs);
+        double limit = avgFrameMs * factor;
+        return work <= limit ? 1.0 : limit / work;
     }
 
     public static void Reset()
@@ -96,5 +160,7 @@ public static class UploadBudget
         PeakMs = 0;
         LastMs = 0;
         Frames = 0;
+        pressureHold = 0;
+        StatPressureCuts = 0;
     }
 }

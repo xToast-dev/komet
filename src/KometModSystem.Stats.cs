@@ -171,7 +171,10 @@ public partial class KometModSystem
 
         // -- uploads and the loading pipeline --
         DebugHud.Row(sb, "upload gain", UploadBudget.Gain.ToString("P0", CultureInfo.CurrentCulture), null,
-            "vom vanilla-budget");
+            "vom vanilla-budget"
+            + (UploadBudget.StatPressureCuts > 0
+                ? " · " + UploadBudget.StatPressureCuts + "x frame-druck"
+                : ""));
         // Shown while the budget is armed even at 0 activity: "0 chunks" is correct idleness,
         // a missing row would be indistinguishable from a prefix that never ran (the edge-prio
         // lesson - idle and broken must not look the same).
@@ -477,9 +480,12 @@ public partial class KometModSystem
                 Patches.ShadowResPatches.EffectiveMapSize, ShadowTexelsPerBlock(),
                 FastCuller.ShadowSkipRedundantLod ? "raus" : "drin");
 
-        sb.AppendFormat(ci, "upload {0:F2} ms (max {1:F1}), throttle {2:P0}, prio-budget {3} "
-            + "({4:N0} chunks, {5:N0}x verteilt) | occlusion {6:F1} ms auf worker, {7:N0} chunks\n",
+        sb.AppendFormat(ci, "upload {0:F2} ms (max {1:F1}), throttle {2:P0}{3}, prio-budget {4} "
+            + "({5:N0} chunks, {6:N0}x verteilt) | occlusion {7:F1} ms auf worker, {8:N0} chunks\n",
             FrameStats.AvgUploadMs, FrameStats.MaxUploadMs, UploadBudget.Gain,
+            UploadBudget.StatPressureCuts > 0
+                ? string.Format(ci, " ({0:N0}x frame-druck gedrosselt)", UploadBudget.StatPressureCuts)
+                : "",
             Patches.PrioUploadPatches.Enabled ? "an" : "AUS",
             Patches.PrioUploadPatches.StatUploadedChunks, Patches.PrioUploadPatches.StatDeferrals,
             FastChunkCuller.StatLastMs, FastChunkCuller.StatChunksSnapshotted);

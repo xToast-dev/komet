@@ -788,6 +788,51 @@ internal static class Program
             UploadBudget.Reset();
         });
 
+        Check("upload throttle sees a choked frame, not just its own clock", () =>
+        {
+            // Under mesa_glthread glBufferSubData only records; the driver pays the copy
+            // later in opaque/swap. A field log's eight-hitch burst (opaque 16-26 ms) ran at
+            // "throttle 100 %" because the upload clock read 0,6 ms throughout. The pure
+            // pressure rule has to catch that frame - and ONLY that frame.
+            double cut = UploadBudget.PressureCorrection(30, 10, 0, 1.0, 1.75);
+            if (cut >= 1.0) throw new Exception("a choked frame with uploads in flight was ignored");
+            if (Math.Abs(cut - 17.5 / 30) > 1e-9)
+                throw new Exception($"cut {cut:F3} not proportional to the excess");
+            // a frame explained by its GC pause is frozen, not choked - starving the terrain
+            // cannot shorten a stop-the-world pause
+            if (UploadBudget.PressureCorrection(30, 10, 22, 1.0, 1.75) < 1.0)
+                throw new Exception("a GC-explained spike cut the upload budget");
+            // no uploads in flight: whatever spiked, it was not the uploads
+            if (UploadBudget.PressureCorrection(30, 10, 0, 0.0, 1.75) < 1.0)
+                throw new Exception("an idle-queue spike cut the upload budget");
+            // a normal frame stays untouched
+            if (UploadBudget.PressureCorrection(12, 10, 0, 1.0, 1.75) != 1.0)
+                throw new Exception("a normal frame was cut");
+
+            // integration: a pressure cut must survive the cheap-upload raise for the hold
+            // window - the upload clock reads "under target" during the very burst the cut
+            // answers, and used to raise the budget straight back
+            UploadBudget.Reset();
+            UploadBudget.Enabled = true;
+            UploadBudget.FramePressureInput = true;
+            UploadBudget.TargetMs = 6.0;
+            UploadBudget.NotePressure(30, 10, 0, 1.0);
+            double afterCut = UploadBudget.Gain;
+            if (afterCut >= 1.0) throw new Exception("NotePressure did not cut the gain");
+            UploadBudget.FrameStart();
+            UploadBudget.FrameEnd(); // ~0 ms upload -> would raise 1.25x without the hold
+            if (UploadBudget.Gain > afterCut + 1e-9)
+                throw new Exception("the cheap-upload raise undid the pressure cut immediately");
+            for (int i = 0; i < UploadBudget.PressureHoldFrames + 20; i++)
+            {
+                UploadBudget.FrameStart();
+                UploadBudget.FrameEnd();
+            }
+            if (UploadBudget.Gain < 1.0 - 1e-9)
+                throw new Exception("the gain never recovered after the hold expired");
+            UploadBudget.Reset();
+        });
+
         Check("HUD text composes without a GL context", () =>
         {
             FrameStats.Reset();

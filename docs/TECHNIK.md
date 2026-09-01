@@ -187,6 +187,23 @@ Klammern bei 0,5× und 1,25× pro Frame, damit ein einzelner Frame ohne Rücksta
 
 Ziel per `UploadBudgetTargetMs` (Default 6 ms). `.komet` zeigt den aktuellen Gain.
 
+**Zweiter Druck-Eingang: der Frame selbst (01.09. nachts).** Unter `mesa_glthread` misst
+die Upload-Uhr nur das *Aufzeichnen* der GL-Kommandos — die eigentliche Kopie zahlt der
+Treiber-Thread später, dort wo seine Queue vollläuft: in opaque, im swap, im Event-Loop.
+Ein Feldlog zeigte die Konsequenz: ein Acht-Ruckler-Burst beim Streaming (opaque 16–26 ms
+je Frame, `draussen 22,4` als Drain), und die ganze Zeit `throttle 100 %` — der Regler
+konnte die Kosten, die er begrenzen soll, schlicht nicht sehen. Deshalb bekommt er über
+`FrameStats.FrameSummary` jetzt zusätzlich die Bilanz des fertigen Frames: läuft ein Frame
+über `PressureFactor` (1,75×) des gleitenden Mittels, **nachdem seine GC-Pause abgezogen
+ist** (ein eingefrorener Frame ist kein Upload-Druck — den kann keine Drossel verkürzen),
+und waren in dem Frame Uploads unterwegs, wird der Gain proportional gekürzt. Ein
+Halte-Fenster (8 Frames) verhindert, dass die billige Upload-Uhr die Kürzung im nächsten
+Frame gleich wieder anhebt — sie liest ja gerade *während* des Bursts „unter Ziel".
+Die pure Regel (`PressureCorrection`) ist im Verify gepinnt (Gegenproben: GC-Abzug raus,
+Halte-Fenster raus, Upload-Wächter raus — alle rot). `.komet toggle uploaddruck` schaltet
+live, `UploadFramePressure` (Layout 5) persistent; Report und HUD zählen
+`x frame-druck gedrosselt`.
+
 ### Die Prioritäts-Queue: vanilla ohne jedes Limit — jetzt mit eigenem Budget
 
 Die **Prioritäts-Queue** (Block-Edits, Prioritäts-Retesselationen) wird in `OnBeforeFrame`
@@ -1840,6 +1857,7 @@ Neubau bisektieren.
 | `DebugHudVisible` | `false` | HUD schon beim Start anzeigen statt erst per F7 |
 | `AdaptiveUploadBudget` | `true` | Upload-Zeit pro Frame deckeln (Rückkopplung brechen) |
 | `UploadBudgetTargetMs` | `6.0` | Zielzeit pro Frame für Chunk-Uploads |
+| `UploadFramePressure` | `true` | Drossel reagiert auch auf heiße Frames (glthread-Drain), GC-Pausen abgezogen |
 | `AnimationLookupWithoutAlloc` | `true` | |
 | `AnimationCollisionBoxWithoutAlloc` | `true` | |
 | `SkipPerFrameGlErrorCheck` | `false` | siehe oben |

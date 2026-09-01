@@ -66,6 +66,7 @@ public partial class KometModSystem : ModSystem
         FastChunkCuller.MinIntervalMs = config.OcclusionMinIntervalMs;
         UploadBudget.TargetMs = config.UploadBudgetTargetMs;
         UploadBudget.Enabled = config.AdaptiveUploadBudget;
+        UploadBudget.FramePressureInput = config.UploadFramePressure;
         FastCuller.MeasureTime = config.MeasureCullTime;
         FastCuller.VectorCulling = config.VectorCulling && FastCuller.VectorAvailable;
         FastCuller.Log = msg => Mod.Logger.Notification(msg);
@@ -350,6 +351,10 @@ public partial class KometModSystem : ModSystem
             Patch(() =>
             {
                 Patches.UploadBudgetPatches.Apply(harmony);
+                // the frame-pressure input: the finished frame's totals reach the
+                // controller each boundary, so it can see the deferred driver cost the
+                // upload clock is blind to under mesa_glthread
+                FrameStats.FrameSummary += UploadBudget.NotePressure;
                 uploadBudgetHooked = true;
             }, "adaptive chunk upload budget");
 
@@ -613,6 +618,7 @@ public partial class KometModSystem : ModSystem
         if (uploadBudgetHooked)
         {
             Patches.UploadBudgetPatches.Unhook();
+            FrameStats.FrameSummary -= UploadBudget.NotePressure;
             uploadBudgetHooked = false;
         }
 
