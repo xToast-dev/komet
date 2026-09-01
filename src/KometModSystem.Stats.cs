@@ -357,6 +357,18 @@ public partial class KometModSystem
             FrameStats.GameTickMs, GpuFrameTimer.GpuMs, FrameStats.GcPauseMsPerSecond,
             FrameStats.AllocMbPerSecond, FrameStats.Gen0PerSecond, FrameStats.Gen2PerSecond,
             System.Runtime.GCSettings.IsServerGC ? "server" : "workstation");
+        // The per-thread allocation split lived only in the F7 overlay until 01.09. - the
+        // one field report that was supposed to decide the network-decompression question
+        // arrived without it, because reports come from '.komet report', not screenshots.
+        // Whatever nobody measures stays visible as "rest" instead of vanishing.
+        if (FrameStats.AllocMbPerSecond >= 8)
+            sb.AppendFormat(ci, "  alloc-quellen: netz {0:F0}, main {1:F0}, prefetch {2:F0}, "
+                + "tess {3:F0}, rest {4:F0} MB/s\n",
+                FrameStats.NetAllocMbPerSecond, FrameStats.MainAllocMbPerSecond,
+                FrameStats.PrefetchAllocMbPerSecond, TesselationStats.AllocMbPerSecond,
+                Math.Max(0.0, FrameStats.AllocMbPerSecond - FrameStats.NetAllocMbPerSecond
+                    - FrameStats.MainAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond
+                    - TesselationStats.AllocMbPerSecond));
         sb.AppendFormat(ci, "ruckler: {0} ('.komet hitch' fuer details)\n", HitchLog.SummaryLine());
         sb.AppendFormat(ci, "cpu: {0:F1} von {1} kernen beschaeftigt ({2:F0} %)\n",
             FrameStats.CpuCoresBusy, Environment.ProcessorCount,
