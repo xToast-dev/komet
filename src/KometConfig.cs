@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "2";
+    public const string Current = "3";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -168,6 +168,19 @@ public class KometConfig
 
     /// <summary>Milliseconds per frame the upload throttle aims for.</summary>
     public double UploadBudgetTargetMs { get; set; } = 6.0;
+
+    /// <summary>
+    /// Also budget the PRIORITY chunk upload queue, which vanilla drains completely in a
+    /// single frame with no limit of any kind. Its designed load is a player block edit -
+    /// one or two chunks - but relight storms (time or season changes, light-baking mods)
+    /// and priority re-tesselations all route through the same queue, and the hitch log
+    /// measured 10-27 ms of upload in single frames while one was running. The budget
+    /// uploads at least one chunk per frame and at least a full chunk mesh's worth of
+    /// vertices (so an edit still appears in the frame it was meshed in) and carries the
+    /// rest into the following frames - deferred, never lost. '.komet toggle prioupload'
+    /// flips it live.
+    /// </summary>
+    public bool BudgetPriorityUploads { get; set; } = true;
 
     /// <summary>
     /// Look animation codes up case-insensitively instead of allocating a lowercase copy of
@@ -442,6 +455,17 @@ public class KometConfig
     /// phase for it. Turn it on to answer a question, then turn it off again.
     /// </summary>
     public bool ProfileRenderers { get; set; }
+
+    /// <summary>
+    /// Keep the Before render stage's renderers timed every frame even while the full
+    /// profiler is off. That stage holds only a handful of system renderers (entity
+    /// preparation, chunk mesh uploads, the liquid depth pre-pass, camera, ambient - plus
+    /// whatever other mods put there), so the cost is a few microseconds - but it is where
+    /// the repeated unattributed world-join bursts (60-87 ms of "before" with no GC) live,
+    /// and a hitch line that can say "renderer Before-ree 60 ms" beats one that cannot.
+    /// The full profiler stays available via '.komet toggle profiler' as before.
+    /// </summary>
+    public bool AttributeBeforeStage { get; set; } = true;
 
     /// <summary>Show the on-screen performance overlay right away. Toggle in game with F7.</summary>
     public bool DebugHudVisible { get; set; }

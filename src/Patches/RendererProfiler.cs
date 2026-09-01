@@ -34,12 +34,37 @@ public static class RendererProfiler
 {
     public static bool Enabled;
 
+    /// <summary>
+    /// Keep the Before stage's renderers wrapped and timed EVERY frame even while the full
+    /// profiler is off.
+    ///
+    /// The full profiler is off by default because it wraps ~10 000 block entity renderers;
+    /// the Before stage holds about nine system renderers (entities, chunk uploads, the
+    /// liquid depth pass, camera, ambient - plus whatever other mods register), so always-on
+    /// costs a few microseconds and answers the one attribution gap the hitch log still had:
+    /// repeated 60-87 ms "before" bursts at world join with no renderer name attached,
+    /// suspected for weeks and never nameable because naming them required remembering to
+    /// arm the profiler before joining a world.
+    /// </summary>
+    public static bool AttributeBeforeStage = true;
+
     private sealed class Entry
     {
         public long Ticks;      // accumulated in the current frame
         public double Ms;       // smoothed, published per frame
         public EnumRenderStage Stage;
+        /// <summary>Before-stage buckets are timed and folded every frame, not sampled -
+        /// the hitch log reads per-frame ticks, and a hitch does not wait to be sampled.</summary>
+        public bool EveryFrame;
     }
+
+    /// <summary>
+    /// Wrapped-instance count per stage. The unregister fix scans a stage's renderer list
+    /// linearly to find a wrapper; with only the Before stage wrapped, an unregistering
+    /// block entity (thousands of entries in the Opaque list, one per chunk unload) must
+    /// not pay that scan for a wrapper that cannot exist there.
+    /// </summary>
+    private static readonly int[] wrappedByStage = new int[32];
 
     private static readonly Dictionary<string, Entry> Entries = new(64);
     private static readonly double TicksToMs = 1000.0 / Stopwatch.Frequency;
@@ -73,24 +98,37 @@ public static class RendererProfiler
     /// </summary>
     public static void Wrap(ClientEventManager manager)
     {
-        if (!Enabled || manager?.renderersByStage == null) return;
+        if (manager?.renderersByStage == null) return;
+
+        // With the full profiler off, only the Before stage is touched - both for the wrap
+        // itself and for the periodic re-wrap pass, which would otherwise walk thousands of
+        // block entity entries four times a second for nothing.
+        int first = 0, last = manager.renderersByStage.Length - 1;
+        if (!Enabled)
+        {
+            if (!AttributeBeforeStage) return;
+            first = last = (int)EnumRenderStage.Before;
+        }
 
         int total = 0, wrapped = 0;
-        for (int stage = 0; stage < manager.renderersByStage.Length; stage++)
+        for (int stage = first; stage <= last; stage++)
         {
             List<RenderHandler> list = manager.renderersByStage[stage];
             if (list == null) continue;
 
+            int wrappedHere = 0;
             for (int i = 0; i < list.Count; i++)
             {
                 RenderHandler handler = list[i];
                 if (handler?.Renderer == null) continue;
                 total++;
-                if (handler.Renderer is Timed) { wrapped++; continue; }
+                if (handler.Renderer is Timed) { wrapped++; wrappedHere++; continue; }
 
                 handler.Renderer = new Timed(handler.Renderer, handler.ProfilingName ?? "?", (EnumRenderStage)stage);
                 wrapped++;
+                wrappedHere++;
             }
+            if (stage < wrappedByStage.Length) wrappedByStage[stage] = wrappedHere;
         }
 
         StatTotal = total;
@@ -134,6 +172,10 @@ public static class RendererProfiler
         // find its decorator or it becomes a ghost.
         if (StatWrapped == 0) return;
         if (handler == null || handler is Timed) return;
+        // A stage with nothing wrapped cannot contain the decorator - and with only the
+        // Before stage attributed, this is what spares every unloading block entity the
+        // linear scan of its thousands-long Opaque list.
+        if ((int)stage < wrappedByStage.Length && wrappedByStage[(int)stage] == 0) return;
 
         List<RenderHandler> list = __instance.renderersByStage?[(int)stage];
         if (list == null) return;
@@ -153,20 +195,32 @@ public static class RendererProfiler
     /// leaves no trace. StatWrapped only drops to zero once every decorator is really gone,
     /// because that flag is what keeps the unregister fix alive in the meantime.
     /// </summary>
-    public static void Unwrap(ClientEventManager manager)
+    public static void Unwrap(ClientEventManager manager, bool keepBeforeAttribution = false)
     {
         Enabled = false;
         if (manager?.renderersByStage == null) return;
 
-        foreach (List<RenderHandler> list in manager.renderersByStage)
+        int kept = 0;
+        for (int stage = 0; stage < manager.renderersByStage.Length; stage++)
         {
+            List<RenderHandler> list = manager.renderersByStage[stage];
             if (list == null) continue;
+            if (keepBeforeAttribution && stage == (int)EnumRenderStage.Before)
+            {
+                // the always-on attribution survives a profiler toggle-off; only the full
+                // teardown (world leave) takes these out too
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i]?.Renderer is Timed) kept++;
+                continue;
+            }
             for (int i = 0; i < list.Count; i++)
                 if (list[i]?.Renderer is Timed timed) list[i].Renderer = timed.Inner;
+            if (stage < wrappedByStage.Length) wrappedByStage[stage] = 0;
         }
 
-        StatWrapped = 0;
-        StatTotal = 0;
+        // StatWrapped keeps the unregister fix armed exactly while any decorator exists.
+        StatWrapped = kept;
+        StatTotal = kept;
     }
 
     /// <summary>Forwards everything, and times OnRenderFrame on sampled frames.</summary>
@@ -196,7 +250,11 @@ public static class RendererProfiler
 
         public void OnRenderFrame(float dt, EnumRenderStage renderStage)
         {
-            if (!measuringThisFrame)
+            // Before-stage buckets are timed every frame: the hitch log reads the raw
+            // per-frame ticks at detection time, and a hitch on an unsampled frame would
+            // otherwise go unnamed - which for the world-join "before" bursts was three
+            // out of four of them.
+            if (!measuringThisFrame && !entry.EveryFrame)
             {
                 Inner.OnRenderFrame(dt, renderStage);
                 return;
@@ -217,7 +275,8 @@ public static class RendererProfiler
     private static Entry Bucket(string name, EnumRenderStage stage)
     {
         name ??= "?";
-        if (!Entries.TryGetValue(name, out Entry e)) Entries[name] = e = new Entry { Stage = stage };
+        if (!Entries.TryGetValue(name, out Entry e))
+            Entries[name] = e = new Entry { Stage = stage, EveryFrame = stage == EnumRenderStage.Before };
         return e;
     }
 
@@ -228,15 +287,16 @@ public static class RendererProfiler
     /// </summary>
     public static void EndFrame()
     {
-        if (measuringThisFrame)
+        foreach (KeyValuePair<string, Entry> kv in Entries)
         {
-            foreach (KeyValuePair<string, Entry> kv in Entries)
-            {
-                Entry e = kv.Value;
-                double ms = e.Ticks * TicksToMs;
-                e.Ms += (ms - e.Ms) * Alpha;
-                e.Ticks = 0;
-            }
+            Entry e = kv.Value;
+            // sampled buckets fold only on measured frames (an unmeasured frame has no
+            // ticks, and folding its zero in would drag the average towards nothing);
+            // every-frame buckets have real ticks every frame and fold every frame
+            if (!measuringThisFrame && !e.EveryFrame) continue;
+            double ms = e.Ticks * TicksToMs;
+            e.Ms += (ms - e.Ms) * Alpha;
+            e.Ticks = 0;
         }
 
         measuringThisFrame = ++frameIndex % SampleEveryNthFrame == 0;

@@ -151,6 +151,13 @@ public partial class KometModSystem
             "von " + DebugHud.N(raw) + " (" + (emitted > 0 ? raw / emitted : 1).ToString("F1", CultureInfo.CurrentCulture) + "x)");
         DebugHud.Row(sb, "occlusion", null, DebugHud.Ms(FastChunkCuller.StatLastMs), "worker-thread");
         DebugHud.Row(sb, "upload gain", UploadBudget.Gain.ToString("P0", CultureInfo.CurrentCulture));
+        // Shown while the budget is armed even at 0 activity: "0 chunks" is correct idleness,
+        // a missing row would be indistinguishable from a prefix that never ran (the edge-prio
+        // lesson - idle and broken must not look the same).
+        if (Patches.PrioUploadPatches.Enabled || Patches.PrioUploadPatches.StatUploadedChunks > 0)
+            DebugHud.Row(sb, "prio-upload", DebugHud.N(Patches.PrioUploadPatches.StatUploadedChunks), null,
+                "chunks, " + DebugHud.N(Patches.PrioUploadPatches.StatDeferrals) + "x verteilt"
+                + (Patches.PrioUploadPatches.Enabled ? "" : " (AUS)"));
         // raw running totals: if these stay at zero the patch is not firing at all, which is a
         // different problem from the smoothed per-frame figures reading zero
         DebugHud.Row(sb, "sweeps/frame", DebugHud.N(sweepsPerFrame?.PerFrame ?? 0), null,
@@ -411,9 +418,11 @@ public partial class KometModSystem
                 Patches.ShadowResPatches.EffectiveMapSize, ShadowTexelsPerBlock(),
                 FastCuller.ShadowSkipRedundantLod ? "raus" : "drin");
 
-        sb.AppendFormat(ci, "upload {0:F2} ms (max {1:F1}), throttle {2:P0} | occlusion {3:F1} ms "
-            + "auf worker, {4:N0} chunks\n",
+        sb.AppendFormat(ci, "upload {0:F2} ms (max {1:F1}), throttle {2:P0}, prio-budget {3} "
+            + "({4:N0} chunks, {5:N0}x verteilt) | occlusion {6:F1} ms auf worker, {7:N0} chunks\n",
             FrameStats.AvgUploadMs, FrameStats.MaxUploadMs, UploadBudget.Gain,
+            Patches.PrioUploadPatches.Enabled ? "an" : "AUS",
+            Patches.PrioUploadPatches.StatUploadedChunks, Patches.PrioUploadPatches.StatDeferrals,
             FastChunkCuller.StatLastMs, FastChunkCuller.StatChunksSnapshotted);
 
         long pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;

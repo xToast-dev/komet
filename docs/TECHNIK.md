@@ -187,9 +187,26 @@ Klammern bei 0,5× und 1,25× pro Frame, damit ein einzelner Frame ohne Rücksta
 
 Ziel per `UploadBudgetTargetMs` (Default 6 ms). `.komet` zeigt den aktuellen Gain.
 
-Wichtig: die **Prioritäts-Queue** (die Chunks direkt um dich herum) wird in `OnBeforeFrame`
-*vor* der Budgetprüfung abgearbeitet und ist von der Drosselung nicht betroffen. Gebremst wird
-nur der Nachschub in der Ferne — genau da, wo später Aufpoppen egal ist.
+### Die Prioritäts-Queue: vanilla ohne jedes Limit — jetzt mit eigenem Budget
+
+Die **Prioritäts-Queue** (Block-Edits, Prioritäts-Retesselationen) wird in `OnBeforeFrame`
+*vor* der Budgetprüfung abgearbeitet — und zwar bei vanilla mit `while (Count > 0)`,
+komplett, in einem Frame, ohne jedes Limit. Für ihren Design-Fall (ein Spieler-Edit, ein
+bis zwei Chunks) ist das richtig. Aber durch dieselbe Queue laufen auch Relight-Stürme
+(Zeit-/Saisonwechsel, licht-backende Mods) und Prioritäts-Retesselationen; das Hitch-Log
+vom 31.08. hat Frame um Frame `davon upload 10–27 ms` gebucht, im Stand, während so ein
+Sturm lief — jedes Mal diese eine Schleife, die Dutzende Chunk-Meshes in einem Frame
+hochlädt. Der adaptive Regler sieht davon nichts: sein Transpiler skaliert nur das Budget
+der *normalen* Queue, und vanilla prüft das erst, wenn die Prioritäts-Queue schon leer ist.
+
+`BudgetPriorityUploads` (Default an) setzt darum dieselbe Art Kappe wie das
+Entity-Tesselations-Budget: pro Frame mindestens ein Chunk (ein Rückstau kann nie
+verhungern) und mindestens ein volles Chunk-Mesh an Vertices (~65k — ein Spieler-Edit
+erscheint also weiterhin im selben Frame), darüber `3 × gain-skalierte Basis` wie beim
+normalen Budget. Der Rest bleibt in der Queue und läuft im nächsten Frame weiter —
+verschoben, nie verloren. `.komet toggle prioupload` schaltet live auf vanilla zurück;
+HUD-Zeile `prio-upload` zeigt Chunks und Verteil-Ereignisse (auch bei 0, damit „korrekt
+untätig" nie wie „läuft nicht" aussieht).
 
 ---
 
@@ -955,6 +972,26 @@ verschieben. `verify` prüft deshalb: alle Renderer werden gewickelt, `RenderOrd
 Wrapper ruft das Original wirklich und in Reihenfolge auf, die Zeiten landen in der richtigen
 Stage, und `Unwrap` stellt exakt die Originalobjekte wieder her. Gegengeprüft mit einem
 absichtlich falschen `RenderOrder`: dann meldet der Test „RenderOrder not forwarded".
+
+### Die Before-Stage ist immer attribuiert (auch mit Profiler aus)
+
+Der volle Profiler ist seit 1.42.0 default-aus — zehntausend Dekoratoren sind Messkosten,
+die niemand dauerhaft tragen soll. Das hatte eine Lücke: die wiederkehrenden
+Weltbeitritts-Bursts (60–87 ms im `before`-Bucket, kein GC, kein Renderer-Name im
+Hitch-Log) blieben wochenlang unbenannt, weil man den Profiler *vor* dem Beitritt hätte
+scharfschalten müssen. Dabei hält die Before-Stage nur eine Handvoll System-Renderer
+(Entity-Vorbereitung `ree`, Chunk-Uploads `chtema`, den Liquid-Depth-Prepass `ret-prep`,
+Kamera, Ambient — plus was fremde Mods dort registrieren).
+
+`AttributeBeforeStage` (Default an) wickelt darum genau diese Stage immer und misst sie in
+**jedem** Frame statt nur im gesampelten Viertel — ein Ruckler wartet nicht darauf,
+gesampelt zu werden. Kosten: wenige Mikrosekunden. Eine Ruckler-Zeile kann damit
+`renderer Before-ree 60,1 ms` sagen, auch wenn der Profiler nie an war; Namen unter 0,5 ms
+werden unterdrückt, damit ein Opaque-Ruckler nicht sinnlos den größten Before-Zwerg
+genannt bekommt. Der Unregister-Fix (Wrapper-Identität) gilt unverändert; damit
+ausgerechnet die ent-registrierenden Block-Entities nicht die Zeche zahlen, bricht der
+Scan pro Stage sofort ab, wenn dort nichts gewickelt ist. `.komet toggle beforeattr`
+schaltet es ab, `toggle profiler` liefert weiterhin das volle Bild.
 
 ### Und die Stages, die bisher fehlten
 

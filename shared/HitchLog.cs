@@ -165,8 +165,12 @@ public static class HitchLog
             SweepWaitMs = sweepWaitMs,
             HudMs = hudMs,
         };
+        // The 0.5 ms floor matters since the Before stage is attributed on every frame: on
+        // an unsampled frame the "top renderer" is merely the top BEFORE renderer, and a
+        // 30 ms opaque hitch must not get a meaningless "renderer Before-camera 0,02 ms"
+        // stamped on it - absence says "no measured renderer explains this" more honestly.
         (string name, double ms)? top = TopRendererProvider?.Invoke();
-        if (top.HasValue)
+        if (top.HasValue && top.Value.ms >= 0.5)
         {
             pending.TopRenderer = top.Value.name;
             pending.TopRendererMs = top.Value.ms;

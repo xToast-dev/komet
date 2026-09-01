@@ -614,6 +614,54 @@ internal static class Program
             AccessTools.TypeByName("Vintagestory.Client.NoObf.ChunkTesselatorManager"), "OnBeforeFrame");
         Check("upload budget transpiler", () => { UploadBudgetPatches.Apply(harmony); ForceJit(onBeforeFrame); });
 
+        Check("priority uploads are budgeted with liveness, and the remainder carries", () =>
+        {
+            // the prefix applies on top of the measurement patch and the transpiler
+            PrioUploadPatches.Apply(harmony);
+            ForceJit(onBeforeFrame);
+
+            // the cap rule: three gain-scaled bases, never below one full chunk mesh
+            if (PrioUploadPatches.CapVertices(49494, 65536) != 148482)
+                throw new Exception("cap is not three times the scaled base");
+            if (PrioUploadPatches.CapVertices(2048, 65536) != 65536)
+                throw new Exception("the one-full-chunk floor did not hold at collapsed gain");
+
+            // the continue rule: liveness first, then the cap
+            if (!PrioUploadPatches.ShouldContinue(0, 0, 0))
+                throw new Exception("liveness: the first entry of a frame must always run");
+            if (PrioUploadPatches.ShouldContinue(70000, 1, 65536))
+                throw new Exception("the cap was ignored once liveness was satisfied");
+
+            // drain mechanics against a real queue of fake entries
+            static Vintagestory.Client.NoObf.TesselatedChunk Fake(int verts)
+            {
+                var tc = (Vintagestory.Client.NoObf.TesselatedChunk)RuntimeHelpers.GetUninitializedObject(
+                    typeof(Vintagestory.Client.NoObf.TesselatedChunk));
+                PrioUploadPatches.TcVerts(tc) = verts;
+                return tc;
+            }
+            var q = new Queue<Vintagestory.Client.NoObf.TesselatedChunk>();
+            for (int i = 0; i < 10; i++) q.Enqueue(Fake(1000));
+            int uploaded = 0;
+            int verts = PrioUploadPatches.DrainBudgeted(q, 2500, tc => { uploaded++; return PrioUploadPatches.TcVerts(tc); });
+            if (uploaded != 3 || verts != 3000)
+                throw new Exception($"cap 2500 drained {uploaded} entries / {verts} verts, expected 3 / 3000");
+            if (q.Count != 7) throw new Exception($"remainder {q.Count}, expected 7 still queued");
+
+            // the remainder moves next frame even against a cap it can never fit under
+            verts = PrioUploadPatches.DrainBudgeted(q, 1, tc => PrioUploadPatches.TcVerts(tc));
+            if (verts != 1000 || q.Count != 6)
+                throw new Exception("a tiny cap must still move exactly one entry per frame");
+
+            // entries whose chunk is gone report zero vertices and never block the drain
+            var dead = new Queue<Vintagestory.Client.NoObf.TesselatedChunk>();
+            for (int i = 0; i < 5; i++) dead.Enqueue(Fake(1000));
+            int disposed = 0;
+            PrioUploadPatches.DrainBudgeted(dead, 65536, _ => { disposed++; return 0; });
+            if (disposed != 5 || dead.Count != 0)
+                throw new Exception("dead entries must drain completely - they cost no budget");
+        });
+
         Console.WriteLine("\nbehaviour:");
 
         Check("ToLowerInvariant really gone from OnFrame", () =>
@@ -2832,6 +2880,73 @@ internal static class Program
             RendererProfiler.Reset();
         });
 
+        Check("the before stage stays attributed while the profiler is off", () =>
+        {
+            // The world-join bursts (60-87 ms of "before" with no GC and no renderer name)
+            // stayed unnamed for weeks because naming them required arming the full profiler
+            // before joining. The Before stage holds only a handful of system renderers, so
+            // those are now wrapped and timed EVERY frame even with the profiler off - and a
+            // hitch on any frame, sampled or not, can name its Before renderer.
+            var manager = (Vintagestory.Client.NoObf.ClientEventManager)
+                System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+                    typeof(Vintagestory.Client.NoObf.ClientEventManager));
+            int stages = Enum.GetValues(typeof(EnumRenderStage)).Length;
+            manager.renderersByStage = new List<Vintagestory.Client.NoObf.RenderHandler>[stages];
+            for (int i = 0; i < stages; i++) manager.renderersByStage[i] = new List<Vintagestory.Client.NoObf.RenderHandler>();
+
+            var beforeRenderer = new SpinningRenderer();
+            var opaqueRenderer = new SpinningRenderer();
+            var beforeList = manager.renderersByStage[(int)EnumRenderStage.Before];
+            var opaqueList = manager.renderersByStage[(int)EnumRenderStage.Opaque];
+            beforeList.Add(new Vintagestory.Client.NoObf.RenderHandler { ProfilingName = "Before-probe", Renderer = beforeRenderer });
+            opaqueList.Add(new Vintagestory.Client.NoObf.RenderHandler { ProfilingName = "Opaque-other", Renderer = opaqueRenderer });
+
+            RendererProfiler.Reset();
+            RendererProfiler.Enabled = false;
+            RendererProfiler.AttributeBeforeStage = true;
+            RendererProfiler.Wrap(manager);
+
+            if (beforeList[0].Renderer is not RendererProfiler.Timed)
+                throw new Exception("the before renderer was not wrapped with the profiler off");
+            if (opaqueList[0].Renderer is RendererProfiler.Timed)
+                throw new Exception("an opaque renderer was wrapped with the profiler off - that is the 10 000-decorator cost the default avoids");
+
+            // Every frame must be readable at the boundary, not just the sampled quarter -
+            // that is the whole point: a hitch does not wait to be sampled.
+            for (int frame = 0; frame < 8; frame++)
+            {
+                beforeList[0].Renderer.OnRenderFrame(0.016f, EnumRenderStage.Before);
+                (string name, double ms)? top = RendererProfiler.TopOfCurrentFrame();
+                if (top == null || top.Value.name != "Before-probe" || top.Value.ms <= 0)
+                    throw new Exception($"frame {frame}: before renderer not readable at the boundary (got {top?.name ?? "null"})");
+                RendererProfiler.EndFrame();
+            }
+
+            // Toggling the full profiler on and off again must keep the attribution armed.
+            RendererProfiler.Enabled = true;
+            RendererProfiler.Wrap(manager);
+            if (opaqueList[0].Renderer is not RendererProfiler.Timed)
+                throw new Exception("full profiler did not wrap the opaque renderer");
+            RendererProfiler.Unwrap(manager, keepBeforeAttribution: true);
+            if (RendererProfiler.Enabled) throw new Exception("Unwrap left the profiler marked enabled");
+            if (beforeList[0].Renderer is not RendererProfiler.Timed)
+                throw new Exception("profiler toggle-off must keep the before attribution");
+            if (!ReferenceEquals(opaqueList[0].Renderer, opaqueRenderer))
+                throw new Exception("profiler toggle-off did not restore the opaque renderer");
+            if (RendererProfiler.StatWrapped == 0)
+                throw new Exception("StatWrapped 0 with a decorator still installed - the unregister fix would disarm");
+
+            // The full teardown (world leave) takes everything out.
+            RendererProfiler.Unwrap(manager);
+            if (beforeList[0].Renderer is RendererProfiler.Timed)
+                throw new Exception("full unwrap left the before wrapper in place");
+            if (RendererProfiler.StatWrapped != 0)
+                throw new Exception("StatWrapped after full unwrap");
+
+            RendererProfiler.Reset();
+            RendererProfiler.AttributeBeforeStage = true;
+        });
+
         Check("sun query throttle skips only when it can restore the GL state", () =>
         {
             SunQueryPatches.Apply(harmony, 4);
@@ -3327,6 +3442,21 @@ internal static class Program
         public double RenderOrder { get; }
         public int RenderRange { get; }
         public void OnRenderFrame(float dt, EnumRenderStage stage) => log.Add(name);
+        public void Dispose() { }
+    }
+
+    /// <summary>Burns a guaranteed-visible amount of clock, so a timing wrapper around it can
+    /// never legitimately read zero ticks - which keeps the every-frame-readable assertions
+    /// deterministic instead of racing the Stopwatch resolution.</summary>
+    private sealed class SpinningRenderer : IRenderer
+    {
+        public double RenderOrder => 0.4;
+        public int RenderRange => 0;
+        public void OnRenderFrame(float dt, EnumRenderStage stage)
+        {
+            long until = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency / 100000;
+            while (System.Diagnostics.Stopwatch.GetTimestamp() < until) { }
+        }
         public void Dispose() { }
     }
 
