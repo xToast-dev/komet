@@ -722,6 +722,21 @@ ms/chunk mal Queue-Länge ist die verbleibende Ladezeit; sinkt der `nachbarn`-An
 Einschalten des Prefetch, wirkt er. Die Zeile kommt aus `shared/` und erscheint auch in der
 Baseline — Vorher/Nachher ist damit ein Mod-Manager-Toggle.
 
+**Der Teardown-NRE und warum die erste Reparatur nicht hielt (01.09. abends).** Ein heiß
+gehaltener Tesselations-Thread stirbt beim Weltverlassen gern mitten in
+`BuildExtendedChunkData`, wenn die Chunk-Daten unter ihm weggerissen werden (die Engine
+loggt das als „unclean exit"). Der erste Fix — ein `ShuttingDown`-Flag, gesetzt in
+`ModSystem.Dispose`, geprüft am Tick-Anfang — schlug im Feld fehl, aus zwei Gründen, die
+beide in `ClientMain.DestroyGameSession` stehen: (1) Die Reihenfolge ist
+`TriggerLeaveWorld()` → `threadsShouldExit = true` → **200 ms warten** → … → `Dispose()`.
+Ein Flag aus Dispose kommt also grundsätzlich **nach** dem Exit-Fenster. (2) **Ein**
+Tesselations-Tick entleert die komplette Dirty-Queue — bei 11 000 wartenden Chunks läuft
+der laufende Tick sekundenlang weiter, ein Guard an der Tick-Grenze greift nie. Jetzt
+setzt das `LeaveWorld`-Event (feuert *vor* dem Fenster) das Flag, und ein Prefix auf
+`TesselateChunk` (Priority.High, von verify gepinnt) bricht **pro Chunk** ab: der
+laufende Tick läuft als No-op-Kette leer und der Thread beendet sich sauber im Fenster.
+Der Mess-Postfix ignoriert die übersprungenen Chunks über ihr Null-Ergebnis von selbst.
+
 Darunter steht jetzt auch die **Empfangsrate**:
 
 ```
@@ -1200,6 +1215,11 @@ Das Log liegt in `shared/` und läuft in der Baseline identisch mit — „ruckl
 gegen komet" ist damit per Konstruktion vergleichbar. Außerdem seit 1.31.0: HUD und
 `.komet` nennen den **GC-Modus**.
 
+Formatdetail (01.09. abends): die Klammer `(davon X warten auf threads)` steht jetzt
+direkt hinter dem sweep-Wert, zu dem sie gehört. Vorher hing sie am Ende der
+davon-Liste — ein Feldlog las dadurch `upload 0,2 (davon 2,6 warten auf threads)`, ein
+Upload, der länger gewartet hätte als er lief. Die Position ist im Verify gepinnt.
+
 ### Korrektur: Server-GC war die falsche Empfehlung (1.46.0)
 
 Bis 1.45.0 stand hier, Workstation-GC sei „der erste Ruckler-Verdächtige", und das HUD
@@ -1603,6 +1623,28 @@ degradieren die Balken zu `#`, statt aus der Box zu laufen (die Rasterbreite rec
 Zeichenzellen). Die Schatten-Zeilen der Aufteilung enthalten jetzt auch die Done-Hälften
 der Kaskaden, damit zwischen den Zeilen nichts mehr versteckt ist; die Drossel-Zeile der
 Komet-Sektion heißt `schatten-takt`, damit kein Name zwei Bedeutungen hat.
+
+**F7 ohne Flackern, HUD-Aufbau ohne Frame-Kosten (01.09. abends).** Zwei Funde aus
+demselben Feldlog. Erstens flackerte beim Zyklus voll → aus → kompakt kurz die volle
+Ansicht auf: der Text-Rebuild lief nur auf Timer (0,25–2 s), F7 änderte den Zustand
+sofort, aber die **alte Textur** wurde bis zum nächsten Timer-Rebuild weitergezeichnet.
+Jetzt invalidieren die View-Properties selbst (`dirty`), und eine kleine Zustandsmaschine
+(`NextStep`, pur, von verify gepinnt) erzwingt die Invariante: **ein dirty-Frame zeichnet
+nie die alte Textur** — er baut sofort synchron neu (der F7-Pfad, einmalig ~2 ms beim
+Tastendruck) oder zeichnet, falls gerade ein Raster in Flug ist, für ein bis zwei Frames
+gar nichts. Unsichtbar schlägt falsch.
+
+Zweitens stand der HUD-Aufbau selbst im Ruckler-Log (`hud 3,0 / 3,1 / 7,7`): Sampling +
+Cairo-Raster + GL-Upload landeten komplett in einem einzigen Ortho-Frame. Der wiederkehrende
+4-Hz-Refresh rastert jetzt **im Worker** (`Task.Run`): der Frame zahlt nur noch Sampling +
+Compose beim Start und den Upload ein paar Frames später, wenn der Worker fertig ist —
+die Textur zeigt solange die 250 ms alten Zahlen, was bei einer 4-Hz-Anzeige niemand sieht.
+Wirft Cairo auf dem Worker (Plattform ohne Thread-Support), fällt das HUD für die Sitzung
+auf den synchronen Pfad zurück und sagt es einmal im Log; `.komet toggle hudraster`
+schaltet live, `HudBackgroundRaster` in der komet.json (Layout 4) persistent. Zusätzlich
+spart die Kompaktansicht den Pool-Walk in `SampleWorld` (GetStats + CalcFragmentation über
+alle Mesh-Pools), dessen Zeilen sie gar nicht zeigt. Die `hud`-Anteile in Ruckler-Zeilen
+buchen seitdem nur noch die Main-Thread-Anteile — die Worker-Zeit stiehlt keinem Frame etwas.
 
 Neben `Komet.dll` wird `KometBaseline.dll` mit installiert. Die enthält **nur die Messung**
 und **keine einzige Optimierung** — dasselbe HUD, aus buchstäblich denselben Quelldateien

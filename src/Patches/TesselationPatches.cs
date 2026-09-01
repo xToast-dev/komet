@@ -54,6 +54,20 @@ public static class TesselationPatches
         NoIdleSleep = noIdleSleep;
         RaiseThreadPriority = raisePriority;
         NeighbourPrefetch = prefetch;
+
+        // The per-chunk teardown guard, applied regardless of the speed toggles: ONE
+        // tesselation tick drains the whole dirty queue, so a tick that is already running
+        // when the world starts dying outlives the engine's 200 ms thread-exit window by
+        // seconds when thousands of chunks are queued - a guard at the tick boundary alone
+        // can never catch it (it did not: the exit NRE came back with an 11k queue).
+        MethodInfo tessChunk = AccessTools.Method(typeof(ChunkTesselatorManager), "TesselateChunk",
+                                   [typeof(int), typeof(int), typeof(int), typeof(bool),
+                                    typeof(bool), typeof(bool).MakeByRefType()])
+                               ?? throw new InvalidOperationException("TesselateChunk not found");
+        harmony.Patch(tessChunk, prefix: new HarmonyMethod(
+            AccessTools.Method(typeof(TesselationPatches), nameof(TesselateChunkPrefix)))
+            { priority = HarmonyLib.Priority.High });
+
         if (!noIdleSleep && !raisePriority && !prefetch) return;
 
         EnsureReady();
@@ -83,14 +97,33 @@ public static class TesselationPatches
     /// thread still naps instead of spinning a core.
     /// </summary>
     /// <summary>
-    /// Set on world leave, cleared on the next world's Apply. While set, the tesselation
-    /// thread gets its vanilla naps back and skips whole ticks: with NoIdleSleep keeping the
-    /// thread hot, it otherwise starts a NEW chunk in the instant between "destroy session"
-    /// and the engine's 200 ms thread-exit window - and dies with an NRE in
-    /// BuildExtendedChunkData when the chunk data is ripped out from under it (seen twice at
-    /// exit, logged by the engine as an unclean shutdown).
+    /// Set the moment the world starts leaving, cleared on the next world's Apply. While set,
+    /// the tesselation thread gets its vanilla naps back, skips whole ticks, and - the part
+    /// that actually closes the hole - skips every remaining chunk of a tick that was already
+    /// running (see <see cref="TesselateChunkPrefix"/>).
+    ///
+    /// Timing matters more than the flag itself: DestroyGameSession fires the LeaveWorld
+    /// event FIRST, then tells the client threads to exit and waits 200 ms, and only long
+    /// after that disposes the mod systems. Setting the flag from Dispose - the first attempt
+    /// - was therefore always too late, and the NRE in BuildExtendedChunkData (chunk data
+    /// freed under the tesselator) came back. KometModSystem now sets it from the LeaveWorld
+    /// event, before the teardown window even opens.
     /// </summary>
     public static volatile bool ShuttingDown;
+
+    /// <summary>
+    /// Skips a single chunk's tesselation during teardown. Priority.High so it runs before
+    /// the measurement prefix; the measurement postfix ignores skipped chunks by their zero
+    /// result, so the per-chunk stats stay clean. requeue is the engine's out parameter and
+    /// must be assigned on the skip path - the caller's variable is uninitialised.
+    /// </summary>
+    public static bool TesselateChunkPrefix(ref int __result, ref bool requeue)
+    {
+        if (!ShuttingDown) return true;
+        requeue = false;
+        __result = 0;
+        return false;
+    }
 
     public static void TickIntervalPostfix(ChunkTesselatorManager __instance, ref int __result)
     {

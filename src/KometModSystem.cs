@@ -220,6 +220,7 @@ public partial class KometModSystem : ModSystem
         sweepsPerFrame = FrameStats.TrackCounter(() => FastCuller.StatSweeps);
         batchesPerFrame = FrameStats.TrackCounter(() => FastCuller.StatBatches);
 
+        DebugHud.BackgroundRaster = config.HudBackgroundRaster;
         hud = new DebugHud(api, "komet " + KometVersion.Display(Mod.Info.Version))
         {
             Visible = config.DebugHudVisible,
@@ -232,12 +233,20 @@ public partial class KometModSystem : ModSystem
         api.Input.RegisterHotKey("komethud", "komet: Performance-HUD", GlKeys.F7, HotkeyType.HelpAndOverlays);
         api.Input.SetHotKeyHandler("komethud", _ =>
         {
-            // aus -> kompakt (the player view) -> voll (the diagnostic instrument) -> aus
-            if (!hud.Visible) { hud.Visible = true; hud.Compact = true; }
-            else if (hud.Compact) hud.Compact = false;
-            else hud.Visible = false;
+            // aus -> kompakt (the player view) -> voll (the diagnostic instrument) -> aus.
+            // The properties self-invalidate, so the next rendered frame shows exactly the
+            // new state - the cycle rule itself lives in DebugHud where verify can pin it.
+            (bool v, bool c) = DebugHud.CycleF7(hud.Visible, hud.Compact);
+            hud.Compact = c;
+            hud.Visible = v;
             return true;
         });
+
+        // DestroyGameSession fires this BEFORE it tells the client threads to exit and
+        // hands them their 200 ms window. Mod Dispose runs long after that window - a
+        // shutdown flag set there provably missed a mid-tick tesselation (the exit NRE in
+        // BuildExtendedChunkData came back). This is the only hook early enough.
+        api.Event.LeaveWorld += OnLeaveWorldEarly;
 
         // The enlarged shadow framebuffers have to be forced into existence: the engine builds
         // its framebuffers at window creation, before any mod loads, so the transpiler alone
@@ -624,6 +633,9 @@ public partial class KometModSystem : ModSystem
 
         HitchLog.TopRendererProvider = null;
         HitchLog.Log = null;
+        if (capi != null) capi.Event.LeaveWorld -= OnLeaveWorldEarly;
+        // belt and braces: normally already done by OnLeaveWorldEarly, but Dispose can also
+        // come without a DestroyGameSession (mod reload), and both are idempotent
         Patches.TesselationPatches.Shutdown();
         WindowPrebuilder.Shutdown();
         if (gcLatencyChanged)
@@ -671,5 +683,18 @@ public partial class KometModSystem : ModSystem
         }
         harmony?.UnpatchAll(harmony.Id);
         base.Dispose();
+    }
+
+    /// <summary>
+    /// Runs at the very start of DestroyGameSession, before the client threads are told to
+    /// exit. Everything that touches world data from a background thread stands down here:
+    /// the tesselation guard flips (its per-chunk prefix then drains the in-flight tick as
+    /// no-ops within the engine's 200 ms window), the prefetcher and the window prebuilder
+    /// stop. From Dispose this was provably too late - the teardown NRE recurred there.
+    /// </summary>
+    private void OnLeaveWorldEarly()
+    {
+        Patches.TesselationPatches.Shutdown();
+        WindowPrebuilder.Shutdown();
     }
 }

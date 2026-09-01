@@ -305,15 +305,19 @@ public static class HitchLog
         // "not the sweep" loudly enough by not appearing.
         if (e.SweepMs >= 1.0 || e.UploadMs >= 1.0 || e.HudMs >= 1.0 || e.EntityTessMs >= 1.0)
         {
-            sb.AppendFormat(ci, " | davon sweep {0:F1}, upload {1:F1}", e.SweepMs, e.UploadMs);
+            sb.AppendFormat(ci, " | davon sweep {0:F1}", e.SweepMs);
+            // The wait is a share OF THE SWEEP, so it prints inside the sweep figure. It used
+            // to be appended after the whole list, where "upload 0,2 (davon 2,6 warten auf
+            // threads)" read as an upload that waited longer than it ran. Only worth the
+            // width when it is actually a large share of the sweep - which is exactly the
+            // case that needs naming.
+            if (e.SweepWaitMs >= 1.0 && e.SweepWaitMs >= e.SweepMs * 0.25)
+                sb.AppendFormat(ci, " (davon {0:F1} warten auf threads)", e.SweepWaitMs);
+            sb.AppendFormat(ci, ", upload {0:F1}", e.UploadMs);
             if (e.EntityTessMs >= 1.0)
                 sb.AppendFormat(ci, ", enttess {0:F1}", e.EntityTessMs);
             if (e.HudMs >= 1.0)
                 sb.AppendFormat(ci, ", hud {0:F1}", e.HudMs);
-            // Only worth the width when it is actually a large share of the sweep - which is
-            // exactly the case that needs naming.
-            if (e.SweepWaitMs >= 1.0 && e.SweepWaitMs >= e.SweepMs * 0.25)
-                sb.AppendFormat(ci, " (davon {0:F1} warten auf threads)", e.SweepWaitMs);
         }
         if (!double.IsNaN(e.TurnDegPerSec))
             sb.AppendFormat(ci, " | {0:F0} grad/s, {1:F1} m/s", e.TurnDegPerSec, e.MoveBlocksPerSec);

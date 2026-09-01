@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "3";
+    public const string Current = "4";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -469,6 +469,14 @@ public class KometConfig
 
     /// <summary>Show the on-screen performance overlay right away. Toggle in game with F7.</summary>
     public bool DebugHudVisible { get; set; }
+
+    /// <summary>
+    /// Raster the HUD text on a worker thread instead of inside the frame. The full rebuild
+    /// (cairo raster included) used to land in a single ortho frame - a field log booked it
+    /// as "hud 3,0 / 7,7" hitch shares. Off: the old synchronous path, also the automatic
+    /// fallback if cairo refuses the worker thread. '.komet toggle hudraster' flips it live.
+    /// </summary>
+    public bool HudBackgroundRaster { get; set; } = true;
 
     /// <summary>
     /// Measure each render stage and the game tick so the HUD can show where a frame goes.

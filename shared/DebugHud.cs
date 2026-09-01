@@ -51,11 +51,49 @@ public class DebugHud : IRenderer
     /// GC involved, is the world still loading - and nothing else. F7 cycles
     /// aus -> kompakt -> voll; the full view is the diagnostic instrument, the compact one
     /// is for playing. Full is unchanged in content, so screenshots stay comparable.
+    ///
+    /// A property, because a view change must invalidate the texture: the text rebuild runs
+    /// on a timer, and a plain field left the OLD view on screen for up to a rebuild interval
+    /// after F7 - the full HUD visibly flashing before the compact one appeared.
     /// </summary>
-    public bool Compact = true;
+    public bool Compact
+    {
+        get => compact;
+        set { if (compact != value) { compact = value; dirty = true; } }
+    }
+    private bool compact = true;
+
+    public bool Visible
+    {
+        get => visible;
+        set { if (visible != value) { visible = value; dirty = true; } }
+    }
+    private bool visible;
+
+    /// <summary>State changed (F7, a command, first show): the very next rendered frame must
+    /// show exactly the new state, never the previous one's pixels. Internal so verify can
+    /// pin that the property setters actually set it - the forgotten invalidation WAS the
+    /// reported flicker.</summary>
+    internal bool dirty = true;
+
+    /// <summary>
+    /// Raster the text on a worker instead of the render thread. The full rebuild used to run
+    /// inside the ortho stage and its cost landed in a single frame - a field log booked
+    /// "hud 3,0 / 3,1 / 7,7" as hitch shares. Off-thread, the frame pays only for sampling,
+    /// composing and the GL upload. Static because there is one overlay per process.
+    /// </summary>
+    public static bool BackgroundRaster = true;
+
+    /// <summary>An off-thread raster threw once (cairo built without threads?): stay on the
+    /// synchronous path for the rest of the session instead of failing four times a second.
+    /// Static like the interval - one overlay per process, and Compose() reports it.</summary>
+    private static bool rasterBroken;
+
+    private System.Threading.Tasks.Task rasterTask;
+    private double pendingMainMs, pendingRasterMs;
 
     private LoadedTexture texture;
-    private readonly CairoFont font;
+    private CairoFont font;
     private readonly TextBackground background;
     private float accum;
     private string lastText = "";
@@ -101,8 +139,6 @@ public class DebugHud : IRenderer
     private float fragmentation;
     private int loadedChunks;
 
-    public bool Visible;
-
     /// <summary>Draw calls issued in the last rendered frame.</summary>
     public int DrawCallsPerFrame => drawCallsPerFrame;
 
@@ -121,11 +157,12 @@ public class DebugHud : IRenderer
         this.capi = capi;
         this.title = title;
 
-        // LoadOrUpdateCairoTexture dereferences the target without a null check, so the
-        // texture object has to exist before the first upload.
-        texture = new LoadedTexture(capi);
+        // Texture and font are created lazily on the first rendered frame, not here: the
+        // LoadedTexture needs a live API (LoadOrUpdateCairoTexture dereferences it without a
+        // null check, so it must exist before the first upload) and CairoFont's static
+        // initialiser needs a running game - while the F7 state machine is exercised by
+        // verify on an instance that has neither.
 
-        font = CairoFont.WhiteSmallText().WithFont("monospace").WithFontSize(15f);
         background = new TextBackground
         {
             FillColor = new[] { 0.0, 0.0, 0.0, 0.62 },
@@ -153,6 +190,31 @@ public class DebugHud : IRenderer
         }
     }
 
+    /// <summary>What the state machine decides to do in one rendered frame. Public surface is
+    /// the enum only; the transition rule is <see cref="NextStep"/>.</summary>
+    internal enum Step { Draw, RebuildNow, WaitInvisible, Upload, Start }
+
+    /// <summary>
+    /// The per-frame decision, pure so verify can pin it. The invariant that fixes the F7
+    /// flicker lives here: while <paramref name="dirty"/> is set the texture still holds the
+    /// PREVIOUS state's pixels, so the only legal outcomes are an immediate synchronous
+    /// rebuild or - if a background raster is still painting the old state - drawing nothing
+    /// at all. Plain Draw is never legal on a dirty frame.
+    /// </summary>
+    internal static Step NextStep(bool dirty, bool rasterInFlight, bool rasterDone,
+                                  float accum, float interval, bool hasTexture)
+    {
+        if (dirty) return rasterInFlight && !rasterDone ? Step.WaitInvisible : Step.RebuildNow;
+        if (rasterInFlight) return rasterDone ? Step.Upload : Step.Draw;
+        if (!hasTexture || accum >= interval) return Step.Start;
+        return Step.Draw;
+    }
+
+    /// <summary>The F7 cycle: aus -> kompakt (player view) -> voll (diagnostic) -> aus.
+    /// Pure; the caller assigns the result to the properties, which self-invalidate.</summary>
+    public static (bool visible, bool compact) CycleF7(bool visible, bool compact)
+        => !visible ? (true, true) : compact ? (true, false) : (false, compact);
+
     private void RenderInner(float dt)
     {
         // draw calls only ever increment, so the per-frame count is the delta. The vanilla
@@ -163,17 +225,36 @@ public class DebugHud : IRenderer
         lastDrawCalls = now;
 
         accum += dt;
-        if (accum >= rebuildInterval || texture.TextureId == 0)
+        texture ??= new LoadedTexture(capi);
+        font ??= CairoFont.WhiteSmallText().WithFont("monospace").WithFontSize(15f);
+
+        switch (NextStep(dirty, rasterTask != null, rasterTask?.IsCompleted ?? false,
+                         accum, rebuildInterval, texture.TextureId != 0))
         {
-            accum = 0;
-            long t0 = Stopwatch.GetTimestamp();
-            SampleWorld();
-            Rebuild();
-            double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
-            AvgRebuildMs = AvgRebuildMs <= 0 ? ms : AvgRebuildMs * 0.8 + ms * 0.2;
-            StatRebuilds++;
-            FrameStats.AddHudMs(ms);
-            rebuildInterval = (float)NextIntervalSeconds(AvgRebuildMs);
+            case Step.WaitInvisible:
+                // F7 with a raster mid-paint: the finished texture would show the OLD view.
+                // A frame or two of no HUD is invisible; a frame of the wrong HUD was the
+                // flicker this state machine exists to kill.
+                return;
+            case Step.RebuildNow:
+                if (rasterTask != null)
+                {
+                    // completed, but composed for the state before the change - discard the
+                    // output and force the repaint (lastText already holds ITS text)
+                    rasterTask = null;
+                    lastText = "";
+                }
+                RebuildSync();
+                dirty = false;
+                accum = 0;
+                break;
+            case Step.Upload:
+                FinishRaster();
+                break;
+            case Step.Start:
+                accum = 0;
+                StartRebuild();
+                break;
         }
 
         if (texture.TextureId == 0) return;
@@ -181,6 +262,108 @@ public class DebugHud : IRenderer
         float x = capi.Render.FrameWidth - texture.Width - 8;
         capi.Render.Render2DTexturePremultipliedAlpha(texture.TextureId, x, 8, texture.Width, texture.Height);
     }
+
+    /// <summary>The whole rebuild in one frame - the F7 path, where "exactly the new state,
+    /// this frame" outranks spreading the cost. A keypress happens a few times a session;
+    /// the recurring 4 Hz refresh goes through <see cref="StartRebuild"/> instead.</summary>
+    private void RebuildSync()
+    {
+        long t0 = Stopwatch.GetTimestamp();
+        SampleWorld();
+        ProbeMetrics();
+        string text = Compose();
+        if (text != lastText || texture.TextureId == 0)
+        {
+            lastText = text;
+            if (Layout(text, out string[] lines, out int width, out int height))
+            {
+                EnsureSurface(width, height);
+                Raster(lines, width, height);
+                Upload();
+            }
+        }
+        double ms = ElapsedMs(t0);
+        FrameStats.AddHudMs(ms);
+        FoldRebuild(ms);
+    }
+
+    /// <summary>
+    /// The recurring refresh: sample and compose on the render thread (they read engine and
+    /// stats state), then hand the cairo raster to a worker. The texture keeps showing the
+    /// previous numbers for the few frames the paint takes - unnoticeable at a 4 Hz cadence,
+    /// and the frame no longer pays for the raster at all.
+    /// </summary>
+    private void StartRebuild()
+    {
+        long t0 = Stopwatch.GetTimestamp();
+        SampleWorld();
+        ProbeMetrics();
+        string text = Compose();
+        if (text == lastText && texture.TextureId != 0)
+        {
+            double ms0 = ElapsedMs(t0);
+            FrameStats.AddHudMs(ms0);
+            FoldRebuild(ms0);
+            return;
+        }
+        lastText = text;
+        if (!Layout(text, out string[] lines, out int width, out int height)) return;
+        EnsureSurface(width, height);
+
+        if (!BackgroundRaster || rasterBroken)
+        {
+            Raster(lines, width, height);
+            Upload();
+            double total = ElapsedMs(t0);
+            FrameStats.AddHudMs(total);
+            FoldRebuild(total);
+            return;
+        }
+
+        double mainMs = ElapsedMs(t0);
+        FrameStats.AddHudMs(mainMs);
+        pendingMainMs = mainMs;
+        // The task owns surface and ctx until it completes. Nothing else can touch them in
+        // between: NextStep only allows Start and RebuildNow when no raster is in flight.
+        rasterTask = System.Threading.Tasks.Task.Run(() =>
+        {
+            long r0 = Stopwatch.GetTimestamp();
+            Raster(lines, width, height);
+            pendingRasterMs = ElapsedMs(r0);
+        });
+    }
+
+    /// <summary>The main-thread tail of a background raster: hand the pixels to the driver.</summary>
+    private void FinishRaster()
+    {
+        System.Threading.Tasks.Task t = rasterTask;
+        rasterTask = null;
+        if (t.IsFaulted)
+        {
+            // cairo (or its font map) refused the worker thread on this platform - stay
+            // synchronous for the session and repaint, so the HUD never freezes on stale text
+            rasterBroken = true;
+            lastText = "";
+            capi.Logger.Warning("{0} HUD: hintergrund-raster fehlgeschlagen, ab jetzt synchron: {1}",
+                title, t.Exception?.GetBaseException()?.Message);
+            return;
+        }
+        double uploadMs = Upload();
+        FrameStats.AddHudMs(uploadMs);
+        FoldRebuild(pendingMainMs + pendingRasterMs + uploadMs);
+    }
+
+    /// <summary>Total cost of one rebuild, wherever its parts ran - what the adaptive
+    /// interval paces on, so a slow machine backs off whether or not it rasters off-thread.</summary>
+    private void FoldRebuild(double totalMs)
+    {
+        AvgRebuildMs = AvgRebuildMs <= 0 ? totalMs : AvgRebuildMs * 0.8 + totalMs * 0.2;
+        StatRebuilds++;
+        rebuildInterval = (float)NextIntervalSeconds(AvgRebuildMs);
+    }
+
+    private static double ElapsedMs(long fromTimestamp)
+        => (Stopwatch.GetTimestamp() - fromTimestamp) * 1000.0 / Stopwatch.Frequency;
 
     /// <summary>
     /// Seconds until the next text rebuild, from what a rebuild costs here: 25x the cost, so
@@ -198,18 +381,24 @@ public class DebugHud : IRenderer
         {
             if (capi.World is not ClientMain game) return;
 
-            ChunkRenderer renderer = ChunkRendererRef(game);
-            if (renderer != null)
+            // The pool walk (GetStats + CalcFragmentation over every mesh pool) feeds rows
+            // only the full view shows. The compact view - the view people actually play
+            // with - earns its smallness by not paying for them either.
+            if (!Compact)
             {
-                renderer.GetStats(out long used, out long rendered, out long allocated);
-                vramBytes = used;
-                renderedTris = rendered;
-                allocatedTris = allocated;
-                poolCount = renderer.QuantityModelDataPools();
-                fragmentation = renderer.CalcFragmentation();
-            }
+                ChunkRenderer renderer = ChunkRendererRef(game);
+                if (renderer != null)
+                {
+                    renderer.GetStats(out long used, out long rendered, out long allocated);
+                    vramBytes = used;
+                    renderedTris = rendered;
+                    allocatedTris = allocated;
+                    poolCount = renderer.QuantityModelDataPools();
+                    fragmentation = renderer.CalcFragmentation();
+                }
 
-            if (game.WorldMap != null) loadedChunks = ChunksRef(game.WorldMap)?.Count ?? 0;
+                if (game.WorldMap != null) loadedChunks = ChunksRef(game.WorldMap)?.Count ?? 0;
+            }
 
             TesselationStats.Sample();
             FrameStats.SampleGc();
@@ -220,57 +409,67 @@ public class DebugHud : IRenderer
         }
     }
 
-    private void Rebuild()
+    /// <summary>
+    /// Font metrics, re-probed only when the GUI scale changes. Must run before Compose():
+    /// it reads BarAscii, or the first text would carry bars the box was not sized for.
+    /// Render thread only - it talks to the font map.
+    /// </summary>
+    private void ProbeMetrics()
     {
-        // Metrics first: Compose() reads BarAscii, so the glyph probe has to have run before
-        // the first text is built - or the first raster draws bars the box was not sized for.
-        if (metricsScale != RuntimeEnv.GUIScale)
-        {
-            charAdvance = font.GetTextExtents("0000000000").Width / 10.0;
-            ruleWidth = font.GetTextExtents(Rule).Width;
-            // The share bars assume the block glyphs advance exactly one monospace cell.
-            // A font that substitutes them from a differently-sized fallback would make
-            // bar-carrying lines wider than the computed raster - probed once, and the bars
-            // degrade to '#' rather than overflowing the box.
-            double barAdvance = font.GetTextExtents("████").Width / 4.0;
-            BarAscii = charAdvance <= 0 || Math.Abs(barAdvance - charAdvance) > charAdvance * 0.05;
-            FontExtents fe = font.GetFontExtents();
-            ascent = fe.Ascent;
-            lineHeight = (int)fe.Height;
-            metricsScale = RuntimeEnv.GUIScale;
-        }
+        if (metricsScale == RuntimeEnv.GUIScale) return;
+        charAdvance = font.GetTextExtents("0000000000").Width / 10.0;
+        ruleWidth = font.GetTextExtents(Rule).Width;
+        // The share bars assume the block glyphs advance exactly one monospace cell.
+        // A font that substitutes them from a differently-sized fallback would make
+        // bar-carrying lines wider than the computed raster - probed once, and the bars
+        // degrade to '#' rather than overflowing the box.
+        double barAdvance = font.GetTextExtents("████").Width / 4.0;
+        BarAscii = charAdvance <= 0 || Math.Abs(barAdvance - charAdvance) > charAdvance * 0.05;
+        FontExtents fe = font.GetFontExtents();
+        ascent = fe.Ascent;
+        lineHeight = (int)fe.Height;
+        metricsScale = RuntimeEnv.GUIScale;
+    }
 
-        string text = Compose();
-        if (text == lastText && texture.TextureId != 0) return;
-        lastText = text;
-
-        // The engine's GenOrUpdateTextTexture is unusable here: its autobreak layout measures
-        // every line word by word against the box width - each measurement a cairo call that
-        // re-selects the font face - which a Windows tester's box turned into ~40 ms per
-        // rebuild (1-2 ms on the dev machine). The HUD is pre-formatted monospace, so it needs
-        // none of that: size by character count, draw each line once.
-        string[] lines = text.Split('\n');
+    /// <summary>
+    /// Splits the text into trimmed lines and sizes the box. The engine's
+    /// GenOrUpdateTextTexture is unusable here: its autobreak layout measures every line word
+    /// by word against the box width - each measurement a cairo call that re-selects the font
+    /// face - which a Windows tester's box turned into ~40 ms per rebuild (1-2 ms on the dev
+    /// machine). The HUD is pre-formatted monospace, so it needs none of that: size by
+    /// character count, draw each line once.
+    /// </summary>
+    private bool Layout(string text, out string[] lines, out int width, out int height)
+    {
+        lines = text.Split('\n');
         int longest = 0;
         for (int i = 0; i < lines.Length; i++)
         {
             lines[i] = lines[i].TrimEnd();
             longest = Math.Max(longest, lines[i].Length);
         }
+        width = (int)Math.Max(longest * charAdvance, ruleWidth) + 1 + 2 * background.HorPadding;
+        height = lineHeight * lines.Length + 1 + 2 * background.VerPadding;
+        return width >= 8 && height >= 8;
+    }
 
-        int width = (int)Math.Max(longest * charAdvance, ruleWidth) + 1 + 2 * background.HorPadding;
-        int height = lineHeight * lines.Length + 1 + 2 * background.VerPadding;
-        if (width < 8 || height < 8) return;
-
+    private void EnsureSurface(int width, int height)
+    {
         (int surfW, int surfH) = NextSurfaceSize(
             surface?.Width ?? 0, surface?.Height ?? 0, width, height, lineHeight);
-        if (surface == null || surfW != surface.Width || surfH != surface.Height)
-        {
-            ctx?.Dispose();
-            surface?.Dispose();
-            surface = new ImageSurface(Format.Argb32, surfW, surfH);
-            ctx = new Context(surface);
-        }
+        if (surface != null && surfW == surface.Width && surfH == surface.Height) return;
+        ctx?.Dispose();
+        surface?.Dispose();
+        surface = new ImageSurface(Format.Argb32, surfW, surfH);
+        ctx = new Context(surface);
+    }
 
+    /// <summary>
+    /// Paints box and text into the surface. Runs on the render thread (F7 path, fallback) or
+    /// on a worker (recurring refresh) - never both at once, the state machine sequences it.
+    /// </summary>
+    private void Raster(string[] lines, int width, int height)
+    {
         ctx.Operator = Operator.Clear;
         ctx.Paint();
         ctx.Operator = Operator.Over;
@@ -278,7 +477,7 @@ public class DebugHud : IRenderer
         // Content sits in the surface's right-bottom-padded corner: right-anchored so the box
         // hugs the screen edge even though the surface is wider than the text, top-anchored
         // with transparent (invisible) slack below.
-        double xOff = surfW - width;
+        double xOff = surface.Width - width;
         ctx.SetSourceRGBA(background.FillColor[0], background.FillColor[1],
             background.FillColor[2], background.FillColor[3]);
         GuiElement.RoundRectangle(ctx, xOff, 0.0, width, height, background.Radius);
@@ -305,11 +504,16 @@ public class DebugHud : IRenderer
             ctx.ShowText(lines[i]);
             if (font.RenderTwice) ctx.ShowText(lines[i]);
         }
+    }
 
+    /// <summary>Hands the surface to the driver. Render thread only (GL).</summary>
+    private double Upload()
+    {
         long t0 = Stopwatch.GetTimestamp();
         capi.Gui.LoadOrUpdateCairoTexture(surface, false, ref texture);
-        double uploadMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+        double uploadMs = ElapsedMs(t0);
         AvgUploadMs = AvgUploadMs <= 0 ? uploadMs : AvgUploadMs * 0.8 + uploadMs * 0.2;
+        return uploadMs;
     }
 
     /// <summary>
@@ -656,7 +860,8 @@ public class DebugHud : IRenderer
         if (AvgRebuildMs >= 0.05)
             Row(sb, "hud-aufbau", null, Ms(AvgRebuildMs),
                 "alle " + rebuildInterval.ToString("0.##", ci)
-                + " s · davon upload " + AvgUploadMs.ToString("F1", ci) + " ms");
+                + " s · upload " + AvgUploadMs.ToString("F1", ci) + " ms"
+                + (BackgroundRaster && !rasterBroken ? " · raster im worker" : ""));
 
         extra?.Invoke(sb, frame);
 
@@ -665,11 +870,21 @@ public class DebugHud : IRenderer
 
     public void Dispose()
     {
+        // A raster still painting owns surface and ctx. Waiting a moment is fine here (world
+        // leave, not a frame); if it is genuinely hung, leak both to the finaliser rather
+        // than dispose them under the worker's brush.
+        bool rasterDone = true;
+        try { rasterDone = rasterTask?.Wait(500) ?? true; } catch { /* faulted counts as done */ }
+        rasterTask = null;
+
         texture?.Dispose();
         texture = null;
-        ctx?.Dispose();
+        if (rasterDone)
+        {
+            ctx?.Dispose();
+            surface?.Dispose();
+        }
         ctx = null;
-        surface?.Dispose();
         surface = null;
     }
 }
