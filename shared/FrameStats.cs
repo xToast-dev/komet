@@ -301,6 +301,12 @@ public static class FrameStats
     /// names itself instead of reading as an engine ortho problem.</summary>
     public static void AddHudMs(double ms) => hudMsThisFrame += ms;
 
+    /// <summary>Main-thread entity shape tesselation inside this frame. Booked separately
+    /// because the world-join bursts land in the same "before" bucket as the chunk uploads
+    /// and the liquid-depth pass - a 65 ms before-hitch needs to say which of them it was.</summary>
+    public static void AddEntityTessMs(double ms) => entityTessMsThisFrame += ms;
+    private static double entityTessMsThisFrame;
+
     public static void AddStageTicks(int stage, long ticks)
     {
         if ((uint)stage < StageCount) stageTicks[stage] += ticks;
@@ -410,7 +416,7 @@ public static class FrameStats
 
                 HitchLog.OnFrame(frameMs, AvgFrameMs, gcPauseMs, hitchBuckets, gcTag,
                                  cullMs, uploadMsThisFrame, cullWaitTicks * TicksToMs,
-                                 hudMsThisFrame);
+                                 hudMsThisFrame, entityTessMsThisFrame);
             }
 
             if (TotalFrames >= WarmupFrames) HasData = true;
@@ -426,6 +432,7 @@ public static class FrameStats
         swapTicks = 0;
         uploadMsThisFrame = 0;
         hudMsThisFrame = 0;
+        entityTessMsThisFrame = 0;
         Array.Clear(stageTicks, 0, StageCount);
         prevFrameTs = now;
         prevGcPauseMs = gcPauseTotalMs;
@@ -485,6 +492,7 @@ public static class FrameStats
         cullTicks = cullWaitTicks = gameTickTicks = swapTicks = 0;
         uploadMsThisFrame = 0;
         hudMsThisFrame = 0;
+        entityTessMsThisFrame = 0;
         peakFrames = 0;
         frameMsPeak = cullMsPeak = uploadMsPeak = 0;
         Array.Clear(stageTicks, 0, StageCount);

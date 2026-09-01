@@ -38,6 +38,17 @@ public static class EntityTessPatches
     /// <summary>Tesselations that ran / were pushed to a later frame, since start.</summary>
     public static long StatAllowed, StatDeferred;
 
+    /// <summary>
+    /// The single most expensive TesselateShape call seen, and whose entity it was.
+    ///
+    /// The budget's known gap is that the FIRST call of a frame is uncapped (liveness), so
+    /// one fat entity - many clothing pieces, cold texture atlas - can still spike a frame
+    /// alone. When a join burst shows up as "enttess 60" in the hitch line, this pair names
+    /// the entity instead of leaving it at "one of the twenty".
+    /// </summary>
+    public static double StatWorstMs;
+    public static string StatWorstName;
+
     private static double spentThisFrameMs;
     private static int allowedThisFrame;
 
@@ -89,11 +100,31 @@ public static class EntityTessPatches
         return true;
     }
 
-    public static void TessPostfix(long __state)
+    public static void TessPostfix(long __state, object __instance)
     {
         if (__state == 0) return; // skipped, or the budget is off
-        spentThisFrameMs += (Stopwatch.GetTimestamp() - __state) * 1000.0 / Stopwatch.Frequency;
+        double ms = (Stopwatch.GetTimestamp() - __state) * 1000.0 / Stopwatch.Frequency;
+        spentThisFrameMs += ms;
         allowedThisFrame++;
         StatAllowed++;
+
+        // feeds the hitch line's "enttess" share - the sub-attribution of the before bucket
+        Measure.FrameStats.AddEntityTessMs(ms);
+
+        if (ms > StatWorstMs)
+        {
+            StatWorstMs = ms;
+            // EntityShapeRenderer derives from the public API EntityRenderer, whose entity
+            // field is public - no reflection needed, and a null anywhere just loses the name
+            StatWorstName = (__instance as Vintagestory.API.Common.Entities.EntityRenderer)
+                ?.entity?.Code?.ToShortString();
+        }
+    }
+
+    public static void ResetStats()
+    {
+        StatAllowed = StatDeferred = 0;
+        StatWorstMs = 0;
+        StatWorstName = null;
     }
 }

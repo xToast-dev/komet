@@ -125,10 +125,7 @@ public partial class KometModSystem
         }
 
         DebugHud.Section(sb, "komet");
-        if (safeMode) DebugHud.Row(sb, "!! SAFEMODE", "AN", null, "alles vanilla, '.komet safemode'");
-        if (StressTest.StatusLine != null) DebugHud.Row(sb, "!! STRESSTEST", null, null, StressTest.StatusLine);
-        string diag = ActiveDiagnostics();
-        if (diag != null) DebugHud.Row(sb, "!! DIAGNOSE", null, null, diag);
+        WriteKometWarnings(sb, frameMs);
 
         // -- the sweep --
         DebugHud.Row(sb, "sichtbarkeit", DebugHud.Pct(FrameStats.AvgCullMs, frameMs), DebugHud.Ms(FrameStats.AvgCullMs),
@@ -228,6 +225,13 @@ public partial class KometModSystem
         if (Patches.EntityTessPatches.StatAllowed + Patches.EntityTessPatches.StatDeferred > 0)
             DebugHud.Row(sb, "entity-tess", DebugHud.N(Patches.EntityTessPatches.StatAllowed), null,
                 DebugHud.N(Patches.EntityTessPatches.StatDeferred) + " verschoben"
+                // the budget's liveness gap made visible: the first call per frame is
+                // uncapped, so ONE fat entity can still spike a frame - this names it
+                + (Patches.EntityTessPatches.StatWorstMs >= 5
+                    ? " · langsamster " + Patches.EntityTessPatches.StatWorstMs.ToString("F0", CultureInfo.CurrentCulture)
+                      + " ms" + (Patches.EntityTessPatches.StatWorstName != null
+                          ? " (" + Patches.EntityTessPatches.StatWorstName + ")" : "")
+                    : "")
                 + (Patches.EntityTessPatches.Enabled ? "" : " (AUS)"));
         if (Patches.FirepitPatches.StatSkipped > 0 || Patches.FirepitPatches.StatFastPath > 0
             || Patches.FirepitPatches.StatNearVanilla > 0)
@@ -238,6 +242,19 @@ public partial class KometModSystem
         if (PoolReclaimer.StatPoolsReclaimed > 0)
             DebugHud.Row(sb, "vram frei", DebugHud.N(PoolReclaimer.StatBytesReclaimed / 1048576.0) + " MB", null,
                 DebugHud.N(PoolReclaimer.StatPoolsReclaimed) + " pools zurückgegeben");
+    }
+
+    /// <summary>
+    /// The !!-rows alone. Shared between the full view's komet section and the compact view:
+    /// a safemode session, a running stress test or an armed diagnostic changes what every
+    /// other number means, so no view may hide them.
+    /// </summary>
+    private void WriteKometWarnings(StringBuilder sb, double frameMs)
+    {
+        if (safeMode) DebugHud.Row(sb, "!! SAFEMODE", "AN", null, "alles vanilla, '.komet safemode'");
+        if (StressTest.StatusLine != null) DebugHud.Row(sb, "!! STRESSTEST", null, null, StressTest.StatusLine);
+        string diag = ActiveDiagnostics();
+        if (diag != null) DebugHud.Row(sb, "!! DIAGNOSE", null, null, diag);
     }
 
     /// <summary>Which of the two bit-identical sweep kernels is running, and on how many threads.</summary>
@@ -362,8 +379,13 @@ public partial class KometModSystem
         // arrived without it, because reports come from '.komet report', not screenshots.
         // Whatever nobody measures stays visible as "rest" instead of vanishing.
         if (FrameStats.AllocMbPerSecond >= 8)
+            // "rest" is what no measured thread accounts for. In singleplayer that is almost
+            // entirely the integrated server (worldgen, serialization, compression) sharing
+            // this process - the 01.09. report measured rest 243 of 317 MB/s while streaming,
+            // with the once-suspected network thread at just 16. Saying so in the line keeps
+            // the number from being re-attributed to the next plausible suspect.
             sb.AppendFormat(ci, "  alloc-quellen: netz {0:F0}, main {1:F0}, prefetch {2:F0}, "
-                + "tess {3:F0}, rest {4:F0} MB/s\n",
+                + "tess {3:F0}, rest {4:F0} MB/s (rest = ungemessen, v.a. integrierter server)\n",
                 FrameStats.NetAllocMbPerSecond, FrameStats.MainAllocMbPerSecond,
                 FrameStats.PrefetchAllocMbPerSecond, TesselationStats.AllocMbPerSecond,
                 Math.Max(0.0, FrameStats.AllocMbPerSecond - FrameStats.NetAllocMbPerSecond
@@ -408,8 +430,8 @@ public partial class KometModSystem
 
         long batches = FastCuller.Workers.StatRuns;
         if (batches > 0)
-            sb.AppendFormat(ci, "  cull-threads: {0:F3} ms warten je batch ueber {1:N0} batches, "
-                + "occlusion auf {2} threads\n",
+            sb.AppendFormat(ci, "  cull-threads: {0:F3} ms warten je batch ueber {1:N0} batches"
+                + "{3}, occlusion auf {2} threads\n",
                 FastCuller.Workers.StatWaitTicks * 1000.0
                     / System.Diagnostics.Stopwatch.Frequency / batches,
                 batches,
@@ -417,7 +439,12 @@ public partial class KometModSystem
                 // ordinary threads on Linux, so "deprioritised" has to be something the OS
                 // confirmed rather than something we asked for.
                 (FastChunkCuller.Workers.ThreadCount + 1)
-                    + (FastChunkCuller.Workers.PriorityLowered ? " (nachrangig)" : ""));
+                    + (FastChunkCuller.Workers.PriorityLowered ? " (nachrangig)" : ""),
+                // batches that ran inline because a helper had not woken up yet - the number
+                // that says how often the machine was too loaded for the parallel path
+                FastCuller.Workers.StatContendedInline > 0
+                    ? " (" + FastCuller.Workers.StatContendedInline.ToString("N0", ci) + "x inline wegen kontention)"
+                    : "");
 
         string diag = ActiveDiagnostics();
         if (diag != null)

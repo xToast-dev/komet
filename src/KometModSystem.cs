@@ -223,14 +223,19 @@ public partial class KometModSystem : ModSystem
         hud = new DebugHud(api, "komet " + KometVersion.Display(Mod.Info.Version))
         {
             Visible = config.DebugHudVisible,
-            ExtraSection = WriteKometSection
+            Compact = true,
+            ExtraSection = WriteKometSection,
+            ExtraCompactSection = WriteKometWarnings
         };
         api.Event.RegisterRenderer(hud, EnumRenderStage.Ortho, "komethud");
 
         api.Input.RegisterHotKey("komethud", "komet: Performance-HUD", GlKeys.F7, HotkeyType.HelpAndOverlays);
         api.Input.SetHotKeyHandler("komethud", _ =>
         {
-            hud.Visible = !hud.Visible;
+            // aus -> kompakt (the player view) -> voll (the diagnostic instrument) -> aus
+            if (!hud.Visible) { hud.Visible = true; hud.Compact = true; }
+            else if (hud.Compact) hud.Compact = false;
+            else hud.Visible = false;
             return true;
         });
 

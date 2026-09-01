@@ -821,6 +821,18 @@ internal static class Program
                 if (DebugHud.Bar(5, 10) != "#####") throw new Exception("ascii fallback broken");
             }
             finally { DebugHud.BarAscii = savedAscii; }
+
+            // The compact view is a SELECTION of the full one: the player rows, none of the
+            // diagnostic sections, and the extra warnings hook still runs (a safemode session
+            // must be recognisable at a glance in either view).
+            bool warned = false;
+            string small = DebugHud.ComposeCompact("test", (sbw, _) => { sbw.Append("!! W\n"); warned = true; });
+            if (!warned) throw new Exception("compact view skipped the warnings hook");
+            if (!small.Contains("fps")) throw new Exception("compact view lost the fps row");
+            if (small.Contains("frame-aufteilung") || small.Contains("terrain vram") || small.Contains("draw calls"))
+                throw new Exception("compact view still carries diagnostic sections");
+            if (small.Split('\n').Length >= text.Split('\n').Length)
+                throw new Exception("compact view is not smaller than the full one");
             FrameStats.Reset();
         });
 
@@ -890,6 +902,46 @@ internal static class Program
             finally { set.Stop(); }
         });
 
+        Check("a helper that has not woken up cannot stall the caller - the batch runs inline", () =>
+        {
+            // The 01.09. report's smoking gun: sweep hitches whose 9,7-11 ms were pure
+            // "warten auf threads" with no GC pause. The old design waited for every helper
+            // to wake and check in, even when no work was left for it; on a machine where
+            // occlusion, worldgen and GC threads fight over six cores, the last helper's
+            // wake-up can take that long. Completion is now counted in work, and a batch that
+            // finds a helper still unaccounted for runs inline instead of waiting.
+            var set = new WorkerSet("verify-contended");
+            set.Start(2);
+            try
+            {
+                var first = new int[64];
+                set.Run(new CountingBody { Hits = first }, 64, 4);
+                for (int i = 0; i < 64; i++)
+                    if (first[i] != 1) throw new Exception("warm-up batch broken");
+
+                // simulate the sleeper: one helper allegedly still inside the previous batch
+                var pendingRef = AccessTools.FieldRefAccess<WorkerSet, int>("pending");
+                pendingRef(set) = 1;
+                long contendedBefore = set.StatContendedInline;
+                var second = new int[64];
+                set.Run(new CountingBody { Hits = second }, 64, 4);
+                if (set.StatContendedInline != contendedBefore + 1)
+                    throw new Exception("the contended batch did not take the inline path");
+                for (int i = 0; i < 64; i++)
+                    if (second[i] != 1) throw new Exception($"inline fallback dropped index {i}");
+
+                // sleeper woke up (checked in) - the parallel path resumes
+                pendingRef(set) = 0;
+                var third = new int[64];
+                set.Run(new CountingBody { Hits = third }, 64, 4);
+                if (set.StatContendedInline != contendedBefore + 1)
+                    throw new Exception("a clean batch was treated as contended");
+                for (int i = 0; i < 64; i++)
+                    if (third[i] != 1) throw new Exception("the set did not recover after the sleeper checked in");
+            }
+            finally { set.Stop(); }
+        });
+
         Check("deprioritised workers really are deprioritised by the OS, not just asked to be", () =>
         {
             // Thread.Priority = BelowNormal is accepted on Linux, reads back as BelowNormal, and
@@ -903,22 +955,36 @@ internal static class Program
             try
             {
                 var seen = new int[64];
-                // one batch, so every worker has run its body and therefore its start-up
                 set.Run(new CountingBody { Hits = seen }, 64, 4);
+                // A Run no longer guarantees the workers have even woken up - completion is
+                // counted in work, and the caller can finish a batch alone before the OS
+                // schedules the helpers. Their start-up (which is where setpriority runs) is
+                // waited for explicitly instead.
+                var startup = System.Diagnostics.Stopwatch.StartNew();
+                while (!set.PriorityLowered && startup.ElapsedMilliseconds < 2000)
+                    System.Threading.Thread.Sleep(5);
                 if (!set.PriorityLowered)
                     throw new Exception("setpriority did not report success");
 
                 // /proc/self/stat is the thread group leader - the main thread - which is the
                 // baseline the workers have to be below. CurrentManagedThreadId is a managed id
                 // and has nothing to do with the OS tid the task directories are named after.
+                // Polled like PriorityLowered above: the second worker may still be on its way
+                // to its own setpriority call when the first one already reported success.
                 int mainNice = NiceOf("/proc/self");
                 int lowered = 0, total = 0;
-                foreach (string dir in System.IO.Directory.GetDirectories("/proc/self/task"))
+                while (startup.ElapsedMilliseconds < 2000)
                 {
-                    if (System.IO.File.ReadAllText(dir + "/comm").Trim() is not "verify-nice-0" and not "verify-nice-1")
-                        continue;
-                    total++;
-                    if (NiceOf(dir) > mainNice) lowered++;
+                    lowered = 0; total = 0;
+                    foreach (string dir in System.IO.Directory.GetDirectories("/proc/self/task"))
+                    {
+                        if (System.IO.File.ReadAllText(dir + "/comm").Trim() is not "verify-nice-0" and not "verify-nice-1")
+                            continue;
+                        total++;
+                        if (NiceOf(dir) > mainNice) lowered++;
+                    }
+                    if (total == 2 && lowered == total) break;
+                    System.Threading.Thread.Sleep(5);
                 }
                 if (total == 0) throw new Exception("the worker threads were not found in /proc");
                 if (lowered != total)
@@ -1919,13 +1985,17 @@ internal static class Program
                 System.Threading.Thread.Sleep(1);
             }
             FrameStats.BeginFrame();
-            Console.WriteLine("\n--- HUD preview ---");
+            Console.WriteLine("\n--- HUD preview (kompakt) ---");
             // stamped by hand: this runner is not the mod assembly and carries no build stamp,
-            // but the preview is exactly where the real title width has to be visible
-            Console.WriteLine(DebugHud.Compose("komet " + KometVersion.Compose("1.0.0", "260830.1917"),
+            // but the preview is exactly where the real title width has to be visible. The
+            // stamp deliberately carries a full git hash so the shortening is visible here.
+            string previewTitle = "komet " + KometVersion.Compose("1.1.0",
+                KometVersion.StampFrom("1.1.0+260901.1928.577893d65021628b0fdc58080053e5eb5defcfb2"));
+            Console.WriteLine(DebugHud.ComposeCompact(previewTitle,
+                (sbw, _) => DebugHud.Row(sbw, "!! SAFEMODE", "AN", null, "alles vanilla")));
+            Console.WriteLine("\n--- HUD preview (voll) ---");
+            Console.WriteLine(DebugHud.Compose(previewTitle,
                 3412, 1536, 512L * 1048576, 214, 0.11f, 41024, null));
-            Console.WriteLine();
-            Console.WriteLine(DebugHud.Compose("vanilla 1.5.0", 3412, 1536, 512L * 1048576, 214, 0.11f, 41024, null));
             Console.WriteLine("--- end ---\n");
         }
 
@@ -2055,6 +2125,19 @@ internal static class Program
                 throw new Exception("a missing informational version did not yield null");
             if (KometVersion.Compose("1.0.0", null) != "1.0.0" || KometVersion.Compose("1.0.0", "") != "1.0.0")
                 throw new Exception("an unstamped build did not fall back to the bare version");
+
+            // The SDK appends the full 40-char git commit inside a repository; the display
+            // keeps git's own short form. The date (6 digits) and time (4) segments are
+            // shorter than any hash and must come through untouched.
+            if (KometVersion.StampFrom("1.1.0+260901.1928.577893d65021628b0fdc58080053e5eb5defcfb2")
+                != "260901.1928.577893d")
+                throw new Exception("full commit hash not shortened to seven characters, got "
+                    + KometVersion.StampFrom("1.1.0+260901.1928.577893d65021628b0fdc58080053e5eb5defcfb2"));
+            if (KometVersion.StampFrom("1.1.0+260901.1928") != "260901.1928")
+                throw new Exception("a hashless stamp was mangled");
+            if (KometVersion.LooksLikeCommitHash("260901")) throw new Exception("a date segment is not a hash");
+            if (KometVersion.LooksLikeCommitHash("veryLongButNotHex")) throw new Exception("non-hex is not a hash");
+            if (!KometVersion.LooksLikeCommitHash("577893d650")) throw new Exception("a real hash prefix was rejected");
         });
 
         Check("every patch class is reachable from KometModSystem", () =>

@@ -38,8 +38,21 @@ public class DebugHud : IRenderer
     private readonly ICoreClientAPI capi;
     private readonly string title;
 
-    /// <summary>Extra rows appended after the built-in sections.</summary>
+    /// <summary>Extra rows appended after the built-in sections (full view only).</summary>
     public SectionWriter ExtraSection;
+
+    /// <summary>The few rows that must be visible even in the compact view - the mod's
+    /// !!-warnings (safemode, stress test, armed diagnostics). A player glancing at the
+    /// small HUD must never mistake a safemode session for a normal one.</summary>
+    public SectionWriter ExtraCompactSection;
+
+    /// <summary>
+    /// The reduced player view: what is my frame, is the GPU the wall, does it hitch, is the
+    /// GC involved, is the world still loading - and nothing else. F7 cycles
+    /// aus -> kompakt -> voll; the full view is the diagnostic instrument, the compact one
+    /// is for playing. Full is unchanged in content, so screenshots stay comparable.
+    /// </summary>
+    public bool Compact = true;
 
     private LoadedTexture texture;
     private readonly CairoFont font;
@@ -428,8 +441,56 @@ public class DebugHud : IRenderer
     }
 
     private string Compose()
-        => Compose(title, drawCallsPerFrame, ClientSettings.ViewDistance, vramBytes, poolCount,
-                   fragmentation, loadedChunks, ExtraSection, renderedTris, allocatedTris);
+        => Compact
+            ? ComposeCompact(title, ExtraCompactSection)
+            : Compose(title, drawCallsPerFrame, ClientSettings.ViewDistance, vramBytes, poolCount,
+                      fragmentation, loadedChunks, ExtraSection, renderedTris, allocatedTris);
+
+    /// <summary>
+    /// The compact view: six-ish rows a player can absorb mid-game. Everything here also
+    /// exists in the full view - this is a selection, never a different measurement.
+    /// </summary>
+    public static string ComposeCompact(string title, SectionWriter warnings)
+    {
+        var sb = new StringBuilder(400);
+
+        if (!FrameStats.HasData)
+        {
+            sb.Append(title).Append('\n');
+            sb.Append("sammelt Daten ... (").Append(FrameStats.TotalFrames).Append(" frames)");
+            return sb.ToString();
+        }
+
+        double frame = FrameStats.AvgFrameMs;
+        double fps = frame > 0 ? 1000.0 / frame : 0;
+        CultureInfo ci = CultureInfo.CurrentCulture;
+
+        sb.Append(title).Append('\n');
+        sb.Append(Rule, 0, 34).Append('\n');
+        Row(sb, "fps", fps.ToString("F0", ci), Ms(frame));
+        if (GpuFrameTimer.GpuMs > 0)
+            Row(sb, "gpu-frame", Pct(GpuFrameTimer.GpuMs, frame), Ms(GpuFrameTimer.GpuMs),
+                GpuFrameTimer.GpuMs >= frame * 0.95 ? "GPU-LIMITIERT" : null);
+        if (HitchLog.TotalHitches > 0)
+        {
+            Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
+                HitchLog.PerMinute.ToString("F1", ci) + "/min");
+            string lastHitch = HitchLog.LastTail();
+            if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
+        }
+        if (FrameStats.GcPauseMsPerSecond > 0.05)
+            Row(sb, "gc-pausen", null, Ms(FrameStats.GcPauseMsPerSecond), "je s");
+        // only while the world is actually loading - a finished world earns a smaller HUD
+        if (Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation > 50
+            || TesselationStats.ReceivedPerSecond > 0.5)
+            Row(sb, "laden", TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s", null,
+                "warteschlange " + N(Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation));
+
+        warnings?.Invoke(sb, frame);
+
+        sb.Append(" F7: details, noch mal: aus");
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Pure text assembly, split out from the renderer so it can be exercised without a GL
@@ -452,7 +513,7 @@ public class DebugHud : IRenderer
         double fps = frame > 0 ? 1000.0 / frame : 0;
         CultureInfo ci = CultureInfo.CurrentCulture;
 
-        sb.Append(title).Append("   gleitender Mittelwert\n");
+        sb.Append(title).Append(" · Mittelwerte\n");
         sb.Append(Rule).Append('\n');
 
         // ---- how it runs, at a glance ----
@@ -577,7 +638,7 @@ public class DebugHud : IRenderer
         }
         if (vramBytes > 0)
             Row(sb, "terrain vram", N(vramBytes / 1048576.0) + " MB", null,
-                poolCount + " pools, " + (fragmentation * 100f).ToString("F0", ci) + "% frag");
+                poolCount + " pools · " + (fragmentation * 100f).ToString("F0", ci) + " % frag");
         Row(sb, "chunk upload", null, Ms(FrameStats.AvgUploadMs),
             "max " + FrameStats.MaxUploadMs.ToString("F1", ci));
         // Cores the whole process keeps busy. Low at idle is HEALTH, not waste - a frame is

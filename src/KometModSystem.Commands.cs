@@ -546,6 +546,8 @@ public partial class KometModSystem
         Patches.MeshUploadPatches.StatFallbackCalls = 0;
         UploadBudget.Reset();
         Patches.PrioUploadPatches.ResetStats();
+        Patches.EntityTessPatches.ResetStats();
+        FastCuller.Workers.StatContendedInline = 0;
         Patches.MeshRecyclerPatches.ResetStats();
         Patches.TightClonePatches.ResetStats();
         Patches.EdgeRetessPriorityPatches.StatPromoted = 0;
