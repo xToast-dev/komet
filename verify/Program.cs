@@ -527,8 +527,15 @@ internal static class Program
             if (!HitchLog.TryGetLast(out HitchLog.Entry eWait)) throw new Exception("wait spike not booked");
             if (Math.Abs(eWait.SweepWaitMs - 18) > 0.5)
                 throw new Exception($"wait share {eWait.SweepWaitMs:F1} ms, expected 18");
-            if (!HitchLog.FormatEntry(in eWait).Contains("warten auf threads"))
+            string waitLine = HitchLog.FormatEntry(in eWait);
+            if (!waitLine.Contains("warten auf threads"))
                 throw new Exception("a wait-dominated sweep did not name the wait");
+            // The wait is a share of the SWEEP and must print inside it. Appended after the
+            // list it attached to whatever came last - a field log read "upload 0,2 (davon
+            // 2,6 warten auf threads)", an upload that waited longer than it ran.
+            if (waitLine.IndexOf("warten auf threads", StringComparison.Ordinal)
+                > waitLine.IndexOf(", upload", StringComparison.Ordinal))
+                throw new Exception("the wait note drifted behind the upload figure");
             // ...and a sweep that really did the work must NOT claim a stall
             if (HitchLog.FormatEntry(in eAttr).Contains("warten auf threads"))
                 throw new Exception("a sweep with no wait was reported as stalled");
@@ -1460,6 +1467,64 @@ internal static class Program
                 HitchLog.MinMs = savedMin;
                 HitchLog.Factor = savedFactor;
             }
+        });
+
+        Check("F7 renders exactly the new state - never stale, never invisible without cause", () =>
+        {
+            // the cycle rule: aus -> kompakt (player view) -> voll (diagnostic) -> aus
+            if (DebugHud.CycleF7(false, false) != (true, true))
+                throw new Exception("off must wake into the compact view");
+            if (DebugHud.CycleF7(true, true) != (true, false))
+                throw new Exception("compact must deepen into the full view");
+            if (DebugHud.CycleF7(true, false).visible)
+                throw new Exception("full must switch off");
+
+            // The invariant that fixes the flicker: on a dirty frame (F7 just changed the
+            // view) the texture still holds the OLD state's pixels, so the only legal steps
+            // are an immediate synchronous rebuild or - while a background raster is still
+            // painting the old state - drawing nothing. Plain Draw booked the old view for
+            // up to a whole rebuild interval: the visible full-HUD flash.
+            foreach (bool inFlight in new[] { false, true })
+            foreach (bool done in new[] { false, true })
+            foreach (float accum in new[] { 0f, 10f })
+            {
+                if (!inFlight && done) continue; // no task cannot be a finished task
+                DebugHud.Step step = DebugHud.NextStep(true, inFlight, done, accum, 0.25f, true);
+                if (step == DebugHud.Step.Draw)
+                    throw new Exception("a dirty frame was allowed to draw the stale texture");
+                if (inFlight && !done && step != DebugHud.Step.WaitInvisible)
+                    throw new Exception("dirty with a raster mid-paint must draw nothing");
+                if ((!inFlight || done) && step != DebugHud.Step.RebuildNow)
+                    throw new Exception("dirty with no busy raster must rebuild this frame");
+            }
+
+            // clean frames: upload a finished raster, never double-start, refresh on the
+            // interval or a missing texture, otherwise just draw
+            if (DebugHud.NextStep(false, true, true, 0f, 0.25f, true) != DebugHud.Step.Upload)
+                throw new Exception("a finished raster must upload");
+            if (DebugHud.NextStep(false, true, false, 10f, 0.25f, true) != DebugHud.Step.Draw)
+                throw new Exception("an unfinished raster must not spawn a second rebuild");
+            if (DebugHud.NextStep(false, false, false, 0.3f, 0.25f, true) != DebugHud.Step.Start)
+                throw new Exception("an elapsed interval must start a refresh");
+            if (DebugHud.NextStep(false, false, false, 0f, 0.25f, false) != DebugHud.Step.Start)
+                throw new Exception("a missing texture must start a refresh");
+            if (DebugHud.NextStep(false, false, false, 0.1f, 0.25f, true) != DebugHud.Step.Draw)
+                throw new Exception("a quiet frame must just draw");
+
+            // the setter half: assigning a view property must raise the dirty flag, or the
+            // state machine never learns anything changed (the texture creation is lazy
+            // precisely so this is constructible without a game)
+            var hud = new DebugHud(null, "probe");
+            if (!hud.dirty) throw new Exception("a fresh HUD must build on its first frame");
+            hud.Visible = true;
+            hud.dirty = false;
+            hud.Compact = false;
+            if (!hud.dirty) throw new Exception("a view change did not invalidate the texture");
+            hud.dirty = false;
+            hud.Compact = false; // no actual change
+            if (hud.dirty) throw new Exception("a no-op assignment invalidated for nothing");
+            hud.Visible = false;
+            if (!hud.dirty) throw new Exception("a visibility change did not invalidate");
         });
 
         Check("custom-part clones copy the content, not the accumulation capacity", () =>
@@ -3316,6 +3381,35 @@ internal static class Program
             MethodInfo tessTick = AccessTools.Method(
                 typeof(Vintagestory.Client.NoObf.ChunkTesselatorManager), "OnSeperateThreadGameTick");
             ForceJit(tessTick);
+            ForceJit(AccessTools.Method(
+                typeof(Vintagestory.Client.NoObf.ChunkTesselatorManager), "TesselateChunk"));
+        });
+
+        Check("a dying world stops the tesselator at the next chunk, not the next tick", () =>
+        {
+            // One tick drains the WHOLE dirty queue - with thousands queued it outlives the
+            // engine's 200 ms thread-exit window by seconds, so the tick-boundary guard alone
+            // provably missed (the exit NRE in BuildExtendedChunkData came back). The
+            // per-chunk prefix is what actually stops an in-flight tick.
+            try
+            {
+                TesselationPatches.ShuttingDown = false;
+                int result = 7;
+                bool requeue = true;
+                if (!TesselationPatches.TesselateChunkPrefix(ref result, ref requeue))
+                    throw new Exception("a healthy world was blocked");
+                TesselationPatches.ShuttingDown = true;
+                if (TesselationPatches.TesselateChunkPrefix(ref result, ref requeue))
+                    throw new Exception("a chunk was tesselated into a dying world");
+                if (requeue)
+                    throw new Exception("the skip left requeue set - the engine would loop the chunk");
+                if (result != 0)
+                    throw new Exception("the skip must report zero vertices so the stats ignore it");
+            }
+            finally
+            {
+                TesselationPatches.ShuttingDown = false;
+            }
         });
 
         Check("tesselation throughput accounting produces sane figures", () =>

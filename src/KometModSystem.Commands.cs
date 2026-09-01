@@ -324,6 +324,12 @@ public partial class KometModSystem
                     ? "AN (ruckler-zeilen koennen den before-renderer nennen)"
                     : "AUS (vanilla-dispatch in der before-stage)");
                 break;
+            case "hudraster":
+                DebugHud.BackgroundRaster = !DebugHud.BackgroundRaster;
+                state = "hud-raster " + (DebugHud.BackgroundRaster
+                    ? "IM WORKER (frame zahlt nur sampling + upload)"
+                    : "SYNCHRON (kompletter aufbau im frame, wie vanilla-overlays)");
+                break;
             case "retess":
                 Patches.RetessSourcePatches.SampleSources = !Patches.RetessSourcePatches.SampleSources;
                 state = "dirty-mark-quellensampling " + (Patches.RetessSourcePatches.SampleSources
@@ -429,7 +435,8 @@ public partial class KometModSystem
             default:
                 return "unbekannt. Systeme: cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
                      + "prebuild, firepit, enttess, edgecoal, edgeprio, prioupload, profiler, beforeattr, retess, "
-                     + "cullcheck, cellsize, shadowbox, shadowfade, shadowdist, shadowlod, shadowstab, shadowthrottle";
+                     + "hudraster, cullcheck, cellsize, shadowbox, shadowfade, shadowdist, shadowlod, shadowstab, "
+                     + "shadowthrottle";
         }
 
         string world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
