@@ -50,6 +50,7 @@ public static class TesselationPatches
 
     public static void Apply(Harmony harmony, bool noIdleSleep, bool raisePriority, bool prefetch)
     {
+        ShuttingDown = false; // static state must not survive a rejoin into the next world
         NoIdleSleep = noIdleSleep;
         RaiseThreadPriority = raisePriority;
         NeighbourPrefetch = prefetch;
@@ -81,8 +82,19 @@ public static class TesselationPatches
     /// is queued, a brake when 1500 chunks are. Negative only while there is work, so an idle
     /// thread still naps instead of spinning a core.
     /// </summary>
+    /// <summary>
+    /// Set on world leave, cleared on the next world's Apply. While set, the tesselation
+    /// thread gets its vanilla naps back and skips whole ticks: with NoIdleSleep keeping the
+    /// thread hot, it otherwise starts a NEW chunk in the instant between "destroy session"
+    /// and the engine's 200 ms thread-exit window - and dies with an NRE in
+    /// BuildExtendedChunkData when the chunk data is ripped out from under it (seen twice at
+    /// exit, logged by the engine as an unclean shutdown).
+    /// </summary>
+    public static volatile bool ShuttingDown;
+
     public static void TickIntervalPostfix(ChunkTesselatorManager __instance, ref int __result)
     {
+        if (ShuttingDown) return;
         if (__result != 0) return;
         ClientMain game = ClientQueues.GameOf(__instance);
         if (game == null) return;
@@ -96,8 +108,13 @@ public static class TesselationPatches
     /// scanning ClientMain's thread list. First call raises the priority and starts the
     /// prefetcher; after that it is two boolean tests.
     /// </summary>
-    public static void TesselationTickPrefix(ChunkTesselatorManager __instance)
+    public static bool TesselationTickPrefix(ChunkTesselatorManager __instance)
     {
+        // The world is going away: no new chunk may enter tesselation. The engine gives the
+        // thread 200 ms to exit; a tick skipped here is a tick that cannot NRE on data the
+        // teardown already freed.
+        if (ShuttingDown) return false;
+
         if (RaiseThreadPriority && Thread.CurrentThread.Priority == ThreadPriority.Normal)
         {
             try { Thread.CurrentThread.Priority = ThreadPriority.AboveNormal; }
@@ -105,6 +122,7 @@ public static class TesselationPatches
         }
 
         if (NeighbourPrefetch) Prefetcher.EnsureRunning(ClientQueues.GameOf(__instance));
+        return true;
     }
 
     /// <summary>
@@ -253,5 +271,9 @@ public static class TesselationPatches
         }
     }
 
-    public static void Shutdown() => Prefetcher.Stop();
+    public static void Shutdown()
+    {
+        ShuttingDown = true;
+        Prefetcher.Stop();
+    }
 }

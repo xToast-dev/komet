@@ -85,6 +85,12 @@ public static class HitchLog
         /// tester's ~40 ms Cairo rebuilds at fixed 4 Hz turned out to BE the ortho stutter.</summary>
         public double HudMs;
 
+        /// <summary>Main-thread entity shape tesselation inside this frame. The world-join
+        /// bursts book into "before" next to chunk uploads and the liquid-depth pass; this
+        /// share says whether a before-hitch was the entity swarm or something else in the
+        /// same stage.</summary>
+        public double EntityTessMs;
+
         /// <summary>
         /// The part of <see cref="SweepMs"/> the render thread spent waiting for the cull
         /// worker threads. A sweep that is almost all wait is a scheduling stall - somebody
@@ -135,7 +141,7 @@ public static class HitchLog
     /// </summary>
     public static void OnFrame(double frameMs, double avgFrameMs, double gcPauseMs, double[] buckets,
                                string gcTag = null, double sweepMs = 0, double uploadMs = 0,
-                               double sweepWaitMs = 0, double hudMs = 0)
+                               double sweepWaitMs = 0, double hudMs = 0, double entityTessMs = 0)
     {
         // a pending hitch whose camera sample never came (main menu, no wiring) is booked
         // without one rather than lost
@@ -164,6 +170,7 @@ public static class HitchLog
             UploadMs = uploadMs,
             SweepWaitMs = sweepWaitMs,
             HudMs = hudMs,
+            EntityTessMs = entityTessMs,
         };
         // The 0.5 ms floor matters since the Before stage is attributed on every frame: on
         // an unsampled frame the "top renderer" is merely the top BEFORE renderer, and a
@@ -296,9 +303,11 @@ public static class HitchLog
         }
         // Only when they explain a meaningful share - a 20 ms hitch with 0,1 ms of sweep says
         // "not the sweep" loudly enough by not appearing.
-        if (e.SweepMs >= 1.0 || e.UploadMs >= 1.0 || e.HudMs >= 1.0)
+        if (e.SweepMs >= 1.0 || e.UploadMs >= 1.0 || e.HudMs >= 1.0 || e.EntityTessMs >= 1.0)
         {
             sb.AppendFormat(ci, " | davon sweep {0:F1}, upload {1:F1}", e.SweepMs, e.UploadMs);
+            if (e.EntityTessMs >= 1.0)
+                sb.AppendFormat(ci, ", enttess {0:F1}", e.EntityTessMs);
             if (e.HudMs >= 1.0)
                 sb.AppendFormat(ci, ", hud {0:F1}", e.HudMs);
             // Only worth the width when it is actually a large share of the sweep - which is

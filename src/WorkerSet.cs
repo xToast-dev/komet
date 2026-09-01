@@ -49,6 +49,7 @@ public sealed class WorkerSet
     private volatile IWorkBody body;
     private int count, chunk;
     private int nextIndex;
+    private int itemsDone;
     private int pending;
     private Exception failure;
     private volatile bool shutdown;
@@ -62,6 +63,15 @@ public sealed class WorkerSet
     public long StatWaitTicks;
 
     public long StatRuns, StatInline;
+
+    /// <summary>
+    /// Batches run inline because a helper from the PREVIOUS batch had not woken up and
+    /// checked back in yet. On a loaded machine (occlusion walk, worldgen, GC threads all
+    /// wanting the six cores) that helper can be descheduled for many milliseconds; running
+    /// the batch on the calling thread alone costs a fraction of that and self-heals the
+    /// moment the sleeper gets a core. Reported so contention is a number, not a hunch.
+    /// </summary>
+    public long StatContendedInline;
 
     /// <param name="niceness">
     /// Unix nice increment for these workers, 0 to leave them at the process default. Only ever
@@ -167,6 +177,18 @@ public sealed class WorkerSet
     /// returns once every one of them is done. Slices are handed out dynamically, so a chunk
     /// that turns out to be expensive does not leave the other threads idle - which a strided
     /// partition does, and pools differ in size by two orders of magnitude.
+    ///
+    /// Completion is counted in WORK, not in workers: the caller returns as soon as every item
+    /// has run, whether or not every helper has woken up yet. The first version waited for all
+    /// helpers to check in, and the hitch log caught what that costs on a loaded machine:
+    /// 9,7-11 ms sweep waits with no GC pause, which were nothing but the render thread
+    /// waiting for the LAST helper to be scheduled so it could discover there was nothing
+    /// left to do. A helper that never claimed a slice holds no state anybody has to wait for.
+    ///
+    /// The check-in count still exists, but it gates the NEXT batch's setup instead of this
+    /// batch's return: batch fields may only be rewritten once no helper can still be inside
+    /// the previous drain. If a straggler has not checked in by then, the batch runs inline on
+    /// the calling thread - a bounded, self-healing cost instead of an unbounded wait.
     /// </summary>
     public void Run(IWorkBody work, int itemCount, int chunkSize)
     {
@@ -177,7 +199,18 @@ public sealed class WorkerSet
         if (t == null || t.Length == 0 || itemCount <= chunkSize)
         {
             StatInline++;
-            work.Run(0, itemCount);
+            RunInline(work, itemCount);
+            return;
+        }
+
+        // A helper from the previous batch has not woken up and checked back in. It cannot be
+        // holding work (the previous Run only returned once all items were done), but it WILL
+        // read the batch fields when it finally wakes - so they must not be rewritten under
+        // it. Waiting here would just move the stall; the batch runs inline instead.
+        if (Volatile.Read(ref pending) != 0)
+        {
+            StatContendedInline++;
+            RunInline(work, itemCount);
             return;
         }
 
@@ -185,6 +218,7 @@ public sealed class WorkerSet
 
         count = itemCount;
         chunk = chunkSize;
+        Volatile.Write(ref itemsDone, 0);
         Volatile.Write(ref nextIndex, 0);
         failure = null;
         pending = t.Length;
@@ -198,10 +232,6 @@ public sealed class WorkerSet
 
         // The caller is a worker too - it would otherwise sit idle through its own batch, and
         // on a small batch it can finish the whole thing before the first helper even wakes.
-        //
-        // Its slice is caught for the same reason a helper's is: leaving Run early would return
-        // to a caller that is free to reuse the batch buffers while the helpers are still
-        // reading them. The wait below is not optional, whatever went wrong.
         try
         {
             Drain(work);
@@ -209,14 +239,33 @@ public sealed class WorkerSet
         catch (Exception e)
         {
             Interlocked.CompareExchange(ref failure, e, null);
+            AbandonRemaining();
         }
 
+        // Waits for the WORK, not the workers: every claimed slice is finished and counted, or
+        // this never fires. Leaving while a slice is unfinished would let the caller reuse the
+        // batch buffers under a helper that is still reading them - so the wait is not
+        // optional, but it also never outlasts the work itself.
         long t0 = Stopwatch.GetTimestamp();
         allDone.Wait();
         StatWaitTicks += Stopwatch.GetTimestamp() - t0;
 
         Exception failed = failure;
         if (failed != null) throw new InvalidOperationException("parallel work item failed", failed);
+    }
+
+    /// <summary>Every path out of Run surfaces a failed work item the same way - the caller
+    /// must not need to know whether the batch happened to go parallel or inline.</summary>
+    private static void RunInline(IWorkBody work, int itemCount)
+    {
+        try
+        {
+            work.Run(0, itemCount);
+        }
+        catch (Exception e)
+        {
+            throw new InvalidOperationException("parallel work item failed", e);
+        }
     }
 
     private void Drain(IWorkBody work)
@@ -228,7 +277,36 @@ public sealed class WorkerSet
             if (from >= n) return;
             int to = from + c;
             if (to > n) to = n;
-            work.Run(from, to);
+            // The item count advances even when the slice throws (the exception still
+            // propagates): a claimed slice that never counted would leave the caller waiting
+            // on work that no longer exists.
+            try
+            {
+                work.Run(from, to);
+            }
+            finally
+            {
+                if (Interlocked.Add(ref itemsDone, to - from) == n) allDone.Set();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Claims and counts every remaining slice WITHOUT running it. Only ever called after a
+    /// slice failed: the batch's result is void anyway (the caller rethrows), and without
+    /// this, a batch in which every participant failed would strand unclaimed items and hang
+    /// the caller forever.
+    /// </summary>
+    private void AbandonRemaining()
+    {
+        int n = count, c = chunk;
+        while (true)
+        {
+            int from = Interlocked.Add(ref nextIndex, c) - c;
+            if (from >= n) return;
+            int to = from + c;
+            if (to > n) to = n;
+            if (Interlocked.Add(ref itemsDone, to - from) == n) allDone.Set();
         }
     }
 
@@ -242,9 +320,10 @@ public sealed class WorkerSet
             gate.Reset();
             if (shutdown) return;
 
-            // Every path has to reach the decrement, or the caller waits forever on a frame it
-            // will never finish. A failed work item is reported through 'failure' and rethrown
-            // on the caller, which is where Parallel.For would have surfaced it too.
+            // A failed work item is reported through 'failure' and rethrown on the caller,
+            // which is where Parallel.For would have surfaced it too. The check-in decrement
+            // runs on every path: it is what tells the next Run that this helper can no
+            // longer be inside the batch fields.
             try
             {
                 Drain(body);
@@ -252,10 +331,11 @@ public sealed class WorkerSet
             catch (Exception e)
             {
                 Interlocked.CompareExchange(ref failure, e, null);
+                AbandonRemaining();
             }
             finally
             {
-                if (Interlocked.Decrement(ref pending) == 0) allDone.Set();
+                Interlocked.Decrement(ref pending);
             }
         }
     }

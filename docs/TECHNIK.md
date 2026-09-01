@@ -532,6 +532,28 @@ weggelassen, Klammerung im Skalarprodukt vertauscht — alle drei schlagen fehl.
 
 ---
 
+## Cull-Worker: fertig ist die Arbeit, nicht die Belegschaft (01.09.)
+
+Die dedizierten Cull-Threads (seit 1.45 statt des ThreadPools) hatten noch ein Loch, das
+der Feldreport vom 01.09. benannt hat: Sweep-Ruckler mit `(davon 9,7–11,0 warten auf
+threads)` **ohne** GC-Pause. Der Render-Thread wartete nicht auf Arbeit, sondern darauf,
+dass der **letzte Helfer aufwacht und sich abmeldet** — auch wenn längst nichts mehr zu
+tun war. Auf einer Maschine, auf der Occlusion-Walk, Worldgen-Threads und GC um sechs
+Kerne kämpfen, kann genau dieser eine Weckruf viele Millisekunden im Scheduler hängen.
+
+Zwei Änderungen: **Completion zählt jetzt Arbeit, nicht Worker** — jede Slice zählt ihre
+Items, der Aufrufer kehrt zurück, sobald alle Items gelaufen sind; ein Helfer, der nie
+eine Slice beansprucht hat, hält nichts, worauf irgendwer warten müsste. Der
+Check-in-Zähler existiert weiter, bewacht aber nur noch den **Setup des nächsten
+Batches** (die Batch-Felder dürfen nicht unter einem noch lesenden Nachzügler
+umgeschrieben werden). Steht der Nachzügler dann immer noch aus, läuft der Batch **inline
+auf dem Aufrufer** — ein begrenzter, selbstheilender Preis statt eines unbegrenzten
+Wartens; der Report weist das als `x inline wegen kontention` aus. Die
+Fehler-Semantik ist auf allen Pfaden gleich (Exception eines Work-Items kommt als
+`InvalidOperationException` beim Aufrufer an, egal ob parallel oder inline), und ein
+Batch, in dem alle Beteiligten werfen, gibt verbleibende Slices explizit auf, statt den
+Aufrufer auf nie gezählte Items warten zu lassen.
+
 ## Was die Mod an sich selbst misst — und was das kostet (1.42.0)
 
 Die Frage stand lange offen: **Safemode fühlt sich schneller an als der Normalbetrieb**, aber
@@ -1559,18 +1581,28 @@ Deinstallieren: `rm ~/.config/VintagestoryData/Mods/Komet.dll`
 
 ### Das F7-HUD (Layout seit 01.09.)
 
-Vier Blöcke statt einer flachen Liste: **Kopf** (fps, gpu-frame, schlechtester Frame mit
-Aufteilung, Ruckler), **frame-aufteilung** (jeder Bucket des Frames in der Reihenfolge und
-mit dem Vokabular des Hitch-Logs — inklusive game tick und `ausserhalb` summiert der Block
-auf 100 %), **gc** (Pausen, Alloc-Quellen, Modus) und **welt & laden** (Draw Calls,
-Chunks, Tesselation, VRAM, Upload). Neben jedem Frame-Bucket steht ein Balken: zehn Zellen
-sind der ganze Frame, Achtel-Zellen über die Unicode-Blockelemente. Ob die Blockglyphen in
-der Monospace-Zelle des Systems wirklich eine Zelle breit sind, wird einmal beim
-Metrik-Probing gemessen; weicht der Font ab, degradieren die Balken zu `#`, statt aus der
-Box zu laufen (die Rasterbreite rechnet in Zeichenzellen). Die Schatten-Zeilen der
-Aufteilung enthalten jetzt auch die Done-Hälften der Kaskaden, damit zwischen den Zeilen
-nichts mehr versteckt ist; die Drossel-Zeile der Komet-Sektion heißt `schatten-takt`,
-damit kein Name zwei Bedeutungen hat.
+**F7 schaltet in drei Stufen: aus → kompakt → voll.** Die Kompaktansicht ist die
+Spieler-Sicht — fps, gpu-frame, Ruckler mit „zuletzt", GC-Pausen, eine Lade-Zeile nur
+solange die Welt streamt, dazu immer die !!-Warnungen (Safemode/Stresstest/Diagnose,
+damit keine Ansicht eine Safemode-Sitzung wie eine normale aussehen lässt). Alles darin
+ist eine **Auswahl** der Vollansicht, nie eine andere Messung. Die Vollansicht bleibt das
+Diagnose-Instrument; Screenshots bleiben vergleichbar. Die Baseline-Mod zeigt immer die
+Vollansicht — sie existiert für Vergleichsbilder. Der Commit-Teil des Buildstempels wird
+auf die üblichen sieben Zeichen gekürzt (`b260901.1928.577893d` statt 40 Hex-Zeichen —
+das SDK hängt den vollen Hash an die InformationalVersion).
+
+Vollansicht: vier Blöcke statt einer flachen Liste: **Kopf** (fps, gpu-frame,
+schlechtester Frame mit Aufteilung, Ruckler), **frame-aufteilung** (jeder Bucket des
+Frames in der Reihenfolge und mit dem Vokabular des Hitch-Logs — inklusive game tick und
+`ausserhalb` summiert der Block auf 100 %), **gc** (Pausen, Alloc-Quellen, Modus) und
+**welt & laden** (Draw Calls, Chunks, Tesselation, VRAM, Upload). Neben jedem
+Frame-Bucket steht ein Balken: zehn Zellen sind der ganze Frame, Achtel-Zellen über die
+Unicode-Blockelemente. Ob die Blockglyphen in der Monospace-Zelle des Systems wirklich
+eine Zelle breit sind, wird einmal beim Metrik-Probing gemessen; weicht der Font ab,
+degradieren die Balken zu `#`, statt aus der Box zu laufen (die Rasterbreite rechnet in
+Zeichenzellen). Die Schatten-Zeilen der Aufteilung enthalten jetzt auch die Done-Hälften
+der Kaskaden, damit zwischen den Zeilen nichts mehr versteckt ist; die Drossel-Zeile der
+Komet-Sektion heißt `schatten-takt`, damit kein Name zwei Bedeutungen hat.
 
 Neben `Komet.dll` wird `KometBaseline.dll` mit installiert. Die enthält **nur die Messung**
 und **keine einzige Optimierung** — dasselbe HUD, aus buchstäblich denselben Quelldateien

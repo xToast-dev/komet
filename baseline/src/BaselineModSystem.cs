@@ -63,7 +63,12 @@ public class BaselineModSystem : ModSystem
         if (harmony == null) return; // stood down because komet is loaded
         capi = api;
 
-        hud = new DebugHud(api, "vanilla " + KometVersion.Display(Mod.Info.Version));
+        hud = new DebugHud(api, "vanilla " + KometVersion.Display(Mod.Info.Version))
+        {
+            // The baseline exists to produce comparison screenshots; a reduced view would
+            // defeat it. Full every time, plain on/off toggle.
+            Compact = false
+        };
 
         // The GPU frame timer is pure measurement, so the baseline carries it too - the
         // CPU-vs-GPU comparison is exactly the kind of number the baseline exists to anchor.
