@@ -3,6 +3,11 @@ using System.Reflection;
 using HarmonyLib;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -26,7 +31,7 @@ public static class GlErrorPatches
     {
         // The call site is virtual, so the abstract declaration on ClientPlatformAbstract is
         // not what actually runs - patch the concrete override.
-        MethodInfo target = AccessTools.Method(
+        var target = AccessTools.Method(
             typeof(ClientPlatformWindows), nameof(ClientPlatformWindows.CheckGlErrorAlways), [typeof(string)]);
 
         if (target == null || target.IsAbstract)

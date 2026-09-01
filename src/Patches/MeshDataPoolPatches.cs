@@ -1,6 +1,11 @@
 using HarmonyLib;
 using Vintagestory.API.Client;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -51,11 +56,26 @@ public static class MeshDataPoolPatches
                   new[] { typeof(Vintagestory.API.MathTools.BlockPos), typeof(double[]), typeof(double[]) })]
     public static void CalcFrustumEquations() => FastCuller.FrustumGeneration++;
 
+    /// <summary>
+    /// Removal is folded into the cache incrementally. The prefix records WHICH index the
+    /// engine is about to take out (List.Remove is by reference, so the index only exists
+    /// before it runs); the postfix - which Harmony skips when the original throws, i.e. when
+    /// nothing was removed - closes that slot in the cache. Anything the cache cannot account
+    /// for exactly falls back to a rebuild inside NoteRemoved.
+    /// </summary>
+    [HarmonyPrefix]
+    [HarmonyPatch(nameof(MeshDataPool.RemoveLocation))]
+    public static void RemoveLocationPrefix(MeshDataPool __instance, ModelDataPoolLocation location, out int __state)
+    {
+        __state = FastCuller.IndexBeforeRemoval(__instance, location);
+    }
+
     [HarmonyPostfix]
     [HarmonyPatch(nameof(MeshDataPool.RemoveLocation))]
-    public static void RemoveLocation(MeshDataPool __instance)
+    public static void RemoveLocation(MeshDataPool __instance, int __state)
     {
-        FastCuller.Invalidate(__instance);
+        if (__state == -2) FastCuller.Invalidate(__instance);
+        else FastCuller.NoteRemoved(__instance, __state);
     }
 
 }

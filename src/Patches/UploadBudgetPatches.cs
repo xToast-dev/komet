@@ -5,6 +5,11 @@ using System.Reflection.Emit;
 using HarmonyLib;
 using Vintagestory.API.Client;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -16,8 +21,8 @@ public static class UploadBudgetPatches
 {
     public static void Apply(Harmony harmony)
     {
-        MethodInfo target = Measure.MeasurementPatches.UploadMethod
-                            ?? throw new InvalidOperationException("measurement patches must be applied first");
+        var target = Measure.MeasurementPatches.UploadMethod
+                     ?? throw new InvalidOperationException("measurement patches must be applied first");
 
         // the throttle needs its own clock around the same method the measurement times
         Measure.MeasurementPatches.UploadBegin += UploadBudget.FrameStart;
@@ -50,12 +55,12 @@ public static class UploadBudgetPatches
     public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
     {
         var code = new List<CodeInstruction>(instructions);
-        FieldInfo viewDistSq = AccessTools.Field(typeof(FrustumCulling), nameof(FrustumCulling.ViewDistanceSq));
-        MethodInfo scale = AccessTools.Method(typeof(UploadBudget), nameof(UploadBudget.Scale));
+        var viewDistSq = AccessTools.Field(typeof(FrustumCulling), nameof(FrustumCulling.ViewDistanceSq));
+        var scale = AccessTools.Method(typeof(UploadBudget), nameof(UploadBudget.Scale));
 
-        int anchor = -1;
-        int anchorCount = 0;
-        for (int i = 0; i < code.Count; i++)
+        var anchor = -1;
+        var anchorCount = 0;
+        for (var i = 0; i < code.Count; i++)
         {
             if (code[i].opcode == OpCodes.Ldfld && ReferenceEquals(code[i].operand, viewDistSq))
             {
@@ -67,8 +72,8 @@ public static class UploadBudgetPatches
             throw new InvalidOperationException($"expected exactly one ViewDistanceSq load, found {anchorCount}");
 
         // walk forward to the store that closes the expression (div, add, then stloc)
-        int store = -1;
-        for (int i = anchor + 1; i < code.Count && i <= anchor + 8; i++)
+        var store = -1;
+        for (var i = anchor + 1; i < code.Count && i <= anchor + 8; i++)
         {
             if (IsStoreLocal(code[i].opcode)) { store = i; break; }
         }

@@ -6,6 +6,11 @@ using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -98,8 +103,8 @@ public static class FirepitPatches
 
         // VSSurvivalMod is a separate mod assembly, resolved at runtime so this mod neither
         // hard-depends on it nor breaks when it is absent.
-        Type type = AccessTools.TypeByName("Vintagestory.GameContent.FirepitContentsRenderer")
-                    ?? throw new InvalidOperationException("FirepitContentsRenderer not found (VSSurvivalMod not loaded?)");
+        var type = AccessTools.TypeByName("Vintagestory.GameContent.FirepitContentsRenderer")
+                   ?? throw new InvalidOperationException("FirepitContentsRenderer not found (VSSurvivalMod not loaded?)");
 
         posRef = AccessTools.FieldRefAccess<BlockPos>(type, "pos");
         childRef = AccessTools.FieldRefAccess<object>(type, "contentStackRenderer");
@@ -109,8 +114,8 @@ public static class FirepitPatches
         if (posRef == null || childRef == null || meshRef == null || transformRef == null || stackRef == null)
             throw new InvalidOperationException("FirepitContentsRenderer fields not found");
 
-        MethodInfo render = AccessTools.Method(type, "OnRenderFrame")
-                            ?? throw new InvalidOperationException("FirepitContentsRenderer.OnRenderFrame not found");
+        var render = AccessTools.Method(type, "OnRenderFrame")
+                     ?? throw new InvalidOperationException("FirepitContentsRenderer.OnRenderFrame not found");
 
         harmony.Patch(render, prefix: new HarmonyMethod(
             AccessTools.Method(typeof(FirepitPatches), nameof(SkipDistant))));
@@ -128,16 +133,16 @@ public static class FirepitPatches
     {
         if (!Enabled) return true;
 
-        Vec3d cam = CameraPos;
+        var cam = CameraPos;
         if (cam == null) return true;
 
-        BlockPos pos = posRef(__instance);
+        var pos = posRef(__instance);
         if (pos == null) return true;
         if (childRef(__instance) != null) return true;   // pot/crucible: sound logic, hands off
 
-        double dx = pos.X + 0.5 - cam.X;
-        double dy = pos.Y + 0.5 - cam.Y;
-        double dz = pos.Z + 0.5 - cam.Z;
+        var dx = pos.X + 0.5 - cam.X;
+        var dy = pos.Y + 0.5 - cam.Y;
+        var dz = pos.Z + 0.5 - cam.Z;
 
         if (ShouldSkip(hasChildRenderer: false, dx * dx + dy * dy + dz * dz, MaxDistance))
         {
@@ -163,37 +168,58 @@ public static class FirepitPatches
 
     private static bool TryRenderCached(object __instance, BlockPos pos)
     {
-        ICoreClientAPI capi = Api;
-        MultiTextureMeshRef mesh = meshRef(__instance);
-        ItemStack stack = stackRef(__instance);
-        ModelTransform tf = transformRef(__instance);
-        if (capi == null || stack?.Collectible == null || tf == null) return false;
+        if (__instance == null) return false;
+
+        var capi = Api;
+        var mesh = meshRef(__instance);
+        var stack = stackRef(__instance);
+        var tf = transformRef(__instance);
+        if (capi == null || capi.World == null || capi.Render == null || stack?.Collectible == null || tf == null) return false;
         if (mesh == null) return true;                   // vanilla would do nothing - so do we
 
         // the LIVE camera position, exactly as vanilla reads it mid-draw - the frame-boundary
         // snapshot used for the distance gate is a tick stale, which a gate does not care
         // about but a model matrix does
-        Vec3d cam = capi.World?.Player?.Entity?.CameraPos;
+        var cam = capi.World?.Player?.Entity?.CameraPos;
         if (cam == null) return false;
 
         try
         {
-            Cache cache = Caches.GetOrCreateValue(__instance);
-            long now = Environment.TickCount64;
+            var cache = Caches.GetOrCreateValue(__instance);
+            if (cache == null) return false;
+
+            var now = Environment.TickCount64;
             if (now >= cache.RefreshAt)
             {
-                int temp = (int)stack.Collectible.GetTemperature(capi.World, stack);
-                Vec4f light = capi.World.BlockAccessor.GetLightRGBs(pos.X, pos.Y, pos.Z);
-                float[] glowColor = ColorUtil.GetIncandescenceColorAsColor4f(temp);
-                cache.LitColor.Set(light.R + glowColor[0], light.G + glowColor[1], light.B + glowColor[2], light.A);
+                var temp = (int)stack.Collectible.GetTemperature(capi.World, stack);
+                var light = capi.World.BlockAccessor?.GetLightRGBs(pos.X, pos.Y, pos.Z);
+                var glowColor = ColorUtil.GetIncandescenceColorAsColor4f(temp);
+
+                // Guard each accessed element explicitly. Some worlds can return an empty/invalid
+                // incandescent color array during block updates, and the cache path should simply
+                // skip this refresh instead of throwing while the vanilla renderer remains available.
+                if (glowColor is not { Length: >= 4 })
+                    return false;
+
+                if (light == null)
+                    return false;
+
+                var litR = light.R + glowColor[0];
+                var litG = light.G + glowColor[1];
+                var litB = light.B + glowColor[2];
+                var litA = light.A;
+                cache.LitColor.Set(litR, litG, litB, litA);
                 cache.Glow = GameMath.Clamp((temp - 500) / 4, 0, 255);
                 cache.RefreshAt = now + LightCacheMs;
             }
 
-            IRenderAPI render = capi.Render;
+            var render = capi.Render;
+            var prog = render.StandardShader;
+            if (prog == null)
+                return false;
+
             render.GlDisableCullFace();
             render.GlToggleBlend(true);
-            IStandardShaderProgram prog = render.StandardShader;
             prog.Use();
             prog.DontWarpVertices = 0;
             prog.AddRenderFlags = 0;

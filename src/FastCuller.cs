@@ -115,6 +115,11 @@ public static class FastCuller
 
     /// <summary>Mid-list inserts folded into the cache without a rebuild.</summary>
     public static long StatIncInserts;
+    /// <summary>Parts taken out of a pool without a rebuild (RemoveLocation postfix).</summary>
+    public static long StatIncRemovals;
+    /// <summary>Kill switch for the incremental removal, so the fuzz test can prove the
+    /// reference path and the field can fall back to rebuilds if it ever misbehaves.</summary>
+    public static bool IncrementalRemoval = true;
     public static long StatRangesRaw;
     public static long StatRangesEmitted;
 
@@ -295,15 +300,15 @@ public static class FastCuller
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static PoolCache Lookup(MeshDataPool pool)
     {
-        int slot = RuntimeHelpers.GetHashCode(pool) & (MemoSlots - 1);
-        PoolCache hit = Memo[slot];
+        var slot = RuntimeHelpers.GetHashCode(pool) & (MemoSlots - 1);
+        var hit = Memo[slot];
         if (hit != null)
         {
-            WeakReference<MeshDataPool> owner = hit.Owner;
-            if (owner != null && owner.TryGetTarget(out MeshDataPool same) && ReferenceEquals(same, pool)) return hit;
+            var owner = hit.Owner;
+            if (owner != null && owner.TryGetTarget(out var same) && ReferenceEquals(same, pool)) return hit;
         }
 
-        PoolCache c = Caches.GetOrCreateValue(pool);
+        var c = Caches.GetOrCreateValue(pool);
         // Only the render thread ever gets here - the parallel batch is handed its caches
         // rather than looking them up - and the identity check above is what makes a slot
         // trustworthy in any case, so a stale slot costs a lookup and nothing else.
@@ -347,7 +352,7 @@ public static class FastCuller
         public void Run(int from, int to)
         {
             Stats st = default;
-            for (int i = from; i < to; i++) CullCore(Pools[i], Caches[i], Culler, Mode, ref st);
+            for (var i = from; i < to; i++) CullCore(Pools[i], Caches[i], Culler, Mode, ref st);
             Flush(ref st);
         }
     }
@@ -440,6 +445,25 @@ public static class FastCuller
         st = default;
     }
 
+    private static long rebuildTicksReported, rebuildsReported;
+
+    /// <summary>
+    /// Hands this frame's rebuild share to the frame accounting, so a hitch line can say
+    /// whether a long sweep was rebuilding caches or sweeping. Runs on the render thread after
+    /// a batch has fully returned, so every worker's Flush has landed in the totals; a reset of
+    /// the totals ('.komet reset') shows up as a negative delta and is simply skipped.
+    /// </summary>
+    private static void ReportRebuilds()
+    {
+        var ticks = System.Threading.Interlocked.Read(ref StatRebuildTicks);
+        var count = System.Threading.Interlocked.Read(ref StatRebuilds);
+        var dTicks = ticks - rebuildTicksReported;
+        var dCount = count - rebuildsReported;
+        rebuildTicksReported = ticks;
+        rebuildsReported = count;
+        if (dTicks > 0 && dCount >= 0) FrameStats.AddCullRebuild(dTicks, (int)dCount);
+    }
+
     /// <summary>Called when a pool is seen for the first time, so the batch knows about it.</summary>
     private static void Register(MeshDataPool pool)
     {
@@ -454,7 +478,7 @@ public static class FastCuller
     {
         batchToken++;
 
-        int live = 0;
+        var live = 0;
         long parts = 0;
         lock (KnownPools)
         {
@@ -464,14 +488,14 @@ public static class FastCuller
                 batchCaches = new PoolCache[KnownPools.Count + 64];
             }
 
-            int write = 0;
-            for (int i = 0; i < KnownPools.Count; i++)
+            var write = 0;
+            for (var i = 0; i < KnownPools.Count; i++)
             {
-                if (KnownPools[i].TryGetTarget(out MeshDataPool p))
+                if (KnownPools[i].TryGetTarget(out var p))
                 {
                     // Resolving the cache here also fills the memo, so the thousands of no-op
                     // FrustumCull calls that follow this batch never touch the weak table.
-                    PoolCache c = Lookup(p);
+                    var c = Lookup(p);
                     batchCaches[live] = c;
                     batchBuffer[live++] = p;
                     parts += c.Count;
@@ -497,7 +521,7 @@ public static class FastCuller
         if (live == 0) return;
 
         StatBatches++;
-        int threads = Workers.ThreadCount;
+        var threads = Workers.ThreadCount;
 
         // Going wide has to be paid for before the first part is tested: waking the helpers
         // costs tens of microseconds. Below a real workload that is more than the sweep itself,
@@ -505,7 +529,7 @@ public static class FastCuller
         if (threads < 1 || live < 32 || parts < ParallelPartThreshold)
         {
             Stats st = default;
-            for (int i = 0; i < live; i++) CullCore(batchBuffer[i], batchCaches[i], culler, mode, ref st);
+            for (var i = 0; i < live; i++) CullCore(batchBuffer[i], batchCaches[i], culler, mode, ref st);
             Flush(ref st);
             return;
         }
@@ -519,7 +543,7 @@ public static class FastCuller
         batchBody.Culler = culler;
         batchBody.Mode = mode;
 
-        long waitBefore = Workers.StatWaitTicks;
+        var waitBefore = Workers.StatWaitTicks;
         try
         {
             Workers.Run(batchBody, live, Math.Max(1, live / (threads * 8)));
@@ -556,14 +580,14 @@ public static class FastCuller
     /// <summary>Called from the TryAdd / RemoveLocation patches when a pool's contents change.</summary>
     public static void Invalidate(MeshDataPool pool)
     {
-        if (Caches.TryGetValue(pool, out PoolCache c)) c.Dirty = true;
+        if (Caches.TryGetValue(pool, out var c)) c.Dirty = true;
     }
 
     public static void InvalidateAll()
     {
         // ConditionalWeakTable has no bulk access; dropping our reference is enough because
         // every entry is recreated lazily and starts out dirty.
-        foreach (KeyValuePair<MeshDataPool, PoolCache> kv in Caches) kv.Value.Dirty = true;
+        foreach (var kv in Caches) kv.Value.Dirty = true;
     }
 
     /// <summary>
@@ -594,7 +618,7 @@ public static class FastCuller
     /// </summary>
     public static void NoteAppended(MeshDataPool pool)
     {
-        if (Caches.TryGetValue(pool, out PoolCache c) && !c.Dirty) c.Appended = true;
+        if (Caches.TryGetValue(pool, out var c) && !c.Dirty) c.Appended = true;
     }
 
     /// <summary>Parts allowed to accumulate outside the grid before a rebuild is worth it.</summary>
@@ -603,7 +627,7 @@ public static class FastCuller
     private static void EnsureOverflowCapacity(PoolCache c, int over)
     {
         if (c.OverGeo.Length >= over * 6 && c.OverOrig.Length >= over) return;
-        int overCap = Math.Max(64, over * 2);
+        var overCap = Math.Max(64, over * 2);
         Array.Resize(ref c.OverGeo, overCap * 6);
         Array.Resize(ref c.OverOrig, overCap);
     }
@@ -623,17 +647,26 @@ public static class FastCuller
     /// </summary>
     public static void NoteInserted(MeshDataPool pool, ModelDataPoolLocation loc)
     {
-        if (!Caches.TryGetValue(pool, out PoolCache c)) return; // no cache yet - first cull builds it
+        if (!Caches.TryGetValue(pool, out var c)) return; // no cache yet - first cull builds it
         if (c.Dirty) return;
-        if (c.Appended) { c.Dirty = true; return; }
 
-        List<ModelDataPoolLocation> locations = LocationsRef(pool);
-        if (locations == null || c.Count != locations.Count - 1) { c.Dirty = true; return; }
+        var locations = LocationsRef(pool);
+        if (locations == null) { c.Dirty = true; return; }
 
-        int n = c.Count;
-        int p = locations.IndexOf(loc);
+        var n = c.Count;
+        // Pending appends (parts the cache has not folded yet) always sit at the END of the
+        // list, so an insert in front of them shifts them by exactly one and Extend - which
+        // reads from c.Count upwards - still finds exactly the pending ones. Without pending
+        // appends the list has to be in exact sync. This used to bail to a rebuild whenever an
+        // append was pending, which while streaming is nearly always: the uploads land in the
+        // Before stage, the squeeze-inserts and removals run in Opaque, and the first sweep
+        // that could fold the appends comes after both.
+        var expected = n + 1;
+        if (c.Appended ? locations.Count < expected : locations.Count != expected) { c.Dirty = true; return; }
+
+        var p = locations.IndexOf(loc);
         if (p < 0) { c.Dirty = true; return; }
-        if (p == n) { c.Appended = true; return; }   // landed at the end after all
+        if (p >= n) { c.Appended = true; return; }   // at or behind the boundary: a pending append now
 
         if (c.OverCount + 1 > OverflowLimit(n + 1)) { c.Dirty = true; return; }
 
@@ -647,27 +680,27 @@ public static class FastCuller
         // here: the sphere and the index range come out of InsertAt's object initialiser, while
         // CullVisible and LodLevel are assigned by the caller afterwards - see the note on
         // PoolCache. Those two are read at sweep time instead, off c.Locs[i].
-        Sphere s2 = loc.FrustumCullSphere;
-        float ex = s2.radius / Sqrt3;
-        float ey = s2.radiusY / Sqrt3;
-        float ez = s2.radiusZ / Sqrt3;
+        var s2 = loc.FrustumCullSphere;
+        var ex = s2.radius / Sqrt3;
+        var ey = s2.radiusY / Sqrt3;
+        var ez = s2.radiusZ / Sqrt3;
 
-        int len = loc.IndicesEnd - loc.IndicesStart;
-        int m = p * 3;
+        var len = loc.IndicesEnd - loc.IndicesStart;
+        var m = p * 3;
         c.Meta[m] = loc.IndicesStart * 4;
         c.Meta[m + 1] = len;
         c.Meta[m + 2] = len / 3;
         c.Locs[p] = loc;
         c.AllocatedTris += len / 3;
 
-        int[] orig = c.Orig;
+        var orig = c.Orig;
         for (int k = 0, gridCount = c.GridCount; k < gridCount; k++)
             if (orig[k] >= p) orig[k]++;
-        int[] overOrig = c.OverOrig;
+        var overOrig = c.OverOrig;
         for (int k = 0, overCount = c.OverCount; k < overCount; k++)
             if (overOrig[k] >= p) overOrig[k]++;
 
-        int g = c.OverCount * 6;
+        var g = c.OverCount * 6;
         c.OverGeo[g] = s2.x;
         c.OverGeo[g + 1] = s2.y;
         c.OverGeo[g + 2] = s2.z;
@@ -690,6 +723,125 @@ public static class FastCuller
     }
 
     /// <summary>
+    /// The list index the engine is about to remove, or -1 when it is not in the list. Called
+    /// from the RemoveLocation PREFIX: List.Remove works by reference and the index is only
+    /// knowable before it runs; the postfix then hands it to <see cref="NoteRemoved"/>. -2
+    /// means "no cache involved", so the postfix has nothing to do.
+    /// </summary>
+    public static int IndexBeforeRemoval(MeshDataPool pool, ModelDataPoolLocation loc)
+    {
+        if (!IncrementalRemoval) return -2;
+        if (!Caches.TryGetValue(pool, out var c) || c.Dirty) return -2;
+        var locations = LocationsRef(pool);
+        if (locations == null) return -2;
+        return locations.IndexOf(loc);
+    }
+
+    /// <summary>
+    /// Takes one part out of the cache after MeshDataPool.RemoveLocation removed it from the
+    /// list - the mirror image of <see cref="NoteInserted"/>, and the last routine reason a
+    /// pool was still rebuilt from scratch. Every re-tesselated chunk removes its old parts
+    /// (three frames delayed, then RemoveLocationsNow at the start of the opaque stage), and a
+    /// rebuild re-reads every location object in the pool - one cache miss each - to lose a
+    /// handful of them. Chunk unloads while walking do the same to most pools at once.
+    ///
+    /// The part's grid slot is closed by shifting the cell-ordered arrays down by one and
+    /// lowering every bucket boundary past it; a part in the overflow is replaced by the last
+    /// overflow entry (that list is unordered by construction). Then the original-order arrays
+    /// shift, every index above the part drops by one - one sequential pass over flat ints, no
+    /// location object is touched - and the count follows. The pool and cell boxes are NOT
+    /// shrunk: a box that bounds the parts plus one that is gone is still a bound, only a
+    /// looser one, and the next full rebuild (still forced by any deviation) tightens it.
+    ///
+    /// Pending appends are tolerated like in NoteInserted: they sit past c.Count, so a removal
+    /// in front of them just moves them down and Extend reads them from the lowered count.
+    /// Any inconsistency - an index the cache does not hold, a count that does not add up -
+    /// falls back to a rebuild, never to a wrong answer.
+    /// </summary>
+    public static void NoteRemoved(MeshDataPool pool, int p)
+    {
+        if (p == -2) return;
+        if (!Caches.TryGetValue(pool, out var c)) return;
+        if (c.Dirty) return;
+        if (p < 0) { c.Dirty = true; return; }
+
+        var n = c.Count;
+        if (p >= n) return; // a pending append the cache never folded; Extend simply will not see it
+
+        var locations = LocationsRef(pool);
+        if (locations == null) { c.Dirty = true; return; }
+        var expected = n - 1;
+        if (c.Appended ? locations.Count < expected : locations.Count != expected) { c.Dirty = true; return; }
+
+        var orig = c.Orig;
+        var gridCount = c.GridCount;
+        var pos = -1;
+        for (var k = 0; k < gridCount; k++)
+            if (orig[k] == p) { pos = k; break; }
+
+        if (pos >= 0)
+        {
+            // the bucket holding pos is the last one whose start is <= pos; every boundary
+            // after it moves down by one, the sentinel at [buckets] included
+            var bucketStart = c.BucketStart;
+            var buckets = c.CellCount * 4;
+            var b = 0;
+            for (var q = 1; q <= buckets; q++)
+            {
+                if (bucketStart[q] > pos) break;
+                b = q;
+            }
+            var tail = gridCount - pos - 1;
+            if (tail > 0)
+            {
+                var geo = c.Geo;
+                var gs = c.GeoStride;
+                for (var blk = 0; blk < 6; blk++)
+                    Array.Copy(geo, blk * gs + pos + 1, geo, blk * gs + pos, tail);
+                Array.Copy(c.Lod, pos + 1, c.Lod, pos, tail);
+                Array.Copy(orig, pos + 1, orig, pos, tail);
+            }
+            for (var q = b + 1; q <= buckets; q++) bucketStart[q]--;
+            c.GridCount = --gridCount;
+        }
+        else
+        {
+            var overOrig = c.OverOrig;
+            var over = c.OverCount;
+            var k2 = -1;
+            for (var k = 0; k < over; k++)
+                if (overOrig[k] == p) { k2 = k; break; }
+            if (k2 < 0) { c.Dirty = true; return; } // the cache does not hold this index at all
+            var last = over - 1;
+            if (k2 != last)
+            {
+                Array.Copy(c.OverGeo, last * 6, c.OverGeo, k2 * 6, 6);
+                overOrig[k2] = overOrig[last];
+            }
+            c.OverCount = last;
+        }
+
+        var meta = c.Meta;
+        c.AllocatedTris -= meta[p * 3 + 2];
+        var tailN = n - p - 1;
+        if (tailN > 0)
+        {
+            Array.Copy(meta, (p + 1) * 3, meta, p * 3, tailN * 3);
+            Array.Copy(c.Locs, p + 1, c.Locs, p, tailN);
+        }
+        c.Locs[n - 1] = null; // the engine dropped it; a stale strong reference here would keep it alive
+
+        for (var k = 0; k < gridCount; k++)
+            if (orig[k] > p) orig[k]--;
+        var overOrig2 = c.OverOrig;
+        for (int k = 0, overCount = c.OverCount; k < overCount; k++)
+            if (overOrig2[k] > p) overOrig2[k]--;
+
+        c.Count = n - 1;
+        System.Threading.Interlocked.Increment(ref StatIncRemovals);
+    }
+
+    /// <summary>
     /// Takes the newly appended parts into the cache without touching the ones already there.
     ///
     /// A full rebuild costs one cache miss per part in the pool - it has to read every
@@ -699,24 +851,24 @@ public static class FastCuller
     /// </summary>
     private static void Extend(PoolCache c, List<ModelDataPoolLocation> locations)
     {
-        int n = locations.Count;
-        int added = n - c.Count;
+        var n = locations.Count;
+        var added = n - c.Count;
 
         EnsureCapacity(c, n);
 
         EnsureOverflowCapacity(c, c.OverCount + added);
 
-        for (int i = c.Count; i < n; i++)
+        for (var i = c.Count; i < n; i++)
         {
-            ModelDataPoolLocation loc = locations[i];
-            Sphere s2 = loc.FrustumCullSphere;
+            var loc = locations[i];
+            var s2 = loc.FrustumCullSphere;
 
-            float ex = s2.radius / Sqrt3;
-            float ey = s2.radiusY / Sqrt3;
-            float ez = s2.radiusZ / Sqrt3;
+            var ex = s2.radius / Sqrt3;
+            var ey = s2.radiusY / Sqrt3;
+            var ez = s2.radiusZ / Sqrt3;
 
-            int len = loc.IndicesEnd - loc.IndicesStart;
-            int m = i * 3;
+            var len = loc.IndicesEnd - loc.IndicesStart;
+            var m = i * 3;
             c.Meta[m] = loc.IndicesStart * 4;
             c.Meta[m + 1] = len;
             c.Meta[m + 2] = len / 3;
@@ -724,7 +876,7 @@ public static class FastCuller
             c.Locs[i] = loc;
             c.AllocatedTris += len / 3;
 
-            int g = c.OverCount * 6;
+            var g = c.OverCount * 6;
             c.OverGeo[g] = s2.x;
             c.OverGeo[g + 1] = s2.y;
             c.OverGeo[g + 2] = s2.z;
@@ -771,7 +923,7 @@ public static class FastCuller
             && c.VisBits.Length >= (n + 63) >> 6)
             return;
 
-        int cap = Math.Max(64, n + (n >> 1));
+        var cap = Math.Max(64, n + (n >> 1));
         Array.Resize(ref c.Meta, cap * 3);
         Array.Resize(ref c.Locs, cap);
         Array.Resize(ref c.Orig, cap);
@@ -788,9 +940,9 @@ public static class FastCuller
         if (c.GeoStride < cap)
         {
             var geo = new float[cap * 6];
-            int keep = Math.Min(c.GridCount, c.GeoStride);
+            var keep = Math.Min(c.GridCount, c.GeoStride);
             if (keep > 0)
-                for (int b = 0; b < 6; b++) Array.Copy(c.Geo, b * c.GeoStride, geo, b * cap, keep);
+                for (var b = 0; b < 6; b++) Array.Copy(c.Geo, b * c.GeoStride, geo, b * cap, keep);
             c.Geo = geo;
             c.GeoStride = cap;
         }
@@ -798,35 +950,35 @@ public static class FastCuller
 
     private static void Rebuild(PoolCache c, List<ModelDataPoolLocation> locations, ref Stats st)
     {
-        long rebuildStart = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var rebuildStart = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         st.Rebuilds++;
-        int n = locations.Count;
+        var n = locations.Count;
 
         EnsureCapacity(c, n);
 
-        int[] meta = c.Meta;
-        ModelDataPoolLocation[] locs = c.Locs;
+        var meta = c.Meta;
+        var locs = c.Locs;
 
         float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
         float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
-        int allocated = 0;
+        var allocated = 0;
 
-        float[] scratch = c.Scratch;
+        var scratch = c.Scratch;
 
         // pass 1: the per-part data that stays in original order, plus the pool's bounds.
         // This is the only pass that touches the location objects; everything after it reads
         // the flat scratch copy.
-        for (int i = 0; i < n; i++)
+        for (var i = 0; i < n; i++)
         {
-            ModelDataPoolLocation loc = locations[i];
-            Sphere s2 = loc.FrustumCullSphere;
+            var loc = locations[i];
+            var s2 = loc.FrustumCullSphere;
 
-            float ex = s2.radius / Sqrt3;
-            float ey = s2.radiusY / Sqrt3;
-            float ez = s2.radiusZ / Sqrt3;
+            var ex = s2.radius / Sqrt3;
+            var ey = s2.radiusY / Sqrt3;
+            var ez = s2.radiusZ / Sqrt3;
 
-            int len = loc.IndicesEnd - loc.IndicesStart;
-            int m = i * 3;
+            var len = loc.IndicesEnd - loc.IndicesStart;
+            var m = i * 3;
             meta[m] = loc.IndicesStart * 4;
             meta[m + 1] = len;
             meta[m + 2] = len / 3;
@@ -834,7 +986,7 @@ public static class FastCuller
             locs[i] = loc;
             allocated += len / 3;
 
-            int g0 = i * 6;
+            var g0 = i * 6;
             scratch[g0] = s2.x;
             scratch[g0 + 1] = s2.y;
             scratch[g0 + 2] = s2.z;
@@ -842,7 +994,7 @@ public static class FastCuller
             scratch[g0 + 4] = ey;
             scratch[g0 + 5] = ez;
             // LOD is packed alongside so pass 2 needs nothing but the scratch arrays
-            int lodLevel = loc.LodLevel;
+            var lodLevel = loc.LodLevel;
             c.ScratchBucket[i] = (uint)lodLevel < 4u ? lodLevel : 3;
 
             if (s2.x - ex < minX) minX = s2.x - ex;
@@ -875,9 +1027,9 @@ public static class FastCuller
         // parts form a wide ring rather than a compact blob. A fixed cell size therefore ends
         // up with one or two parts per cell, where the per-cell test costs more than the parts
         // it saves. Size the grid by part count instead, aiming for a few dozen parts per cell.
-        int targetCells = Math.Clamp(n / PartsPerCellTarget, 1, MaxCells);
-        double area = (double)(maxX - minX) * (maxZ - minZ);
-        float cellSize = area > 0 ? (float)Math.Max(BaseCellSize, Math.Sqrt(area / targetCells)) : BaseCellSize;
+        var targetCells = Math.Clamp(n / PartsPerCellTarget, 1, MaxCells);
+        var area = (double)(maxX - minX) * (maxZ - minZ);
+        var cellSize = area > 0 ? (float)Math.Max(BaseCellSize, Math.Sqrt(area / targetCells)) : BaseCellSize;
 
         int gx, gz;
         while (true)
@@ -887,50 +1039,50 @@ public static class FastCuller
             if ((long)gx * gz <= MaxCells) break;
             cellSize *= 2f;
         }
-        int cellCount = gx * gz;
+        var cellCount = gx * gz;
         c.CellCount = cellCount;
 
-        int buckets = cellCount * 4;
+        var buckets = cellCount * 4;
         if (c.BucketStart.Length < buckets + 1) c.BucketStart = new int[buckets + 1];
         if (c.CellBox.Length < cellCount * 6) c.CellBox = new float[cellCount * 6];
         if (cursor == null || cursor.Length < buckets) cursor = new int[buckets];
 
-        int[] bucketStart = c.BucketStart;
-        float[] cellBox = c.CellBox;
+        var bucketStart = c.BucketStart;
+        var cellBox = c.CellBox;
         Array.Clear(bucketStart, 0, buckets + 1);
 
         // pass 2: how many parts land in each (cell, LOD) bucket. The bucket index is kept
         // so pass 3 does not have to compute it a second time.
-        int[] scratchBucket = c.ScratchBucket;
-        for (int i = 0; i < n; i++)
+        var scratchBucket = c.ScratchBucket;
+        for (var i = 0; i < n; i++)
         {
-            int g0 = i * 6;
-            int b = BucketOf(scratch[g0], scratch[g0 + 2], scratchBucket[i], minX, minZ, cellSize, gx, gz);
+            var g0 = i * 6;
+            var b = BucketOf(scratch[g0], scratch[g0 + 2], scratchBucket[i], minX, minZ, cellSize, gx, gz);
             scratchBucket[i] = b;
             bucketStart[b + 1]++;
         }
-        for (int b = 1; b <= buckets; b++) bucketStart[b] += bucketStart[b - 1];
+        for (var b = 1; b <= buckets; b++) bucketStart[b] += bucketStart[b - 1];
 
         // pass 3: scatter into cell order and accumulate each cell's box
-        for (int cell = 0; cell < cellCount; cell++)
+        for (var cell = 0; cell < cellCount; cell++)
         {
-            int o = cell * 6;
+            var o = cell * 6;
             cellBox[o] = cellBox[o + 1] = cellBox[o + 2] = float.MaxValue;
             cellBox[o + 3] = cellBox[o + 4] = cellBox[o + 5] = float.MinValue;
         }
         Array.Copy(bucketStart, cursor, buckets);
 
-        float[] geo = c.Geo;
-        byte[] lod = c.Lod;
-        int[] orig = c.Orig;
-        int gs = c.GeoStride;
+        var geo = c.Geo;
+        var lod = c.Lod;
+        var orig = c.Orig;
+        var gs = c.GeoStride;
 
-        for (int i = 0; i < n; i++)
+        for (var i = 0; i < n; i++)
         {
-            int b = scratchBucket[i];
-            int pos = cursor[b]++;
+            var b = scratchBucket[i];
+            var pos = cursor[b]++;
 
-            int g0 = i * 6;
+            var g0 = i * 6;
             float sx = scratch[g0], sy = scratch[g0 + 1], sz = scratch[g0 + 2];
             float ex = scratch[g0 + 3], ey = scratch[g0 + 4], ez = scratch[g0 + 5];
 
@@ -943,11 +1095,11 @@ public static class FastCuller
 
             // The out-of-range LOD levels vanilla treats as permanently invisible share
             // bucket 3, so the real level still has to come from the location itself.
-            int l = locs[i].LodLevel;
+            var l = locs[i].LodLevel;
             lod[pos] = (byte)((uint)l < 4u ? l : 255);
             orig[pos] = i;
 
-            int o = (b >> 2) * 6;
+            var o = (b >> 2) * 6;
             if (sx - ex < cellBox[o]) cellBox[o] = sx - ex;
             if (sy - ey < cellBox[o + 1]) cellBox[o + 1] = sy - ey;
             if (sz - ez < cellBox[o + 2]) cellBox[o + 2] = sz - ez;
@@ -957,10 +1109,10 @@ public static class FastCuller
         }
 
         // store the cell boxes the way the plane test wants them: centre plus half extent
-        for (int cell = 0; cell < cellCount; cell++)
+        for (var cell = 0; cell < cellCount; cell++)
         {
             if (bucketStart[cell * 4] == bucketStart[cell * 4 + 4]) continue;
-            int o = cell * 6;
+            var o = cell * 6;
             float x0 = cellBox[o], y0 = cellBox[o + 1], z0 = cellBox[o + 2];
             float x1 = cellBox[o + 3], y1 = cellBox[o + 4], z1 = cellBox[o + 5];
             cellBox[o] = (x0 + x1) * 0.5f;
@@ -978,11 +1130,11 @@ public static class FastCuller
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int BucketOf(float x, float z, int lodLevel, float minX, float minZ, float cellSize, int gx, int gz)
     {
-        int cx = (int)((x - minX) / cellSize);
-        int cz = (int)((z - minZ) / cellSize);
+        var cx = (int)((x - minX) / cellSize);
+        var cz = (int)((z - minZ) / cellSize);
         if ((uint)cx >= (uint)gx) cx = cx < 0 ? 0 : gx - 1;
         if ((uint)cz >= (uint)gz) cz = cz < 0 ? 0 : gz - 1;
-        int l = (uint)lodLevel < 4u ? lodLevel : 3;
+        var l = (uint)lodLevel < 4u ? lodLevel : 3;
         return ((cz * gx + cx) << 2) + l;
     }
 
@@ -1044,9 +1196,9 @@ public static class FastCuller
     /// </summary>
     private static void BuildLodBounds(FrustumCulling culler, double[] lo, double[] hi)
     {
-        float lod0BiasSq = culler.lod0BiasSq;
+        var lod0BiasSq = culler.lod0BiasSq;
         double viewDistSq = culler.ViewDistanceSq;
-        double lod2BiasSq = culler.lod2BiasSq;
+        var lod2BiasSq = culler.lod2BiasSq;
 
         // lodLevel 0: lod0BiasSq > 0 && distSq < lod0BiasSq + 1024
         lo[0] = double.NegativeInfinity;
@@ -1068,7 +1220,7 @@ public static class FastCuller
     private static double[] NewLodTable(double fill)
     {
         var table = new double[256];
-        for (int i = 4; i < 256; i++) table[i] = fill;
+        for (var i = 4; i < 256; i++) table[i] = fill;
         return table;
     }
 
@@ -1079,17 +1231,17 @@ public static class FastCuller
     /// </summary>
     private static FastPlane[] LoadPlanes(FrustumCulling culler)
     {
-        FastPlane[] dst = tlsPlanes;
+        var dst = tlsPlanes;
         if (dst != null && ReferenceEquals(tlsPlaneCuller, culler) && tlsPlaneGen == FrustumGeneration)
             return dst;
 
         dst = tlsPlanes ??= new FastPlane[6];
-        FastPlaneV[] dstV = Avx.IsSupported ? tlsPlanesV ??= new FastPlaneV[6] : null;
-        Plane[] frustum = FrustumRef(culler);
-        for (int i = 0; i < 6; i++)
+        var dstV = Avx.IsSupported ? tlsPlanesV ??= new FastPlaneV[6] : null;
+        var frustum = FrustumRef(culler);
+        for (var i = 0; i < 6; i++)
         {
-            Plane s = frustum[i];
-            ref FastPlane d = ref dst[i];
+            var s = frustum[i];
+            ref var d = ref dst[i];
             d.Nx = s.normalX;
             d.Ny = s.normalY;
             d.Nz = s.normalZ;
@@ -1100,7 +1252,7 @@ public static class FastCuller
             d.Sz = s.normalZ > 0.0 ? 1f : -1f;
 
             if (dstV == null) continue;
-            ref FastPlaneV v = ref dstV[i];
+            ref var v = ref dstV[i];
             v.Nx = Vector256.Create(d.Nx);
             v.Ny = Vector256.Create(d.Ny);
             v.Nz = Vector256.Create(d.Nz);
@@ -1139,15 +1291,15 @@ public static class FastCuller
         Vector256<double> x, Vector256<double> y, Vector256<double> z,
         Vector256<double> ex, Vector256<double> ey, Vector256<double> ez)
     {
-        Vector256<double> zero = Vector256<double>.Zero;
-        Vector256<double> mask = Vector256<double>.AllBitsSet;
-        for (int i = 0; i < planes; i++)
+        var zero = Vector256<double>.Zero;
+        var mask = Vector256<double>.AllBitsSet;
+        for (var i = 0; i < planes; i++)
         {
-            ref FastPlaneV q = ref p[i];
-            Vector256<double> ax = Avx.Add(x, Avx.Multiply(ex, q.Sx));
-            Vector256<double> ay = Avx.Add(y, Avx.Multiply(ey, q.Sy));
-            Vector256<double> az = Avx.Add(z, Avx.Multiply(ez, q.Sz));
-            Vector256<double> d = Avx.Add(
+            ref var q = ref p[i];
+            var ax = Avx.Add(x, Avx.Multiply(ex, q.Sx));
+            var ay = Avx.Add(y, Avx.Multiply(ey, q.Sy));
+            var az = Avx.Add(z, Avx.Multiply(ez, q.Sz));
+            var d = Avx.Add(
                 Avx.Add(Avx.Add(Avx.Multiply(ax, q.Nx), Avx.Multiply(ay, q.Ny)), Avx.Multiply(az, q.Nz)),
                 q.D);
             mask = Avx.AndNot(Avx.CompareLessThan(d, zero), mask);
@@ -1191,12 +1343,12 @@ public static class FastCuller
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool InFrustum6(FastPlane[] p, float x, float y, float z, float ex, float ey, float ez)
     {
-        ref FastPlane p0 = ref p[0];
-        ref FastPlane p1 = ref p[1];
-        ref FastPlane p2 = ref p[2];
-        ref FastPlane p3 = ref p[3];
-        ref FastPlane p4 = ref p[4];
-        ref FastPlane p5 = ref p[5];
+        ref var p0 = ref p[0];
+        ref var p1 = ref p[1];
+        ref var p2 = ref p[2];
+        ref var p3 = ref p[3];
+        ref var p4 = ref p[4];
+        ref var p5 = ref p[5];
         return !(Dist(ref p0, x, y, z, ex, ey, ez) < 0.0)
              & !(Dist(ref p1, x, y, z, ex, ey, ez) < 0.0)
              & !(Dist(ref p2, x, y, z, ex, ey, ez) < 0.0)
@@ -1209,11 +1361,11 @@ public static class FastCuller
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool InFrustum5(FastPlane[] p, float x, float y, float z, float ex, float ey, float ez)
     {
-        ref FastPlane p0 = ref p[0];
-        ref FastPlane p1 = ref p[1];
-        ref FastPlane p2 = ref p[2];
-        ref FastPlane p3 = ref p[3];
-        ref FastPlane p4 = ref p[4];
+        ref var p0 = ref p[0];
+        ref var p1 = ref p[1];
+        ref var p2 = ref p[2];
+        ref var p3 = ref p[3];
+        ref var p4 = ref p[4];
         return !(Dist(ref p0, x, y, z, ex, ey, ez) < 0.0)
              & !(Dist(ref p1, x, y, z, ex, ey, ez) < 0.0)
              & !(Dist(ref p2, x, y, z, ex, ey, ez) < 0.0)
@@ -1262,9 +1414,9 @@ public static class FastCuller
     private static void Emit(int[] starts, int[] sizes, int[] meta, int i,
                              ref int group, ref int rendered, ref int prevEndByte, bool merge)
     {
-        int m = i * 3;
-        int startByte = meta[m];
-        int len = meta[m + 1];
+        var m = i * 3;
+        var startByte = meta[m];
+        var len = meta[m + 1];
 
         if (merge && group > 0 && prevEndByte == startByte)
         {
@@ -1296,23 +1448,23 @@ public static class FastCuller
     private static void TryBridge(int[] meta, ModelDataPoolLocation[] locs, FastPlane[] planes, bool fivePlanes,
                                   int prevI, int i, ref int prevEndByte, int[] sizes, int group, ref Stats st)
     {
-        int startByte = meta[i * 3];
-        int gapBytes = startByte - prevEndByte;
+        var startByte = meta[i * 3];
+        var gapBytes = startByte - prevEndByte;
         if (gapBytes <= 0 || i - prevI - 1 > GapMergeMaxParts) return;
 
-        int cursor = prevEndByte;
-        int parts = 0;
-        int tris = 0;
-        for (int j = prevI + 1; j < i && cursor < startByte; j++)
+        var cursor = prevEndByte;
+        var parts = 0;
+        var tris = 0;
+        for (var j = prevI + 1; j < i && cursor < startByte; j++)
         {
-            int m = j * 3;
+            var m = j * 3;
             if (meta[m] != cursor) continue;
 
-            Sphere s = locs[j].FrustumCullSphere;
-            float ex = s.radius / Sqrt3;
-            float ey = s.radiusY / Sqrt3;
-            float ez = s.radiusZ / Sqrt3;
-            bool inFrustum = fivePlanes
+            var s = locs[j].FrustumCullSphere;
+            var ex = s.radius / Sqrt3;
+            var ey = s.radiusY / Sqrt3;
+            var ez = s.radiusZ / Sqrt3;
+            var inFrustum = fivePlanes
                 ? InFrustum5(planes, s.x, s.y, s.z, ex, ey, ez)
                 : InFrustum6(planes, s.x, s.y, s.z, ex, ey, ez);
             if (inFrustum) return;
@@ -1336,17 +1488,21 @@ public static class FastCuller
     {
         if (!Parallel)
         {
-            long ts = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var ts = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             Stats seq = default;
             CullCore(pool, Lookup(pool), culler, mode, ref seq);
             Flush(ref seq);
-            if (MeasureTime) FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - ts);
+            if (MeasureTime)
+            {
+                FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - ts);
+                ReportRebuilds();
+            }
             CullVerifier.Maybe(pool, culler, mode);
             return;
         }
 
-        PoolCache c = Lookup(pool);
-        int visBuf = ModelDataPoolLocation.VisibleBufIndex;
+        var c = Lookup(pool);
+        var visBuf = ModelDataPoolLocation.VisibleBufIndex;
 
         // A new render stage means new planes, a new mode, or the occlusion culler having
         // flipped its visibility buffer. Any of the three invalidates a batch.
@@ -1373,12 +1529,12 @@ public static class FastCuller
             Memo[RuntimeHelpers.GetHashCode(pool) & (MemoSlots - 1)] = c;
         }
 
-        bool fireBatch = !keyBatched && ++keyCulls >= BatchThreshold;
+        var fireBatch = !keyBatched && ++keyCulls >= BatchThreshold;
 
         // A pool that gained or lost parts since the batch, or was created after it, is stale
         // and has to be redone - otherwise a freshly tesselated chunk would not render until
         // the next stage.
-        bool stale = c.BatchToken != batchStamp || c.Dirty || c.Count != LocationsRef(pool).Count;
+        var stale = c.BatchToken != batchStamp || c.Dirty || c.Count != LocationsRef(pool).Count;
 
         // Nothing to do. Leaving before the clock is read matters: all but one of the several
         // thousand FrustumCull calls a frame end here, and two Stopwatch reads apiece (a vDSO
@@ -1390,7 +1546,7 @@ public static class FastCuller
         // ninety pools in ninety-one unverified.
         if (!fireBatch && !stale) { CullVerifier.Maybe(pool, culler, mode); return; }
 
-        long t0 = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var t0 = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         if (fireBatch)
         {
@@ -1407,7 +1563,11 @@ public static class FastCuller
             Flush(ref st);
         }
 
-        if (MeasureTime) FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+        if (MeasureTime)
+        {
+            FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+            ReportRebuilds();
+        }
 
         // Outside the timed region and only ever on this thread: the batch's worker threads
         // must not run a checker that walks the same pool lists they are culling.
@@ -1418,7 +1578,7 @@ public static class FastCuller
     {
         if (!c.Registered) { c.Registered = true; Register(pool); }
         c.BatchToken = batchToken;
-        List<ModelDataPoolLocation> live = LocationsRef(pool);
+        var live = LocationsRef(pool);
         // The Dirty flag is set from the RemoveLocation patch and anything else that can
         // reorder the list. The count check is a belt-and-braces guard in case some other code
         // path ever mutates the list directly - that case has to rebuild, because nothing
@@ -1443,7 +1603,7 @@ public static class FastCuller
             Log?.Invoke($"visibility sweep is live ({live.Count} mesh parts in the first pool)");
         }
 
-        int n = c.Count;
+        var n = c.Count;
         if (n == 0)
         {
             pool.indicesGroupsCount = 0;
@@ -1452,20 +1612,20 @@ public static class FastCuller
             return;
         }
 
-        int[] starts = pool.indicesStartsByte;
-        int[] sizes = pool.indicesSizes;
-        int[] meta = c.Meta;
-        int group = 0;
-        int rendered = 0;
+        var starts = pool.indicesStartsByte;
+        var sizes = pool.indicesSizes;
+        var meta = c.Meta;
+        var group = 0;
+        var rendered = 0;
 
         // NoCull: vanilla's IsVisible falls through to "return !Hide".
         if (mode == EnumFrustumCullMode.NoCull)
         {
-            ModelDataPoolLocation[] all = c.Locs;
-            bool mergeNo = MergeDrawRanges;
-            int prevNo = -1;
-            int rawNo = 0;
-            for (int i = 0; i < n; i++)
+            var all = c.Locs;
+            var mergeNo = MergeDrawRanges;
+            var prevNo = -1;
+            var rawNo = 0;
+            for (var i = 0; i < n; i++)
             {
                 if (all[i].Hide) continue;
                 rawNo++;
@@ -1479,23 +1639,23 @@ public static class FastCuller
             return;
         }
 
-        FastPlane[] planes = LoadPlanes(culler);
+        var planes = LoadPlanes(culler);
 
         // set when the pool box sits entirely inside the frustum - see AllInside5
-        bool poolFullyInside = false;
+        var poolFullyInside = false;
 
         // Whole-pool rejection. The cached box is the union of every part's box, so if the
         // box fails a plane every part inside it fails the same plane.
         if (PoolLevelCulling && c.HasBox)
         {
-            float cx = (c.MinX + c.MaxX) * 0.5f;
-            float cy = (c.MinY + c.MaxY) * 0.5f;
-            float cz = (c.MinZ + c.MaxZ) * 0.5f;
-            float hx = (c.MaxX - c.MinX) * 0.5f;
-            float hy = (c.MaxY - c.MinY) * 0.5f;
-            float hz = (c.MaxZ - c.MinZ) * 0.5f;
+            var cx = (c.MinX + c.MaxX) * 0.5f;
+            var cy = (c.MinY + c.MaxY) * 0.5f;
+            var cz = (c.MinZ + c.MaxZ) * 0.5f;
+            var hx = (c.MaxX - c.MinX) * 0.5f;
+            var hy = (c.MaxY - c.MinY) * 0.5f;
+            var hz = (c.MaxZ - c.MinZ) * 0.5f;
 
-            bool boxVisible = mode == EnumFrustumCullMode.CullNormal
+            var boxVisible = mode == EnumFrustumCullMode.CullNormal
                 ? InFrustum5(planes, cx, cy, cz, hx, hy, hz)
                 : InFrustum6(planes, cx, cy, cz, hx, hy, hz);
 
@@ -1513,39 +1673,39 @@ public static class FastCuller
                 : AllInside6(planes, cx, cy, cz, hx, hy, hz);
         }
 
-        float[] geo = c.Geo;
-        byte[] lod = c.Lod;
-        int[] orig = c.Orig;
-        int[] bucketStart = c.BucketStart;
-        float[] cellBox = c.CellBox;
-        ModelDataPoolLocation[] locs = c.Locs;
-        ulong[] bits = c.VisBits;
-        bool merge = MergeDrawRanges;
-        int prevEndByte = -1;
-        int rawRanges = 0;
+        var geo = c.Geo;
+        var lod = c.Lod;
+        var orig = c.Orig;
+        var bucketStart = c.BucketStart;
+        var cellBox = c.CellBox;
+        var locs = c.Locs;
+        var bits = c.VisBits;
+        var merge = MergeDrawRanges;
+        var prevEndByte = -1;
+        var rawRanges = 0;
 
         // Offsets of the six planar blocks in Geo. x sits at 0, so it needs no name.
-        int gs = c.GeoStride;
+        var gs = c.GeoStride;
         int oY = gs, oZ = 2 * gs, oEX = 3 * gs, oEY = 4 * gs, oEZ = 5 * gs;
 
-        int words = (n + 63) >> 6;
+        var words = (n + 63) >> 6;
         Array.Clear(bits, 0, words);
 
         // Read the double-buffer index once. ChunkCuller flips it from the chunkculling
         // worker thread, so vanilla can observe two different values inside one sweep;
         // sampling it once here is if anything more consistent, not less.
-        int visBuf = ModelDataPoolLocation.VisibleBufIndex;
-        bool normalMode = mode == EnumFrustumCullMode.CullNormal;
-        bool multiCell = c.CellCount > 1;
-        int tested = 0;
-        int cellsSkipped = 0;
-        int bucketsSkipped = 0;
+        var visBuf = ModelDataPoolLocation.VisibleBufIndex;
+        var normalMode = mode == EnumFrustumCullMode.CullNormal;
+        var multiCell = c.CellCount > 1;
+        var tested = 0;
+        var cellsSkipped = 0;
+        var bucketsSkipped = 0;
 
         // ---- mode-specific setup, hoisted out of the cell loop ----
-        BlockPos ppos = PlayerPosRef(culler);
+        var ppos = PlayerPosRef(culler);
         double px = ppos.X, pz = ppos.Z;
-        double[] loBound = tlsLo ??= NewLodTable(0.0);
-        double[] hiBound = tlsHi ??= NewLodTable(double.NegativeInfinity);
+        var loBound = tlsLo ??= NewLodTable(0.0);
+        var hiBound = tlsHi ??= NewLodTable(double.NegativeInfinity);
         if (normalMode && !(ReferenceEquals(tlsLodCuller, culler)
                             && tlsLod0Bias.Equals(culler.lod0BiasSq)
                             && tlsLod2Bias.Equals(culler.lod2BiasSq)
@@ -1558,30 +1718,30 @@ public static class FastCuller
             tlsLodViewDistSq = culler.ViewDistanceSq;
         }
 
-        bool farPass = mode == EnumFrustumCullMode.CullInstantShadowPassFar;
-        bool shadowMode = farPass || mode == EnumFrustumCullMode.CullInstantShadowPassNear;
+        var farPass = mode == EnumFrustumCullMode.CullInstantShadowPassFar;
+        var shadowMode = farPass || mode == EnumFrustumCullMode.CullInstantShadowPassNear;
 
         // The LOD 3 stand-in is only ever drawn beyond lod2Bias. If the whole pool is nearer
         // than that, every LOD 3 part in it is geometry the camera pass does not draw, and
         // whose detailed counterpart (LOD 1 or LOD 2) is already in this shadow map. Testing
         // the pool's farthest corner keeps it exact: one comparison for the whole sweep.
-        bool skipLod3 = false;
+        var skipLod3 = false;
         if (shadowMode && ShadowSkipRedundantLod && c.HasBox)
         {
-            double fx = Math.Max(Math.Abs(px - c.MinX), Math.Abs(px - c.MaxX));
-            double fz = Math.Max(Math.Abs(pz - c.MinZ), Math.Abs(pz - c.MaxZ));
+            var fx = Math.Max(Math.Abs(px - c.MinX), Math.Abs(px - c.MaxX));
+            var fz = Math.Max(Math.Abs(pz - c.MinZ), Math.Abs(pz - c.MaxZ));
             skipLod3 = fx * fx + fz * fz <= culler.lod2BiasSq;
         }
         float ppx = ppos.X, ppz = ppos.Z;
-        double rangeX = culler.shadowRangeX;
-        double rangeZ = culler.shadowRangeZ;
+        var rangeX = culler.shadowRangeX;
+        var rangeZ = culler.shadowRangeZ;
 
         // ---- vector setup, also hoisted out of the cell loop ----
         // LoadPlanes filled the broadcast copies alongside the scalar ones under the same
         // cache key, so these two are never out of step.
-        bool vector = VectorCulling && Avx.IsSupported;
-        FastPlaneV[] planesV = vector ? tlsPlanesV : null;
-        ref float geoRef = ref MemoryMarshal.GetArrayDataReference(geo);
+        var vector = VectorCulling && Avx.IsSupported;
+        var planesV = vector ? tlsPlanesV : null;
+        ref var geoRef = ref MemoryMarshal.GetArrayDataReference(geo);
         Vector256<double> pxV = default, pzV = default, rangeXV = default, rangeZV = default;
         Vector128<float> ppxV = default, ppzV = default, absMask = default;
         if (vector)
@@ -1603,11 +1763,11 @@ public static class FastCuller
         // parts with it. This is what stops the sweep from touching every mesh part in memory.
         for (int cell = 0, cellCount = c.CellCount; cell < cellCount; cell++)
         {
-            int cellFrom = bucketStart[cell << 2];
-            int cellTo = bucketStart[(cell << 2) + 4];
+            var cellFrom = bucketStart[cell << 2];
+            var cellTo = bucketStart[(cell << 2) + 4];
             if (cellFrom == cellTo) continue;
 
-            int cb = cell * 6;
+            var cb = cell * 6;
             float ccx = cellBox[cb], ccy = cellBox[cb + 1], ccz = cellBox[cb + 2];
             float chx = cellBox[cb + 3], chy = cellBox[cb + 4], chz = cellBox[cb + 5];
 
@@ -1642,18 +1802,18 @@ public static class FastCuller
             double cellMinSq = 0, cellMaxSq = 0;
             if (normalMode)
             {
-                double ndx = Math.Abs(px - ccx) - chx; if (ndx < 0) ndx = 0;
-                double ndz = Math.Abs(pz - ccz) - chz; if (ndz < 0) ndz = 0;
+                var ndx = Math.Abs(px - ccx) - chx; if (ndx < 0) ndx = 0;
+                var ndz = Math.Abs(pz - ccz) - chz; if (ndz < 0) ndz = 0;
                 cellMinSq = ndx * ndx + ndz * ndz;
-                double fdx = Math.Abs(px - ccx) + chx;
-                double fdz = Math.Abs(pz - ccz) + chz;
+                var fdx = Math.Abs(px - ccx) + chx;
+                var fdz = Math.Abs(pz - ccz) + chz;
                 cellMaxSq = fdx * fdx + fdz * fdz;
             }
 
-            for (int l = 0; l < 4; l++)
+            for (var l = 0; l < 4; l++)
             {
-                int bs = bucketStart[(cell << 2) + l];
-                int be = bucketStart[(cell << 2) + l + 1];
+                var bs = bucketStart[(cell << 2) + l];
+                var be = bucketStart[(cell << 2) + l + 1];
                 if (bs == be) continue;
 
                 // vanilla checks LodLevel >= 1 last in the far shadow pass; a pure AND, so
@@ -1671,7 +1831,7 @@ public static class FastCuller
 
                 tested += be - bs;
 
-                int k = bs;
+                var k = bs;
 
                 // ---- four parts per iteration ----
                 // Every operation below mirrors the scalar body underneath term for term and in
@@ -1681,17 +1841,17 @@ public static class FastCuller
                 {
                     for (; k + 4 <= be; k += 4)
                     {
-                        nuint kk = (nuint)k;
+                        var kk = (nuint)k;
                         int m;
 
                         if (normalMode)
                         {
-                            Vector256<double> vx = Widen(ref geoRef, kk);
-                            Vector256<double> vz = Widen(ref geoRef, kk + (nuint)oZ);
-                            Vector256<double> dx = Avx.Subtract(vx, pxV);
-                            Vector256<double> dz = Avx.Subtract(vz, pzV);
+                            var vx = Widen(ref geoRef, kk);
+                            var vz = Widen(ref geoRef, kk + (nuint)oZ);
+                            var dx = Avx.Subtract(vx, pxV);
+                            var dz = Avx.Subtract(vz, pzV);
                             // vanilla narrows the sum of squares back to float before comparing
-                            Vector256<double> distSq = Avx.ConvertToVector256Double(
+                            var distSq = Avx.ConvertToVector256Double(
                                 Avx.ConvertToVector128Single(
                                     Avx.Add(Avx.Multiply(dx, dx), Avx.Multiply(dz, dz))));
 
@@ -1699,9 +1859,9 @@ public static class FastCuller
                             // out-of-range levels vanilla treats as permanently invisible, and
                             // reading the table per lane needs no argument about what a bucket
                             // can contain. Two loads a lane out of a table that stays in L1.
-                            Vector256<double> loV = Vector256.Create(
+                            var loV = Vector256.Create(
                                 loBound[lod[k]], loBound[lod[k + 1]], loBound[lod[k + 2]], loBound[lod[k + 3]]);
-                            Vector256<double> hiV = Vector256.Create(
+                            var hiV = Vector256.Create(
                                 hiBound[lod[k]], hiBound[lod[k + 1]], hiBound[lod[k + 2]], hiBound[lod[k + 3]]);
 
                             m = Avx.MoveMask(Avx.And(Avx.CompareGreaterThan(distSq, loV),
@@ -1714,13 +1874,13 @@ public static class FastCuller
                         }
                         else if (shadowMode)
                         {
-                            Vector128<float> fx = Vector128.LoadUnsafe(ref geoRef, kk);
-                            Vector128<float> fz = Vector128.LoadUnsafe(ref geoRef, kk + (nuint)oZ);
+                            var fx = Vector128.LoadUnsafe(ref geoRef, kk);
+                            var fz = Vector128.LoadUnsafe(ref geoRef, kk + (nuint)oZ);
                             // the difference and its absolute value are computed in float, as
                             // vanilla does, and only then widened for the range comparison
-                            Vector256<double> adx = Avx.ConvertToVector256Double(
+                            var adx = Avx.ConvertToVector256Double(
                                 Sse.And(Sse.Subtract(ppxV, fx), absMask));
-                            Vector256<double> adz = Avx.ConvertToVector256Double(
+                            var adz = Avx.ConvertToVector256Double(
                                 Sse.And(Sse.Subtract(ppzV, fz), absMask));
                             m = Avx.MoveMask(Avx.And(Avx.CompareLessThan(adx, rangeXV),
                                                      Avx.CompareLessThan(adz, rangeZV)));
@@ -1747,9 +1907,9 @@ public static class FastCuller
 
                         while (m != 0)
                         {
-                            int i = orig[k + System.Numerics.BitOperations.TrailingZeroCount(m)];
+                            var i = orig[k + System.Numerics.BitOperations.TrailingZeroCount(m)];
                             m &= m - 1;
-                            ModelDataPoolLocation loc = locs[i];
+                            var loc = locs[i];
                             if (!loc.CullVisible[visBuf] || loc.Hide) continue;
                             if (normalMode) loc.FrustumVisible = true;
                             bits[i >> 6] |= 1UL << (i & 63);
@@ -1759,18 +1919,18 @@ public static class FastCuller
 
                 for (; k < be; k++)
                 {
-                    float x = geo[k];
-                    float z = geo[oZ + k];
+                    var x = geo[k];
+                    var z = geo[oZ + k];
                     bool visible;
 
                     if (normalMode)
                     {
                         // BlockPos.HorDistanceSqTo returns float; vanilla widens that to double
-                        double dx = (double)x - px;
-                        double dz = (double)z - pz;
+                        var dx = (double)x - px;
+                        var dz = (double)z - pz;
                         double distSq = (float)(dx * dx + dz * dz);
 
-                        byte lv = lod[k];
+                        var lv = lod[k];
                         visible = distSq > loBound[lv] & distSq < hiBound[lv];
                         if (visible & !poolFullyInside)
                             visible = InFrustum5(planes, x, geo[oY + k], z, geo[oEX + k], geo[oEY + k], geo[oEZ + k]);
@@ -1790,8 +1950,8 @@ public static class FastCuller
 
                     if (!visible) continue;
 
-                    int i = orig[k];
-                    ModelDataPoolLocation loc = locs[i];
+                    var i = orig[k];
+                    var loc = locs[i];
                     if (!loc.CullVisible[visBuf] || loc.Hide) continue;
                     // Deliberate deviation, stated rather than hidden: vanilla's
                     // UpdateVisibleFlag writes FrustumVisible either way, this only writes the
@@ -1810,27 +1970,27 @@ public static class FastCuller
         // Parts appended since the last rebuild are not in the grid. They get the same tests,
         // just without cell or bucket pre-rejection - there are at most a few dozen of them,
         // which is the whole point of not rebuilding the grid for every new chunk.
-        for (int k = 0; k < c.OverCount; k++)
+        for (var k = 0; k < c.OverCount; k++)
         {
-            int g = k * 6;
-            float x = c.OverGeo[g];
-            float z = c.OverGeo[g + 2];
+            var g = k * 6;
+            var x = c.OverGeo[g];
+            var z = c.OverGeo[g + 2];
 
             // The LOD level is read off the location, not out of a cached byte. An overflow
             // entry can be a part that TryAdd squeezed into the middle of the list, and at the
             // moment our postfix sees that part the engine has not assigned its LodLevel yet -
             // a cached copy is a 0, which the camera pass reads as "invisible unless the LOD0
             // setting is on". A few dozen entries at most, so the dereference is nothing.
-            int i = c.OverOrig[k];
-            ModelDataPoolLocation loc = locs[i];
-            int lodLevel = loc.LodLevel;
-            byte lv = (byte)((uint)lodLevel < 4u ? lodLevel : 255);
+            var i = c.OverOrig[k];
+            var loc = locs[i];
+            var lodLevel = loc.LodLevel;
+            var lv = (byte)((uint)lodLevel < 4u ? lodLevel : 255);
             bool visible;
 
             if (normalMode)
             {
-                double dx = (double)x - px;
-                double dz = (double)z - pz;
+                var dx = (double)x - px;
+                var dz = (double)z - pz;
                 double distSq = (float)(dx * dx + dz * dz);
 
                 visible = distSq > loBound[lv] & distSq < hiBound[lv];
@@ -1872,14 +2032,14 @@ public static class FastCuller
         //
         // A pool fully inside the frustum cannot contain a frustum-rejected part, so there is
         // nothing a bridge could legally cross - the flag saves the walk, not correctness.
-        bool bridging = merge && GapMergeDrawRanges && !poolFullyInside;
-        int prevI = -1;
-        for (int w = 0; w < words; w++)
+        var bridging = merge && GapMergeDrawRanges && !poolFullyInside;
+        var prevI = -1;
+        for (var w = 0; w < words; w++)
         {
-            ulong v = bits[w];
+            var v = bits[w];
             while (v != 0)
             {
-                int i = (w << 6) + System.Numerics.BitOperations.TrailingZeroCount(v);
+                var i = (w << 6) + System.Numerics.BitOperations.TrailingZeroCount(v);
                 v &= v - 1;
                 rawRanges++;
                 if (bridging && group > 0)

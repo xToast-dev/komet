@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Reflection;
 using HarmonyLib;
 
 namespace Komet.Patches;
@@ -67,11 +66,11 @@ public static class EdgeCoalescePatches
     public static void Apply(Harmony harmony, double coalesceMs)
     {
         CoalesceMs = coalesceMs;
-        Type map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
-                   ?? throw new InvalidOperationException("ClientWorldMap not found");
-        MethodInfo mark = AccessTools.Method(map, "MarkChunkDirty")
-                          ?? throw new InvalidOperationException("MarkChunkDirty not found");
-        markChunkDirty = HarmonyLib.MethodInvoker.GetHandler(mark);
+        var map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
+                  ?? throw new InvalidOperationException("ClientWorldMap not found");
+        var mark = AccessTools.Method(map, "MarkChunkDirty")
+                   ?? throw new InvalidOperationException("MarkChunkDirty not found");
+        markChunkDirty = MethodInvoker.GetHandler(mark);
 
         harmony.Patch(mark, prefix: new HarmonyMethod(typeof(EdgeCoalescePatches), nameof(MarkPrefix)));
     }
@@ -81,6 +80,9 @@ public static class EdgeCoalescePatches
     internal static (int cx, int cy, int cz) Unpack(long key)
         => ((int)(key >> 42), (int)((key >> 21) & 0x1FFFFF), (int)(key & 0x1FFFFF));
 
+    // ReSharper disable InconsistentNaming - Harmony binds these BY NAME: __instance is the
+    // injected receiver and OnRetesselated must match the engine's parameter spelling exactly.
+    // A rename (an IDE "fix naming" pass did it once) makes Patch() throw and the feature go dead.
     public static bool MarkPrefix(object __instance, int cx, int cy, int cz, bool priority,
                                   bool sunRelight, Action OnRetesselated, bool fireEvent, bool edgeOnly)
     {
@@ -99,7 +101,7 @@ public static class EdgeCoalescePatches
         }
     }
 
-    private static readonly List<long> due = new(64);
+    private static readonly List<long> Due = [];
 
     /// <summary>Re-issues due marks. Runs on the main thread via a game tick listener.</summary>
     public static void Flush() => FlushInternal(onlyDue: true);
@@ -109,26 +111,26 @@ public static class EdgeCoalescePatches
 
     private static void FlushInternal(bool onlyDue)
     {
-        object map = worldMap;
+        var map = worldMap;
         if (map == null || markChunkDirty == null) return;
 
-        due.Clear();
+        Due.Clear();
         lock (Pending)
         {
             // Capped against the burst cost the stress test measured (-0,12 ms +-0,07 when
             // hundreds of re-issues landed in one tick), but with a catch-up mode: a cap
             // below the inflow turns "delayed" into "missing" - see CatchUpThreshold.
-            if (onlyDue) Pending.CollectDue(Stopwatch.GetTimestamp(), due, CapFor(Pending.Count));
-            else Pending.CollectAll(due);
+            if (onlyDue) Pending.CollectDue(Stopwatch.GetTimestamp(), Due, CapFor(Pending.Count));
+            else Pending.CollectAll(Due);
         }
-        if (due.Count == 0) return;
+        if (Due.Count == 0) return;
 
         try
         {
             flushing = true;
-            foreach (long key in due)
+            foreach (var key in Due)
             {
-                (int cx, int cy, int cz) = Unpack(key);
+                (var cx, var cy, var cz) = Unpack(key);
                 markChunkDirty(map, cx, cy, cz, false, false, null, false, true);
                 StatFlushed++;
             }
@@ -175,18 +177,18 @@ public static class EdgeCoalescePatches
 
         public void CollectDue(long nowTicks, List<long> into, int max = int.MaxValue)
         {
-            foreach (KeyValuePair<long, long> kv in dueAt)
+            foreach (var kv in dueAt)
             {
                 if (kv.Value > nowTicks) continue;
                 into.Add(kv.Key);
                 if (into.Count >= max) break;
             }
-            foreach (long key in into) dueAt.Remove(key);
+            foreach (var key in into) dueAt.Remove(key);
         }
 
         public void CollectAll(List<long> into)
         {
-            foreach (KeyValuePair<long, long> kv in dueAt) into.Add(kv.Key);
+            foreach (var kv in dueAt) into.Add(kv.Key);
             dueAt.Clear();
         }
 

@@ -4,6 +4,11 @@ using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -49,9 +54,9 @@ public static class ShadowStabilityPatches
     {
         EnsureReady();
 
-        MethodInfo ortho = AccessTools.Method(typeof(SystemRenderShadowMap), "loadOrthoModeMatrix",
-                               [typeof(double[]), typeof(double), typeof(double), typeof(double)])
-                           ?? throw new InvalidOperationException("loadOrthoModeMatrix not found");
+        var ortho = AccessTools.Method(typeof(SystemRenderShadowMap), "loadOrthoModeMatrix",
+                        [typeof(double[]), typeof(double), typeof(double), typeof(double)])
+                    ?? throw new InvalidOperationException("loadOrthoModeMatrix not found");
 
         harmony.Patch(ortho, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowStabilityPatches), nameof(SnapToTexelGrid))));
@@ -71,16 +76,16 @@ public static class ShadowStabilityPatches
         offsetX = offsetY = 0;
         if (lightView == null || lightView.Length < 16 || mapSize <= 0) return false;
 
-        double texelX = width / mapSize;
-        double texelY = height / mapSize;
+        var texelX = width / mapSize;
+        var texelY = height / mapSize;
         if (texelX <= 0 || texelY <= 0) return false;
 
         // The camera's world position in light space. Only the rotation matters - the
         // translation column would cancel out, since the projection is centred on the camera
         // either way. lightViewMatrix still holds the previous pass's value at this point,
         // which is the same sun direction to well within a texel.
-        double lx = lightView[0] * camX + lightView[4] * camY + lightView[8] * camZ;
-        double ly = lightView[1] * camX + lightView[5] * camY + lightView[9] * camZ;
+        var lx = lightView[0] * camX + lightView[4] * camY + lightView[8] * camZ;
+        var ly = lightView[1] * camX + lightView[5] * camY + lightView[9] * camZ;
 
         offsetX = lx - Math.Floor(lx / texelX) * texelX;
         offsetY = ly - Math.Floor(ly / texelY) * texelY;
@@ -98,9 +103,9 @@ public static class ShadowStabilityPatches
 
         try
         {
-            ClientMain game = GameRef(__instance);
-            Vintagestory.API.MathTools.Vec3d cam = game?.EntityPlayer?.CameraPos;
-            double[] lightView = LightViewRef(__instance);
+            var game = GameRef(__instance);
+            var cam = game?.EntityPlayer?.CameraPos;
+            var lightView = LightViewRef(__instance);
             if (cam == null || lightView == null || lightView.Length < 16) return;
 
             // Shadow map resolution. Snapping to the wrong grid does not snap at all: the
@@ -108,9 +113,9 @@ public static class ShadowStabilityPatches
             // supposed to remove comes back as a sub-texel one. ShadowResPatches enlarges the
             // framebuffer past what the setting alone implies, so its size wins when it is
             // active; the engine's own formula is the fallback.
-            int mapSize = ShadowResPatches.EffectiveMapSize;
+            var mapSize = ShadowResPatches.EffectiveMapSize;
             if (!SnapOffset(lightView, cam.X, cam.Y, cam.Z, width, height, mapSize,
-                            out double offsetX, out double offsetY))
+                            out var offsetX, out var offsetY))
                 return;
 
             // Light-space units into normalised device coordinates: the ortho projection maps

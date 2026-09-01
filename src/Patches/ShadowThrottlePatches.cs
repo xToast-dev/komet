@@ -1,11 +1,14 @@
 using System;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Client;
-using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -85,17 +88,17 @@ public static class ShadowThrottlePatches
 
     // The sampling matrices and camera positions of the frames that actually rendered each
     // cascade - the base every skipped frame's compensation is computed from.
-    private static readonly float[] farMatrixSnap = new float[16];
+    private static readonly float[] FarMatrixSnap = new float[16];
     private static double farCamX, farCamY, farCamZ;
     private static bool haveFarSnap;
-    private static readonly float[] nearMatrixSnap = new float[16];
+    private static readonly float[] NearMatrixSnap = new float[16];
     private static double nearCamX, nearCamY, nearCamZ;
     private static bool haveNearSnap;
 
-    private static readonly HarmonyLib.AccessTools.FieldRef<ClientMain, float[]> FarMatrixRef =
-        HarmonyLib.AccessTools.FieldRefAccess<ClientMain, float[]>("toShadowMapSpaceMatrixFar");
-    private static readonly HarmonyLib.AccessTools.FieldRef<ClientMain, float[]> NearMatrixRef =
-        HarmonyLib.AccessTools.FieldRefAccess<ClientMain, float[]>("toShadowMapSpaceMatrixNear");
+    private static readonly AccessTools.FieldRef<ClientMain, float[]> FarMatrixRef =
+        AccessTools.FieldRefAccess<ClientMain, float[]>("toShadowMapSpaceMatrixFar");
+    private static readonly AccessTools.FieldRef<ClientMain, float[]> NearMatrixRef =
+        AccessTools.FieldRefAccess<ClientMain, float[]>("toShadowMapSpaceMatrixNear");
 
     /// <summary>
     /// Latched so ShadowFarDone always gives the same answer as ShadowFar. Recomputing would
@@ -127,9 +130,9 @@ public static class ShadowThrottlePatches
         // Applied even at 1/1/1 (which decides "render" for every frame, exactly vanilla):
         // '.komet toggle shadowthrottle' has to be able to switch throttling on mid-session,
         // and a patch that was never applied cannot be enabled by a field write.
-        MethodInfo stage = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.TriggerRenderStage),
-                                              new[] { typeof(EnumRenderStage), typeof(float) })
-                           ?? throw new InvalidOperationException("ClientMain.TriggerRenderStage not found");
+        var stage = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.TriggerRenderStage),
+                        [typeof(EnumRenderStage), typeof(float)])
+                    ?? throw new InvalidOperationException("ClientMain.TriggerRenderStage not found");
 
         // Priority.Last so the measurement prefix still gets to start its clock; a prefix
         // returning false only skips the original method, not the other patches. The postfix
@@ -192,19 +195,19 @@ public static class ShadowThrottlePatches
 
         if (stage == EnumRenderStage.ShadowFar && renderFar)
         {
-            Vec3d cam = __instance.EntityPlayer?.CameraPos;
-            float[] m = FarMatrixRef(__instance);
+            var cam = __instance.EntityPlayer?.CameraPos;
+            var m = FarMatrixRef(__instance);
             if (cam == null || m == null || m.Length < 16) { haveFarSnap = false; return; }
-            Array.Copy(m, farMatrixSnap, 16);
+            Array.Copy(m, FarMatrixSnap, 16);
             farCamX = cam.X; farCamY = cam.Y; farCamZ = cam.Z;
             haveFarSnap = true;
         }
         else if (stage == EnumRenderStage.ShadowNear && renderNear)
         {
-            Vec3d cam = __instance.EntityPlayer?.CameraPos;
-            float[] m = NearMatrixRef(__instance);
+            var cam = __instance.EntityPlayer?.CameraPos;
+            var m = NearMatrixRef(__instance);
             if (cam == null || m == null || m.Length < 16) { haveNearSnap = false; return; }
-            Array.Copy(m, nearMatrixSnap, 16);
+            Array.Copy(m, NearMatrixSnap, 16);
             nearCamX = cam.X; nearCamY = cam.Y; nearCamZ = cam.Z;
             haveNearSnap = true;
         }
@@ -218,22 +221,22 @@ public static class ShadowThrottlePatches
     private static void Compensate(ClientMain game, bool far)
     {
         if (game == null) return;
-        Vec3d cam = game.EntityPlayer?.CameraPos;
+        var cam = game.EntityPlayer?.CameraPos;
         if (cam == null) return;
 
         if (far)
         {
             if (!haveFarSnap) return;
-            float[] target = FarMatrixRef(game);
+            var target = FarMatrixRef(game);
             if (target == null || target.Length < 16) return;
-            OffsetShadowMatrix(farMatrixSnap, target, cam.X - farCamX, cam.Y - farCamY, cam.Z - farCamZ);
+            OffsetShadowMatrix(FarMatrixSnap, target, cam.X - farCamX, cam.Y - farCamY, cam.Z - farCamZ);
         }
         else
         {
             if (!haveNearSnap) return;
-            float[] target = NearMatrixRef(game);
+            var target = NearMatrixRef(game);
             if (target == null || target.Length < 16) return;
-            OffsetShadowMatrix(nearMatrixSnap, target, cam.X - nearCamX, cam.Y - nearCamY, cam.Z - nearCamZ);
+            OffsetShadowMatrix(NearMatrixSnap, target, cam.X - nearCamX, cam.Y - nearCamY, cam.Z - nearCamZ);
         }
     }
 
@@ -249,7 +252,7 @@ public static class ShadowThrottlePatches
     /// </summary>
     internal static void OffsetShadowMatrix(float[] snap, float[] into, double dx, double dy, double dz)
     {
-        for (int i = 0; i < 12; i++) into[i] = snap[i];
+        for (var i = 0; i < 12; i++) into[i] = snap[i];
         into[12] = (float)(snap[12] + snap[0] * dx + snap[4] * dy + snap[8] * dz);
         into[13] = (float)(snap[13] + snap[1] * dx + snap[5] * dy + snap[9] * dz);
         into[14] = (float)(snap[14] + snap[2] * dx + snap[6] * dy + snap[10] * dz);
@@ -267,7 +270,7 @@ public static class ShadowThrottlePatches
     {
         if (NearInterval <= 1) return true;
 
-        long since = frameCounter - lastNearFrame;
+        var since = frameCounter - lastNearFrame;
         if (since <= 0) return renderNear;
         if (since < NearInterval) return false;
         if (renderFar && since <= NearInterval) return false;
@@ -289,7 +292,7 @@ public static class ShadowThrottlePatches
 
     private static bool DecideFar(ClientMain game)
     {
-        long since = frameCounter - lastFarFrame;
+        var since = frameCounter - lastFarFrame;
 
         // The same frame asking twice (or a frame counter that has not advanced) must not
         // flip the answer half way through a stage pair.
@@ -305,8 +308,8 @@ public static class ShadowThrottlePatches
         // [0, 1], where shadowcoords.vsh's edge terms (multiplied by ten) cut the shadow off
         // over a couple of metres instead of fading it. That edge then jumps every time the
         // cascade is finally redrawn.
-        bool read = TryRead(game, out double x, out double y, out double z, out Vec3f light);
-        bool known = haveReference && read;
+        var read = TryRead(game, out var x, out var y, out var z, out var light);
+        var known = haveReference && read;
 
         if (known)
         {
@@ -324,7 +327,7 @@ public static class ShadowThrottlePatches
 
         // Light direction: the shadow projection is a LookAt along this vector, so a rotation
         // invalidates the map even when the camera has not moved at all.
-        float len = MathF.Sqrt(light.X * light.X + light.Y * light.Y + light.Z * light.Z);
+        var len = MathF.Sqrt(light.X * light.X + light.Y * light.Y + light.Z * light.Z);
         if (len <= 1e-6f) return true;
         float nx = light.X / len, ny = light.Y / len, nz = light.Z / len;
         return nx * refLx + ny * refLy + nz * refLz < LightEpsilon;
@@ -332,7 +335,7 @@ public static class ShadowThrottlePatches
 
     private static void Remember(ClientMain game)
     {
-        if (!TryRead(game, out double x, out double y, out double z, out Vec3f light))
+        if (!TryRead(game, out var x, out var y, out var z, out var light))
         {
             haveReference = false;
             return;
@@ -340,7 +343,7 @@ public static class ShadowThrottlePatches
 
         refX = x; refY = y; refZ = z;
 
-        float len = MathF.Sqrt(light.X * light.X + light.Y * light.Y + light.Z * light.Z);
+        var len = MathF.Sqrt(light.X * light.X + light.Y * light.Y + light.Z * light.Z);
         if (len <= 1e-6f) { haveReference = false; return; }
         refLx = light.X / len; refLy = light.Y / len; refLz = light.Z / len;
         haveReference = true;
@@ -356,8 +359,8 @@ public static class ShadowThrottlePatches
         light = null;
         if (game == null) return false;
 
-        Vec3d cam = game.EntityPlayer?.CameraPos;
-        IClientGameCalendar cal = game.Calendar;
+        var cam = game.EntityPlayer?.CameraPos;
+        var cal = game.Calendar;
         if (cam == null || cal == null) return false;
 
         light = cal.MoonLightStrength > cal.SunLightStrength ? cal.MoonPosition : cal.SunPosition;

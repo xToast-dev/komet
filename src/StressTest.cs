@@ -85,7 +85,7 @@ public static class StressTest
         lastFrameTs = 0;
         Running = true;
 
-        double total = schedule.Length * secondsPerSlice;
+        var total = schedule.Length * secondsPerSlice;
         return $"Stresstest gestartet: {plan.Count} Systeme x {rounds} Runden, verschraenkt mit Baselines "
              + $"({schedule.Length} Scheiben a {secondsPerSlice:0.#}s = ~{total:0}s). Bewegung ist ok - "
              + "Drift wird durch die Nachbar-Baselines herausgerechnet. '.komet stress stop' bricht ab.";
@@ -96,9 +96,9 @@ public static class StressTest
     internal static int[] BuildSchedule(int systemCount, int roundCount)
     {
         var plan = new List<int>(roundCount * systemCount * 2 + 1);
-        for (int r = 0; r < roundCount; r++)
+        for (var r = 0; r < roundCount; r++)
         {
-            for (int s = 0; s < systemCount; s++)
+            for (var s = 0; s < systemCount; s++)
             {
                 plan.Add(-1);
                 plan.Add(s);
@@ -111,7 +111,7 @@ public static class StressTest
     public static string Stop(string reason)
     {
         if (!Running) return "kein Stresstest aktiv";
-        int current = CurrentSystem();
+        var current = CurrentSystem();
         if (current >= 0) SafeExit(systems[current]);
         Running = false;
         StatusLine = null;
@@ -135,12 +135,12 @@ public static class StressTest
     {
         if (!Running) return;
 
-        double frameMs = lastFrameTs != 0 ? (now - lastFrameTs) * 1000.0 / Stopwatch.Frequency : 0;
+        var frameMs = lastFrameTs != 0 ? (now - lastFrameTs) * 1000.0 / Stopwatch.Frequency : 0;
         lastFrameTs = now;
 
         if (sliceIndex < 0 || now >= sliceEndsAt)
         {
-            int leaving = CurrentSystem();
+            var leaving = CurrentSystem();
             if (leaving >= 0) SafeExit(systems[leaving]);
 
             sliceIndex++;
@@ -148,7 +148,7 @@ public static class StressTest
             {
                 Running = false;
                 StatusLine = null;
-                string table = BuildReport(slices, schedule, systems);
+                var table = BuildReport(slices, schedule, systems);
                 systems = null;
                 slices = null;
                 schedule = null;
@@ -156,7 +156,7 @@ public static class StressTest
                 return;
             }
 
-            int entering = schedule[sliceIndex];
+            var entering = schedule[sliceIndex];
             if (entering >= 0)
             {
                 try { systems[entering].Enter?.Invoke(); }
@@ -166,7 +166,7 @@ public static class StressTest
             slices.Add(new Slice { System = entering });
             settleLeft = SettleFrames;
             sliceEndsAt = now + (long)(secondsPerSlice * Stopwatch.Frequency);
-            int round = sliceIndex / (systems.Count * 2) + 1;
+            var round = sliceIndex / (systems.Count * 2) + 1;
             StatusLine = entering < 0
                 ? $"runde {Math.Min(round, rounds)}/{rounds}: baseline"
                 : $"runde {round}/{rounds}: {systems[entering].Name}";
@@ -176,7 +176,7 @@ public static class StressTest
         if (settleLeft > 0) { settleLeft--; return; }
         if (frameMs <= 0) return;
 
-        Slice s = slices[sliceIndex];
+        var s = slices[sliceIndex];
         s.Frames++;
         s.SumMs += frameMs;
         s.SumSwapMs += swapMs;
@@ -196,12 +196,12 @@ public static class StressTest
     /// </summary>
     internal static string BuildReport(List<Slice> done, int[] plan, List<Phase> sys)
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(1024);
 
         double firstBase = -1, lastBase = 0, baseSum = 0;
-        int baseCount = 0;
-        foreach (Slice s in done)
+        var baseCount = 0;
+        foreach (var s in done)
         {
             if (s.System != -1 || s.Frames == 0) continue;
             if (firstBase < 0) firstBase = s.AvgMs;
@@ -209,7 +209,7 @@ public static class StressTest
             baseSum += s.AvgMs;
             baseCount++;
         }
-        double baseMean = baseCount > 0 ? baseSum / baseCount : 0;
+        var baseMean = baseCount > 0 ? baseSum / baseCount : 0;
 
         sb.AppendFormat(ci, "stresstest fertig - baseline im mittel {0:F2} ms ({1:F0} fps)",
             baseMean, baseMean > 0 ? 1000 / baseMean : 0);
@@ -220,19 +220,19 @@ public static class StressTest
                 firstBase, lastBase);
         sb.Append('\n');
 
-        for (int sysIdx = 0; sysIdx < sys.Count; sysIdx++)
+        for (var sysIdx = 0; sysIdx < sys.Count; sysIdx++)
         {
             double sum = 0, swapSum = 0, shadowSum = 0;
             double min = double.MaxValue, max = double.MinValue, worst = 0;
-            int n = 0;
-            for (int i = 0; i < done.Count && i < plan.Length; i++)
+            var n = 0;
+            for (var i = 0; i < done.Count && i < plan.Length; i++)
             {
                 if (plan[i] != sysIdx || done[i].Frames == 0) continue;
                 if (i - 1 < 0 || i + 1 >= done.Count) continue;
                 if (done[i - 1].Frames == 0 || done[i + 1].Frames == 0) continue;
 
-                double local = (done[i - 1].AvgMs + done[i + 1].AvgMs) / 2;
-                double d = done[i].AvgMs - local;
+                var local = (done[i - 1].AvgMs + done[i + 1].AvgMs) / 2;
+                var d = done[i].AvgMs - local;
                 sum += d;
                 swapSum += done[i].AvgSwapMs - (done[i - 1].AvgSwapMs + done[i + 1].AvgSwapMs) / 2;
                 shadowSum += done[i].AvgShadowMs - (done[i - 1].AvgShadowMs + done[i + 1].AvgShadowMs) / 2;
@@ -248,8 +248,8 @@ public static class StressTest
                 continue;
             }
 
-            double mean = sum / n;
-            double spread = (max - min) / 2;
+            var mean = sum / n;
+            var spread = (max - min) / 2;
             sb.AppendFormat(ci, "{0}: delta {1}{2:F2} ms", sys[sysIdx].Name, mean >= 0 ? "+" : "", mean);
             if (n > 1) sb.AppendFormat(ci, " (+-{0:F2} ueber {1} runden)", spread, n);
             sb.AppendFormat(ci, " [swap {0}{1:F2}, schatten {2}{3:F2}]",

@@ -65,7 +65,7 @@ public static class CullVerifier
     /// </summary>
     internal static bool VanillaVisible(ModelDataPoolLocation loc, EnumFrustumCullMode mode, FrustumCulling culler)
     {
-        int buf = ModelDataPoolLocation.VisibleBufIndex;
+        var buf = ModelDataPoolLocation.VisibleBufIndex;
         switch (mode)
         {
             case EnumFrustumCullMode.CullInstant:
@@ -92,13 +92,13 @@ public static class CullVerifier
                                    List<int> allowed = null)
     {
         // want and allowed are flat (startByte, lengthInIndices) lists; want is in emit order
-        int wantCount = want.Count / 2;
-        int w = 0;
+        var wantCount = want.Count / 2;
+        var w = 0;
 
-        for (int g = 0; g < groups; g++)
+        for (var g = 0; g < groups; g++)
         {
-            int gStart = starts[g * 2];
-            int gLen = sizes[g];
+            var gStart = starts[g * 2];
+            var gLen = sizes[g];
 
             if (w >= wantCount)
                 return $"range {g} at byte {gStart} len {gLen} was not drawn by vanilla";
@@ -107,8 +107,8 @@ public static class CullVerifier
 
             // one emitted range may cover several consecutive vanilla ranges - plus, between
             // them, parts a bridge may cross - but only if the bytes are genuinely contiguous
-            int covered = 0;
-            int cursorByte = gStart;
+            var covered = 0;
+            var cursorByte = gStart;
             while (covered < gLen)
             {
                 if (w < wantCount && want[w * 2] == cursorByte)
@@ -119,7 +119,7 @@ public static class CullVerifier
                     continue;
                 }
 
-                int bridged = AllowedLenAt(allowed, cursorByte);
+                var bridged = AllowedLenAt(allowed, cursorByte);
                 if (bridged > 0)
                 {
                     covered += bridged;
@@ -156,7 +156,7 @@ public static class CullVerifier
     private static int AllowedLenAt(List<int> allowed, int startByte)
     {
         if (allowed == null) return 0;
-        for (int a = 0; a < allowed.Count; a += 2)
+        for (var a = 0; a < allowed.Count; a += 2)
             if (allowed[a] == startByte) return allowed[a + 1];
         return 0;
     }
@@ -167,17 +167,17 @@ public static class CullVerifier
     /// </summary>
     public static void Maybe(MeshDataPool pool, FrustumCulling culler, EnumFrustumCullMode mode)
     {
-        int every = SampleEvery;
+        var every = SampleEvery;
         if (every <= 0 || reports >= MaxReports) return;
         if (--countdown > 0) return;
         countdown = every;
 
         try
         {
-            List<ModelDataPoolLocation> live = LocationsRef(pool);
+            var live = LocationsRef(pool);
             if (live == null) return;
 
-            List<int> want = expected ??= new List<int>(1024);
+            var want = expected ??= new List<int>(1024);
             want.Clear();
 
             // The safety criterion is computed with vanilla's own InFrustum, not with the
@@ -193,9 +193,9 @@ public static class CullVerifier
                 allowed.Clear();
             }
 
-            for (int i = 0; i < live.Count; i++)
+            for (var i = 0; i < live.Count; i++)
             {
-                ModelDataPoolLocation loc = live[i];
+                var loc = live[i];
                 if (VanillaVisible(loc, mode, culler))
                 {
                     want.Add(loc.IndicesStart * 4);
@@ -209,7 +209,7 @@ public static class CullVerifier
             }
 
             StatChecked++;
-            string problem = Compare(pool.indicesStartsByte, pool.indicesSizes, pool.indicesGroupsCount,
+            var problem = Compare(pool.indicesStartsByte, pool.indicesSizes, pool.indicesGroupsCount,
                                      want, allowed);
             if (problem == null) return;
 

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 
 namespace Komet;
@@ -18,25 +19,25 @@ namespace Komet;
 /// </summary>
 public static class ChunkMarkClock
 {
-    private static readonly ConcurrentDictionary<long, long> lastMark = new();
+    private static readonly ConcurrentDictionary<long, long> LastMarks = new();
 
     /// <summary>Whether anything records marks - false leaves the dictionary untouched.</summary>
     public static bool Enabled;
 
     public static void Note(long index3d)
     {
-        if (Enabled) lastMark[index3d] = Stopwatch.GetTimestamp();
+        if (Enabled) LastMarks[index3d] = Stopwatch.GetTimestamp();
     }
 
     /// <summary>Timestamp of the last mark, or 0 when this chunk was never marked.</summary>
     public static long LastMark(long index3d)
-        => lastMark.TryGetValue(index3d, out long ts) ? ts : 0;
+        => LastMarks.GetValueOrDefault(index3d);
 
     /// <summary>The engine's chunk key: ((y * mulZ) + z) * mulX + x.</summary>
     public static long Key(int cx, int cy, int cz, int mulX, int mulZ)
         => ((long)cy * mulZ + cz) * mulX + cx;
 
-    public static void Clear() => lastMark.Clear();
+    public static void Clear() => LastMarks.Clear();
 
-    public static int Count => lastMark.Count;
+    public static int Count => LastMarks.Count;
 }

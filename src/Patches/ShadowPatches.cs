@@ -4,6 +4,11 @@ using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -38,6 +43,11 @@ public static class ShadowPatches
 
     /// <summary>What the config asked for, so a live toggle can return to it.</summary>
     public static double ConfiguredMultiplier = 1.0;
+
+    private const double FloatingPointEpsilon = 1e-9;
+
+    private static bool NearlyEqual(double left, double right, double epsilon = FloatingPointEpsilon)
+        => Math.Abs(left - right) <= epsilon;
 
     // All three patches are applied unconditionally and gated here at runtime. They are the
     // only things in this mod that change how shadows look, and until 1.37.0 they were the
@@ -119,21 +129,21 @@ public static class ShadowPatches
         SymmetricBox = symmetricBox;
         FadeFix = fadeFix;
 
-        Type type = typeof(SystemRenderShadowMap);
+        var type = typeof(SystemRenderShadowMap);
 
-        MethodInfo update = AccessTools.Method(typeof(ShadowBox), nameof(ShadowBox.update))
-                            ?? throw new InvalidOperationException("ShadowBox.update not found");
+        var update = AccessTools.Method(typeof(ShadowBox), nameof(ShadowBox.update))
+                     ?? throw new InvalidOperationException("ShadowBox.update not found");
         harmony.Patch(update, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowPatches), nameof(MakeBoxSymmetric))));
 
-        MethodInfo prepare = AccessTools.Method(type, "PrepareForShadowRendering",
-                                 [typeof(double), typeof(EnumFrameBuffer), typeof(float)])
-                             ?? throw new InvalidOperationException("PrepareForShadowRendering not found");
+        var prepare = AccessTools.Method(type, "PrepareForShadowRendering",
+                          [typeof(double), typeof(EnumFrameBuffer), typeof(float)])
+                      ?? throw new InvalidOperationException("PrepareForShadowRendering not found");
         harmony.Patch(prepare, prefix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowPatches), nameof(ScaleDistance))));
 
-        MethodInfo far = AccessTools.Method(type, "OnRenderShadowFar", [typeof(float)])
-                         ?? throw new InvalidOperationException("OnRenderShadowFar not found");
+        var far = AccessTools.Method(type, "OnRenderShadowFar", [typeof(float)])
+                  ?? throw new InvalidOperationException("OnRenderShadowFar not found");
         harmony.Patch(far, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowPatches), nameof(MatchFadeToBox))));
     }
@@ -188,15 +198,15 @@ public static class ShadowPatches
         if (!SymmetricBox || !farCascade) return;
         try
         {
-            Camera camera = CameraRef(__instance);
-            Vintagestory.API.MathTools.Vec3d origin = camera?.OriginPosition;
-            double[] lightView = __instance.lightViewMatrix;
-            double r = ShadowBox.SHADOW_DISTANCE * BoxRadiusFactor;
+            var camera = CameraRef(__instance);
+            var origin = camera?.OriginPosition;
+            var lightView = __instance.lightViewMatrix;
+            var r = ShadowBox.SHADOW_DISTANCE * BoxRadiusFactor;
             if (origin == null || lightView == null || lightView.Length < 16 || r <= 0) return;
 
             SymmetricLightSpaceBounds(lightView, origin.X, origin.Y, origin.Z, r,
-                out double minX, out double minY, out double minZ,
-                out double maxX, out double maxY, out double maxZ);
+                out var minX, out var minY, out var minZ,
+                out var maxX, out var maxY, out var maxZ);
 
             __instance.minX = minX; __instance.maxX = maxX;
             __instance.minY = minY; __instance.maxY = maxY;
@@ -238,9 +248,9 @@ public static class ShadowPatches
     {
         // Mat4d.MulWithVec4 with w = 1, column-major - the same transform vanilla uses for
         // its frustum points, applied to the sphere's centre only.
-        double cx = lightView[0] * camX + lightView[4] * camY + lightView[8] * camZ + lightView[12];
-        double cy = lightView[1] * camX + lightView[5] * camY + lightView[9] * camZ + lightView[13];
-        double cz = lightView[2] * camX + lightView[6] * camY + lightView[10] * camZ + lightView[14];
+        var cx = lightView[0] * camX + lightView[4] * camY + lightView[8] * camZ + lightView[12];
+        var cy = lightView[1] * camX + lightView[5] * camY + lightView[9] * camZ + lightView[13];
+        var cz = lightView[2] * camX + lightView[6] * camY + lightView[10] * camZ + lightView[14];
 
         minX = cx - r; maxX = cx + r;
         minY = cy - r; maxY = cy + r;
@@ -253,7 +263,7 @@ public static class ShadowPatches
         // update() runs inside the body this prefixes, so the flag is always current when the
         // box postfix reads it
         farCascade = fb == EnumFrameBuffer.ShadowmapFar;
-        if (farCascade && DistanceMultiplier != 1.0)
+        if (farCascade && Math.Abs(DistanceMultiplier - 1.0) > double.Epsilon)
             shadowDistance *= DistanceMultiplier;
     }
 
@@ -266,7 +276,7 @@ public static class ShadowPatches
     /// </summary>
     public static void MatchFadeToBox(SystemRenderShadowMap __instance, ClientMain ___game)
     {
-        double distance = ShadowBox.SHADOW_DISTANCE;
+        var distance = ShadowBox.SHADOW_DISTANCE;
         ShadowDistance = distance;
 
         // The far cascade has just rendered and the near one has not run yet, so right here -
@@ -274,8 +284,8 @@ public static class ShadowPatches
         // built it. Width and Height are the two axes the map's texels are spread over.
         try
         {
-            ShadowBox box = ShadowBoxRef(__instance);
-            double span = box == null ? 0 : Math.Max(box.Width, box.Height);
+            var box = ShadowBoxRef(__instance);
+            var span = box == null ? 0 : Math.Max(box.Width, box.Height);
             if (span > 0 && !double.IsNaN(span)) ShadowBoxSpan = span;
         }
         catch (Exception) { /* a missing span only costs a HUD row */ }
@@ -287,7 +297,7 @@ public static class ShadowPatches
 
         // the shader's distance term reaches full fade at 0.9 * range, so range = distance
         // puts the end of the fade just inside the edge of the map
-        float range = (float)distance;
+        var range = (float)distance;
         ___game.shUniforms.ShadowRangeFar = range;
         ShadowRangeUniform = range;
     }

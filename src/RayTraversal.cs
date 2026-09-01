@@ -73,16 +73,16 @@ public static class RayTraversal
         double cUp = 1.0 - oy, cDown = 0.0 - oy;
 
         int px = fromX, py = fromY, pz = fromZ;
-        int rayLen = Math.Abs(relX) + Math.Abs(relY) + Math.Abs(relZ);
-        int fromFace = -1;
+        var rayLen = Math.Abs(relX) + Math.Abs(relY) + Math.Abs(relZ);
+        var fromFace = -1;
 
         while (true)
         {
-            int dist = Math.Abs(px - fromX) + Math.Abs(py - fromY) + Math.Abs(pz - fromZ);
+            var dist = Math.Abs(px - fromX) + Math.Abs(py - fromY) + Math.Abs(pz - fromZ);
             if (dist > rayLen + 2) break;
 
             double cx = px + 0.5, cy = py + 0.5, cz = pz + 0.5;
-            int face = -1;
+            var face = -1;
             double t;
 
             // tried in ALLFACES order so that a ray leaving exactly through an edge picks the

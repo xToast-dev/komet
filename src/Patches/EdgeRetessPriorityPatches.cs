@@ -5,6 +5,11 @@ using HarmonyLib;
 using Vintagestory.API.Datastructures;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -91,8 +96,8 @@ public static class EdgeRetessPriorityPatches
 
     public static void Apply(Harmony harmony)
     {
-        MethodInfo tick = AccessTools.Method(typeof(ChunkTesselatorManager), "OnSeperateThreadGameTick")
-                          ?? throw new InvalidOperationException("OnSeperateThreadGameTick not found");
+        var tick = AccessTools.Method(typeof(ChunkTesselatorManager), "OnSeperateThreadGameTick")
+                   ?? throw new InvalidOperationException("OnSeperateThreadGameTick not found");
         harmony.Patch(tick, prefix: new HarmonyMethod(
             AccessTools.Method(typeof(EdgeRetessPriorityPatches), nameof(TickPrefix))));
     }
@@ -105,15 +110,15 @@ public static class EdgeRetessPriorityPatches
     public static void TickPrefix(ClientMain ___game)
     {
         if (!Enabled || ___game == null || !___game.ShouldTesselateTerrain) return;
-        long now = Environment.TickCount64;
+        var now = Environment.TickCount64;
         if (now < nextSweepAtMs) return;
         nextSweepAtMs = now + SweepIntervalMs;
         StatSweeps++;
 
         try
         {
-            UniqueQueue<long> dirty = ClientQueues.Dirty(___game);
-            UniqueQueue<long> prio = ClientQueues.DirtyPrio(___game);
+            var dirty = ClientQueues.Dirty(___game);
+            var prio = ClientQueues.DirtyPrio(___game);
             if (dirty == null || prio == null) return;
             // racy read of Count, like vanilla's own OnBeforeFrame stats line - a stale
             // answer delays the sweep by one interval, nothing more
@@ -149,16 +154,16 @@ public static class EdgeRetessPriorityPatches
         taken.Clear();
         lock (dirtyLock)
         {
-            int n = dirty.Count;
+            var n = dirty.Count;
             if (n == 0) return 0;
-            bool any = false;
-            foreach (long k in dirty)
+            var any = false;
+            foreach (var k in dirty)
                 if (k < 0) { any = true; break; }
             if (!any) return 0;
 
-            for (int i = 0; i < n; i++)
+            for (var i = 0; i < n; i++)
             {
-                long k = dirty.Dequeue();
+                var k = dirty.Dequeue();
                 if (k < 0 && taken.Count < cap) taken.Add(k);
                 else dirty.Enqueue(k);
             }
@@ -170,7 +175,7 @@ public static class EdgeRetessPriorityPatches
             // UniqueQueue.Enqueue dedups: a key that is already queued as urgent merges
             // instead of doubling. The consumer's own edge/full dedup (a full entry
             // subsumes the edge one) stays in charge after this point.
-            foreach (long k in taken) prio.Enqueue(k);
+            foreach (var k in taken) prio.Enqueue(k);
         }
         StatPromoted += taken.Count;
         return taken.Count;

@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "5";
+    public const string Current = "6";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -747,6 +747,33 @@ public class KometConfig
     /// exists. Report row "klon-kompakt"; '.komet toggle tightclone' flips it live.
     /// </summary>
     public bool TightCustomClones { get; set; } = true;
+
+    /// <summary>
+    /// Recycle the per-face extras and custom-part value arrays of chunk part clones through
+    /// a size-class pool instead of allocating them fresh per part. The mesh recycler keeps a
+    /// part's basic arrays alive between tesselations; these were the remaining fresh
+    /// allocations in that path (~18 MB/s "klone" while streaming), and the worst kind for
+    /// the collector - born on the tesselation thread, promoted while the part waits in the
+    /// upload queue, dead on the render thread. Rented in CloneExtraData, returned by a
+    /// postfix on TesselatedChunkPart.AddToPools after the upload disposed the mesh. Exact:
+    /// nothing in the engine reads these arrays' Length as a count. Report row "extras-pool";
+    /// '.komet toggle extrapool' flips it live.
+    /// </summary>
+    public bool PoolMeshExtras { get; set; } = true;
+
+    /// <summary>
+    /// Skip AnimatableRenderer.OnRenderFrame (animated block entities: windmills, pulverizers,
+    /// bellows, swinging doors, modded machines) when the mesh's bounding sphere lies entirely
+    /// outside the frustum of the stage being rendered - the camera frustum in Opaque/OIT, the
+    /// light box in the two shadow stages. Vanilla runs every active instance in four stages
+    /// with a shader switch, a chunk light lookup, ~15 uniforms, a UBO update and a draw, with
+    /// no distance or visibility test at all (its RenderRange is never read by the engine).
+    /// Exact by construction: only geometry that could not produce a fragment is skipped, and
+    /// an idle instance already returns before its first GL call, so no successor renderer
+    /// can depend on this one's GL state. HUD/report row "animatable-gate";
+    /// '.komet toggle animcull' flips it live; safemode switches it off.
+    /// </summary>
+    public bool CullAnimatableRenderers { get; set; } = true;
 
     /// <summary>
     /// A frame is booked as a hitch (HUD row "ruckler", '.komet hitch', one log line) when it

@@ -1,0 +1,12 @@
+# Harmony binds patch-method parameters BY NAME: __instance, __result, __state, ___field and the
+# engine's own parameter spellings (e.g. OnRetesselated, Indices). An IDE "fix naming" cleanup
+# (ReSharper/Rider code cleanup, Roslyn IDE1006) renames them to instance/result/... - the patch
+# then throws at Patch() time and the feature silently runs vanilla. That happened on 01.09.2026
+# to five patch files at once. Naming inspections are therefore OFF for this repository.
+root = true
+
+[*.cs]
+resharper_inconsistent_naming_highlighting = none
+resharper_csharp_naming_rule_violation_highlighting = none
+dotnet_diagnostic.IDE1006.severity = none
+dotnet_naming_rule.parameters_should_be_camel_case.severity = none
