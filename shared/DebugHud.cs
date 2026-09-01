@@ -27,7 +27,7 @@ public class DebugHud : IRenderer
 
     private const int LabelWidth = 13;
     private const int ValueWidth = 9;
-    private static readonly string Rule = new('─', 42);
+    private static readonly string Rule = new('─', 48);
 
     /// <summary>ClientMain.chunkRenderer and ClientWorldMap.chunks are internal.</summary>
     private static readonly AccessTools.FieldRef<ClientMain, ChunkRenderer> ChunkRendererRef =
@@ -209,6 +209,24 @@ public class DebugHud : IRenderer
 
     private void Rebuild()
     {
+        // Metrics first: Compose() reads BarAscii, so the glyph probe has to have run before
+        // the first text is built - or the first raster draws bars the box was not sized for.
+        if (metricsScale != RuntimeEnv.GUIScale)
+        {
+            charAdvance = font.GetTextExtents("0000000000").Width / 10.0;
+            ruleWidth = font.GetTextExtents(Rule).Width;
+            // The share bars assume the block glyphs advance exactly one monospace cell.
+            // A font that substitutes them from a differently-sized fallback would make
+            // bar-carrying lines wider than the computed raster - probed once, and the bars
+            // degrade to '#' rather than overflowing the box.
+            double barAdvance = font.GetTextExtents("████").Width / 4.0;
+            BarAscii = charAdvance <= 0 || Math.Abs(barAdvance - charAdvance) > charAdvance * 0.05;
+            FontExtents fe = font.GetFontExtents();
+            ascent = fe.Ascent;
+            lineHeight = (int)fe.Height;
+            metricsScale = RuntimeEnv.GUIScale;
+        }
+
         string text = Compose();
         if (text == lastText && texture.TextureId != 0) return;
         lastText = text;
@@ -224,16 +242,6 @@ public class DebugHud : IRenderer
         {
             lines[i] = lines[i].TrimEnd();
             longest = Math.Max(longest, lines[i].Length);
-        }
-
-        if (metricsScale != RuntimeEnv.GUIScale)
-        {
-            charAdvance = font.GetTextExtents("0000000000").Width / 10.0;
-            ruleWidth = font.GetTextExtents(Rule).Width;
-            FontExtents fe = font.GetFontExtents();
-            ascent = fe.Ascent;
-            lineHeight = (int)fe.Height;
-            metricsScale = RuntimeEnv.GUIScale;
         }
 
         int width = (int)Math.Max(longest * charAdvance, ruleWidth) + 1 + 2 * background.HorPadding;
@@ -310,6 +318,46 @@ public class DebugHud : IRenderer
 
     public static string Ms(double ms) => ms.ToString("F2", CultureInfo.CurrentCulture).PadLeft(6) + " ms";
     public static string N(double v) => v.ToString("N0", CultureInfo.CurrentCulture);
+
+    /// <summary>Millions with one decimal - triangle counts would otherwise be the widest
+    /// number on screen and stretch the whole box for digits nobody reads.</summary>
+    public static string Mio(double v) => (v / 1_000_000.0).ToString("F1", CultureInfo.CurrentCulture);
+
+    // ---- the share bar next to each frame bucket ----
+    //
+    // Ten cells represent the whole frame, so the frame-aufteilung block reads as a picture:
+    // the eye compares bar lengths directly instead of parsing a column of percentages.
+    // Partial cells use the Unicode block-element eighths; if the font's fallback for those
+    // glyphs does not match the monospace cell width (probed once, next to the rule glyph),
+    // the bar degrades to '#', which every monospace font gets right.
+
+    private const int BarCells = 10;
+    private static readonly char[] BarEighths = { ' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉' };
+
+    /// <summary>Set by the metrics probe when the block glyphs would break the raster.</summary>
+    internal static bool BarAscii;
+
+    /// <summary>Pure, so verify can pin the geometry: length in cells tracks ms/frame,
+    /// clamped to one frame, and anything visible gets at least a sliver.</summary>
+    internal static string Bar(double ms, double frameMs)
+    {
+        if (frameMs <= 0 || ms < 0.05) return "";
+        double frac = Math.Min(1.0, ms / frameMs);
+        int eighths = Math.Max(1, (int)Math.Round(frac * BarCells * 8));
+        int full = eighths / 8, rem = eighths % 8;
+        if (BarAscii) return new string('#', Math.Max(1, full + (rem >= 4 ? 1 : 0)));
+        return rem > 0 ? new string('█', full) + BarEighths[rem] : new string('█', full);
+    }
+
+    /// <summary>One frame bucket: percent, milliseconds, bar, optional note after the bar.</summary>
+    private static void BucketRow(StringBuilder sb, string label, double ms, double frame, string note = null)
+    {
+        string bar = Bar(ms, frame);
+        string tail = note == null
+            ? (bar.Length > 0 ? bar : null)
+            : bar.PadRight(BarCells + 1) + note;
+        Row(sb, label, Pct(ms, frame), Ms(ms), tail);
+    }
 
     /// <summary>One aligned row: label, an optional value column, an optional millisecond column.</summary>
     public static void Row(StringBuilder sb, string label, string value = null, string ms = null, string tail = null)
@@ -402,15 +450,13 @@ public class DebugHud : IRenderer
 
         double frame = FrameStats.AvgFrameMs;
         double fps = frame > 0 ? 1000.0 / frame : 0;
+        CultureInfo ci = CultureInfo.CurrentCulture;
 
         sb.Append(title).Append("   gleitender Mittelwert\n");
         sb.Append(Rule).Append('\n');
-        Row(sb, "fps", fps.ToString("F0", CultureInfo.CurrentCulture), Ms(frame));
-        Row(sb, "schlechtester", null, Ms(FrameStats.MaxFrameMs));
-        // where the worst frame actually went - a hitch's cause is invisible in the smoothed
-        // averages precisely because it is rare
-        string worst = WorstFrameTail();
-        if (worst != null) Row(sb, "  davon", null, null, worst);
+
+        // ---- how it runs, at a glance ----
+        Row(sb, "fps", fps.ToString("F0", ci), Ms(frame));
         if (GpuFrameTimer.GpuMs > 0)
         {
             // The one comparison that settles CPU-bound vs GPU-bound: gpu >= cpu frame time
@@ -418,65 +464,81 @@ public class DebugHud : IRenderer
             double gpu = GpuFrameTimer.GpuMs;
             Row(sb, "gpu-frame", Pct(gpu, frame), Ms(gpu), gpu >= frame * 0.95 ? "GPU-LIMITIERT" : null);
         }
-        Row(sb, "game tick", Pct(FrameStats.GameTickMs, frame), Ms(FrameStats.GameTickMs));
+        Row(sb, "schlechtester", null, Ms(FrameStats.MaxFrameMs));
+        // where the worst frame actually went - a hitch's cause is invisible in the smoothed
+        // averages precisely because it is rare
+        string worst = WorstFrameTail();
+        if (worst != null) Row(sb, "  davon", null, null, worst);
+        // Every frame over the hitch threshold, attributed and split by camera movement -
+        // the row that turns "es ruckelt beim drehen" into a countable statement.
+        if (HitchLog.TotalHitches > 0)
+        {
+            Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
+                HitchLog.PerMinute.ToString("F1", ci) + "/min, " + HitchLog.CommandHint);
+            string lastHitch = HitchLog.LastTail();
+            if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
+        }
+
+        // ---- where the frame goes ----
+        // Every bucket of the frame, in the hitch log's order and vocabulary, each with its
+        // share of the frame drawn as a bar (ten cells = the whole frame). Including the game
+        // tick and the outside-the-stages remainder, the block accounts for 100 % - the eye
+        // compares bars instead of parsing a percent column.
+        Section(sb, "frame-aufteilung");
+        BucketRow(sb, "before", FrameStats.StageMs[(int)EnumRenderStage.Before], frame);
+        // each cascade including its Done half, so nothing hides between the rows
+        BucketRow(sb, "schatten fern", FrameStats.StageMs[(int)EnumRenderStage.ShadowFar]
+                                     + FrameStats.StageMs[(int)EnumRenderStage.ShadowFarDone], frame);
+        BucketRow(sb, "schatten nah", FrameStats.StageMs[(int)EnumRenderStage.ShadowNear]
+                                    + FrameStats.StageMs[(int)EnumRenderStage.ShadowNearDone], frame);
+        BucketRow(sb, "opaque", FrameStats.StageMs[(int)EnumRenderStage.Opaque], frame);
+        BucketRow(sb, "oit", FrameStats.StageMs[(int)EnumRenderStage.OIT], frame);
+        // AfterOIT through AfterBlit - SSAO, god rays, colour grading; a fifth of the frame
+        // used to be invisible here
+        BucketRow(sb, "post/compose", FrameStats.PostComposeMs, frame);
+        BucketRow(sb, "ortho (gui)", FrameStats.StageMs[(int)EnumRenderStage.Ortho], frame);
+        BucketRow(sb, "done", FrameStats.StageMs[(int)EnumRenderStage.Done], frame);
+        BucketRow(sb, "game tick", FrameStats.GameTickMs, frame);
+        // Whatever no stage and no tick accounts for: buffer swap, frame limiter, driver
+        // back-pressure. Naming it stops it from being mistaken for measurement error.
+        BucketRow(sb, "ausserhalb", FrameStats.OutsideStagesMs, frame,
+            FrameStats.AvgSwapMs > 0.005
+                ? "davon swap " + FrameStats.AvgSwapMs.ToString("F2", ci)
+                : "swap/treiber");
+
+        // ---- gc ----
         // GC pauses stop every thread at once - the only mechanism that slows the render
         // thread, the tesselation thread and the occlusion worker by the same factor at the
-        // same time. When this row is large, no renderer is guilty; the allocations are.
+        // same time. When this section is large, no renderer is guilty; the allocations are.
+        Section(sb, "gc");
         if (FrameStats.GcPauseMsPerSecond > 0.05)
-            Row(sb, "gc-pausen", FrameStats.Gen0PerSecond.ToString("F0", CultureInfo.CurrentCulture) + "/s",
+            Row(sb, "gc-pausen", FrameStats.Gen0PerSecond.ToString("F0", ci) + "/s",
                 Ms(FrameStats.GcPauseMsPerSecond),
-                FrameStats.AllocMbPerSecond.ToString("F0", CultureInfo.CurrentCulture) + " MB/s alloc"
+                "je s · " + FrameStats.AllocMbPerSecond.ToString("F0", ci) + " MB/s alloc"
                 + (FrameStats.Gen2PerSecond > 0.05
-                    ? ", gen2 " + FrameStats.Gen2PerSecond.ToString("F1", CultureInfo.CurrentCulture) + "/s"
+                    ? " · gen2 " + FrameStats.Gen2PerSecond.ToString("F1", ci) + "/s"
                     : ""));
-
         // Where those bytes come from, thread by thread, so "the allocations are guilty"
         // has a next question to ask. Whatever no one measures stays visible as "rest"
         // instead of disappearing into the total - the share this row was built to expose
         // was exactly the unmeasured one.
         if (FrameStats.AllocMbPerSecond >= 32)
         {
-            CultureInfo ci = CultureInfo.CurrentCulture;
             double tessAlloc = TesselationStats.AllocMbPerSecond;
             double unattributed = Math.Max(0.0,
                 FrameStats.AllocMbPerSecond - FrameStats.MainAllocMbPerSecond
                 - FrameStats.NetAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond - tessAlloc);
-            Row(sb, "alloc-quellen",
-                FrameStats.NetAllocMbPerSecond.ToString("F0", ci) + " netz",
-                null,
-                "main " + FrameStats.MainAllocMbPerSecond.ToString("F0", ci)
-                + ", prefetch " + FrameStats.PrefetchAllocMbPerSecond.ToString("F0", ci)
-                + ", tess " + tessAlloc.ToString("F0", ci)
-                + ", rest " + unattributed.ToString("F0", ci) + " MB/s");
+            Row(sb, "alloc-quellen", "MB/s", null,
+                "netz " + FrameStats.NetAllocMbPerSecond.ToString("F0", ci)
+                + " · main " + FrameStats.MainAllocMbPerSecond.ToString("F0", ci)
+                // prefetch is usually zero; it stays measured, but only earns screen width
+                // when it has something to say
+                + (FrameStats.PrefetchAllocMbPerSecond >= 0.5
+                    ? " · prefetch " + FrameStats.PrefetchAllocMbPerSecond.ToString("F0", ci)
+                    : "")
+                + " · tess " + tessAlloc.ToString("F0", ci)
+                + " · rest " + unattributed.ToString("F0", ci));
         }
-
-        // Cores the whole process keeps busy. Low at idle is HEALTH, not waste - a frame is
-        // a latency problem and the serial main thread caps it (Amdahl); this row is for
-        // judging the streaming pipeline, where the workers should actually show up.
-        if (FrameStats.CpuCoresBusy > 0.05)
-            Row(sb, "cpu-kerne",
-                (100.0 * FrameStats.CpuCoresBusy / Environment.ProcessorCount).ToString("F0", CultureInfo.CurrentCulture) + " %",
-                null,
-                FrameStats.CpuCoresBusy.ToString("F1", CultureInfo.CurrentCulture) + " von "
-                    + Environment.ProcessorCount + " kernen beschaeftigt");
-
-        // Every frame over the hitch threshold, attributed and split by camera movement -
-        // the row that turns "es ruckelt beim drehen" into a countable statement.
-        if (HitchLog.TotalHitches > 0)
-        {
-            Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
-                HitchLog.PerMinute.ToString("F1", CultureInfo.CurrentCulture) + "/min, " + HitchLog.CommandHint);
-            string lastHitch = HitchLog.LastTail();
-            if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
-        }
-
-        // The overlay's own price, so it can never again masquerade as an engine problem:
-        // a Windows tester's ~40 ms Cairo rebuild at fixed 4 Hz WAS the ortho stutter.
-        if (AvgRebuildMs >= 0.05)
-            Row(sb, "hud-aufbau", null, Ms(AvgRebuildMs),
-                "alle " + rebuildInterval.ToString("0.##", CultureInfo.CurrentCulture)
-                + " s, davon upload " + AvgUploadMs.ToString("F1", CultureInfo.CurrentCulture) + " ms");
-
         // The mode, stated without a verdict attached.
         //
         // This row used to nag whenever it saw workstation GC, on the strength of server GC
@@ -489,73 +551,55 @@ public class DebugHud : IRenderer
         // both of them assuming.
         Row(sb, "gc-modus", System.Runtime.GCSettings.IsServerGC ? "server" : "workst.", null,
             HitchLog.WorstEphemeralPauseMs >= 1.0
-                ? "laengste gen0/gen1-pause " + HitchLog.WorstEphemeralPauseMs.ToString("F0", CultureInfo.CurrentCulture) + " ms"
+                ? "längste gen0/1-pause " + HitchLog.WorstEphemeralPauseMs.ToString("F0", ci) + " ms"
                 : null);
 
-        Section(sb, "render stages");
-        Stage(sb, "before", EnumRenderStage.Before, frame);
-        Stage(sb, "shadow far", EnumRenderStage.ShadowFar, frame);
-        Stage(sb, "shadow near", EnumRenderStage.ShadowNear, frame);
-        Stage(sb, "opaque", EnumRenderStage.Opaque, frame);
-        Stage(sb, "oit", EnumRenderStage.OIT, frame);
-
-        // AfterOIT, AfterPostProcessing, AfterFinalComposition and AfterBlit were measured all
-        // along but never shown, which left roughly a fifth of the frame invisible - exactly
-        // where SSAO, god rays and colour grading live.
-        double post = FrameStats.PostComposeMs;
-        Row(sb, "post/compose", Pct(post, frame), Ms(post));
-        Stage(sb, "ortho (gui)", EnumRenderStage.Ortho, frame);
-        Stage(sb, "done", EnumRenderStage.Done, frame);
-
-        double shadows = FrameStats.ShadowMs;
-        Row(sb, "= schatten", Pct(shadows, frame), Ms(shadows));
-
-        // Whatever the stages do not account for: the game tick, and the part of the frame
-        // that happens outside any render stage at all (buffer swap, frame limiter, driver
-        // back-pressure). Naming it stops it from being mistaken for measurement error.
-        double rest = FrameStats.OutsideStagesMs;
-        Row(sb, "= ausserhalb", Pct(rest, frame), Ms(rest),
-            FrameStats.AvgSwapMs > 0.005
-                ? "davon swap " + FrameStats.AvgSwapMs.ToString("F2", CultureInfo.CurrentCulture)
-                : "swap/treiber");
-
-        Section(sb, "welt");
-        Row(sb, "draw calls", N(drawCallsPerFrame));
+        // ---- the world and the loading pipeline ----
+        Section(sb, "welt & laden");
         // Not RuntimeStats.renderedTriangles: SystemRenderTerrain only fills those while the
-        // engine's own debug screen is open, which is why this row used to read "0 von 0".
-        Row(sb, "dreiecke", N(renderedTris), null, "von " + N(allocatedTris));
+        // engine's own debug screen is open, which is why the triangle figure once read "0 von 0".
+        Row(sb, "draw calls", N(drawCallsPerFrame), null,
+            "dreiecke " + Mio(renderedTris) + " von " + Mio(allocatedTris) + " mio");
         Row(sb, "entities", N(RuntimeStats.renderedEntities));
         Row(sb, "chunks", N(loadedChunks), null,
-            "warteschl. " + RuntimeStats.chunksAwaitingTesselation + "/" + RuntimeStats.chunksAwaitingPooling);
+            "warteschlange " + N(RuntimeStats.chunksAwaitingTesselation)
+            + "/" + N(RuntimeStats.chunksAwaitingPooling));
         if (TesselationStats.TotalChunks > 0)
         {
-            Row(sb, "tesselation",
-                TesselationStats.ChunksPerSecond.ToString("F0", CultureInfo.CurrentCulture) + "/s",
+            Row(sb, "tesselation", TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s",
                 Ms(TesselationStats.MsPerChunk),
-                "je chunk, " + TesselationStats.NeighbourMsPerChunk.ToString("F1", CultureInfo.CurrentCulture) + " nachbarn, "
-                    + TesselationStats.AllocMbPerSecond.ToString("F0", CultureInfo.CurrentCulture) + " MB/s");
+                "je chunk · " + TesselationStats.NeighbourMsPerChunk.ToString("F1", ci) + " nachbarn · "
+                    + TesselationStats.AllocMbPerSecond.ToString("F0", ci) + " MB/s");
             // arrival rate from the server - a low number here with an empty queue means the
             // wait is server-side (worldgen/sending), not this client
-            Row(sb, "empfangen",
-                TesselationStats.ReceivedPerSecond.ToString("F0", CultureInfo.CurrentCulture) + "/s", null,
+            Row(sb, "empfangen", TesselationStats.ReceivedPerSecond.ToString("F0", ci) + "/s", null,
                 "vom server");
         }
         if (vramBytes > 0)
             Row(sb, "terrain vram", N(vramBytes / 1048576.0) + " MB", null,
-                poolCount + " pools, " + (fragmentation * 100f).ToString("F0", CultureInfo.CurrentCulture) + "% frag");
+                poolCount + " pools, " + (fragmentation * 100f).ToString("F0", ci) + "% frag");
         Row(sb, "chunk upload", null, Ms(FrameStats.AvgUploadMs),
-            "max " + FrameStats.MaxUploadMs.ToString("F1", CultureInfo.CurrentCulture));
-        Row(sb, "sichtweite", N(viewDistance), null, "blocks");
+            "max " + FrameStats.MaxUploadMs.ToString("F1", ci));
+        // Cores the whole process keeps busy. Low at idle is HEALTH, not waste - a frame is
+        // a latency problem and the serial main thread caps it (Amdahl); this row is for
+        // judging the streaming pipeline, where the workers should actually show up.
+        if (FrameStats.CpuCoresBusy > 0.05)
+            Row(sb, "cpu-kerne",
+                (100.0 * FrameStats.CpuCoresBusy / Environment.ProcessorCount).ToString("F0", ci) + " %",
+                null,
+                FrameStats.CpuCoresBusy.ToString("F1", ci) + " von "
+                    + Environment.ProcessorCount + " kernen beschäftigt");
+        Row(sb, "sichtweite", N(viewDistance), null, "blöcke");
+        // The overlay's own price, so it can never again masquerade as an engine problem:
+        // a Windows tester's ~40 ms Cairo rebuild at fixed 4 Hz WAS the ortho stutter.
+        if (AvgRebuildMs >= 0.05)
+            Row(sb, "hud-aufbau", null, Ms(AvgRebuildMs),
+                "alle " + rebuildInterval.ToString("0.##", ci)
+                + " s · davon upload " + AvgUploadMs.ToString("F1", ci) + " ms");
 
         extra?.Invoke(sb, frame);
 
         return sb.ToString().TrimEnd('\n');
-    }
-
-    private static void Stage(StringBuilder sb, string label, EnumRenderStage stage, double frame)
-    {
-        double ms = FrameStats.StageMs[(int)stage];
-        Row(sb, label, Pct(ms, frame), Ms(ms));
     }
 
     public void Dispose()

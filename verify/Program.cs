@@ -805,6 +805,22 @@ internal static class Program
             // every line must be non-empty - blank lines were the original complaint
             foreach (string line in lines)
                 if (line.Trim().Length == 0) throw new Exception("blank line in HUD text");
+
+            // The share bars are pure geometry the raster relies on: ten cells represent the
+            // whole frame, nothing may exceed them, and anything visible gets a sliver.
+            if (DebugHud.Bar(5, 10) != "█████") throw new Exception($"half a frame must be five cells, got '{DebugHud.Bar(5, 10)}'");
+            if (DebugHud.Bar(0, 10) != "") throw new Exception("an empty bucket drew a bar");
+            if (DebugHud.Bar(25, 10).Length > 10) throw new Exception("a bucket longer than the frame must clamp at ten cells");
+            if (DebugHud.Bar(0.06, 10).Length != 1) throw new Exception("a visible bucket lost its sliver");
+            if (DebugHud.Bar(3, 10).Length < DebugHud.Bar(2, 10).Length) throw new Exception("bars not monotonic");
+            bool savedAscii = DebugHud.BarAscii;
+            try
+            {
+                // the fallback for fonts whose block glyphs are not one monospace cell wide
+                DebugHud.BarAscii = true;
+                if (DebugHud.Bar(5, 10) != "#####") throw new Exception("ascii fallback broken");
+            }
+            finally { DebugHud.BarAscii = savedAscii; }
             FrameStats.Reset();
         });
 

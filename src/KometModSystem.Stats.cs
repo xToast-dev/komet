@@ -25,7 +25,7 @@ public partial class KometModSystem
         CultureInfo ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(6144);
 
-        sb.Append("==================== komet report ").Append(KometVersion.Display(Mod.Info.Version))
+        sb.Append("==================== Komet report ").Append(KometVersion.Display(Mod.Info.Version))
           .Append(" ====================\n");
 
         // ---- environment ----
@@ -129,28 +129,52 @@ public partial class KometModSystem
         if (StressTest.StatusLine != null) DebugHud.Row(sb, "!! STRESSTEST", null, null, StressTest.StatusLine);
         string diag = ActiveDiagnostics();
         if (diag != null) DebugHud.Row(sb, "!! DIAGNOSE", null, null, diag);
+
+        // -- the sweep --
         DebugHud.Row(sb, "sichtbarkeit", DebugHud.Pct(FrameStats.AvgCullMs, frameMs), DebugHud.Ms(FrameStats.AvgCullMs),
-            CullKernel());
+            CullKernelShort());
         DebugHud.Row(sb, "teile getest.", DebugHud.N(partsPerFrame?.PerFrame ?? 0), null,
             DebugHud.N(cellsSkippedPerFrame?.PerFrame ?? 0) + " zellen weg");
         DebugHud.Row(sb, "davon rebuild", DebugHud.N(rebuildsPerFrame?.PerFrame ?? 0), DebugHud.Ms(RebuildMsPerFrame()),
             FastCuller.StatIncInserts > 0 ? DebugHud.N(FastCuller.StatIncInserts) + " inkrementell" : null);
+        // raw running totals: if these stay at zero the patch is not firing at all, which is a
+        // different problem from the smoothed per-frame figures reading zero
+        DebugHud.Row(sb, "sweeps/frame", DebugHud.N(sweepsPerFrame?.PerFrame ?? 0), null,
+            DebugHud.N(batchesPerFrame?.PerFrame ?? 0) + " parallel-batches");
         if (CullVerifier.SampleEvery > 0 || CullVerifier.StatMismatches > 0)
             DebugHud.Row(sb, "sweep-check", DebugHud.N(CullVerifier.StatChecked), null,
                 CullVerifier.StatMismatches > 0
                     ? "!! " + DebugHud.N(CullVerifier.StatMismatches) + " ABWEICHUNGEN (log)"
                     : "alle gleich vanilla");
-        if (InflowBrake.Enabled)
-            DebugHud.Row(sb, "zufluss", InflowBrake.CurrentPercent + " %", null,
-                InflowBrake.CurrentPercent < 100
-                    ? InflowBrake.CurrentColumns + " spalten / " + InflowBrake.CurrentTickMs + " ms"
-                    : "voll");
         double raw = rawRangesPerFrame?.PerFrame ?? 0;
         double emitted = rangesPerFrame?.PerFrame ?? 0;
         DebugHud.Row(sb, "draw ranges", DebugHud.N(emitted), null,
             "von " + DebugHud.N(raw) + " (" + (emitted > 0 ? raw / emitted : 1).ToString("F1", CultureInfo.CurrentCulture) + "x)");
         DebugHud.Row(sb, "occlusion", null, DebugHud.Ms(FastChunkCuller.StatLastMs), "worker-thread");
-        DebugHud.Row(sb, "upload gain", UploadBudget.Gain.ToString("P0", CultureInfo.CurrentCulture));
+
+        // -- shadows --
+        long shadowFrames = Patches.ShadowThrottlePatches.FarRendered + Patches.ShadowThrottlePatches.FarSkipped;
+        if (shadowFrames > 0)
+            // "schatten-takt", not "schatten fern": the frame-aufteilung block above already
+            // has a row named schatten fern that means milliseconds - one name, one meaning
+            DebugHud.Row(sb, "schatten-takt",
+                "1/" + Patches.ShadowThrottlePatches.FarInterval + "-1/" + Patches.ShadowThrottlePatches.FarMaxSkip, null,
+                (100.0 * Patches.ShadowThrottlePatches.FarSkipped / shadowFrames).ToString("F0", CultureInfo.CurrentCulture)
+                + " % ferne kaskaden gespart");
+        if (Patches.ShadowPatches.ShadowDistance > 0)
+        {
+            DebugHud.Row(sb, "schatten bis", DebugHud.N(Patches.ShadowPatches.ShadowDistance), null,
+                "blöcke · box " + (Patches.ShadowPatches.SymmetricBox ? "kugel" : "vanilla")
+                + " · fade " + (Patches.ShadowPatches.FadeFix ? "fix" : "vanilla"));
+            // texels per block is the number that decides whether thin geometry (foliage!)
+            // still casts a shadow - map edge over the box's world size
+            DebugHud.Row(sb, "schattenmap", Patches.ShadowResPatches.EffectiveMapSize + "px", null,
+                ShadowTexelsPerBlock().ToString("F1", CultureInfo.CurrentCulture) + " texel je block");
+        }
+
+        // -- uploads and the loading pipeline --
+        DebugHud.Row(sb, "upload gain", UploadBudget.Gain.ToString("P0", CultureInfo.CurrentCulture), null,
+            "vom vanilla-budget");
         // Shown while the budget is armed even at 0 activity: "0 chunks" is correct idleness,
         // a missing row would be indistinguishable from a prefix that never ran (the edge-prio
         // lesson - idle and broken must not look the same).
@@ -158,64 +182,14 @@ public partial class KometModSystem
             DebugHud.Row(sb, "prio-upload", DebugHud.N(Patches.PrioUploadPatches.StatUploadedChunks), null,
                 "chunks, " + DebugHud.N(Patches.PrioUploadPatches.StatDeferrals) + "x verteilt"
                 + (Patches.PrioUploadPatches.Enabled ? "" : " (AUS)"));
-        // raw running totals: if these stay at zero the patch is not firing at all, which is a
-        // different problem from the smoothed per-frame figures reading zero
-        DebugHud.Row(sb, "sweeps/frame", DebugHud.N(sweepsPerFrame?.PerFrame ?? 0), null,
-            DebugHud.N(batchesPerFrame?.PerFrame ?? 0) + " parallel-batches");
-        long shadowFrames = Patches.ShadowThrottlePatches.FarRendered + Patches.ShadowThrottlePatches.FarSkipped;
-        if (shadowFrames > 0)
-            DebugHud.Row(sb, "schatten fern",
-                "1/" + Patches.ShadowThrottlePatches.FarInterval + "-1/" + Patches.ShadowThrottlePatches.FarMaxSkip, null,
-                (100.0 * Patches.ShadowThrottlePatches.FarSkipped / shadowFrames).ToString("F0", CultureInfo.CurrentCulture)
-                + " % frames gespart");
-        if (Patches.ShadowPatches.ShadowDistance > 0)
-        {
-            DebugHud.Row(sb, "schatten bis", DebugHud.N(Patches.ShadowPatches.ShadowDistance), null,
-                "blocks, box " + (Patches.ShadowPatches.SymmetricBox ? "kugel" : "vanilla")
-                + ", fade " + (Patches.ShadowPatches.FadeFix ? "fix" : "vanilla"));
-            // texels per block is the number that decides whether thin geometry (foliage!)
-            // still casts a shadow - map edge over the box's world size
-            DebugHud.Row(sb, "schattenmap", Patches.ShadowResPatches.EffectiveMapSize + "px", null,
-                ShadowTexelsPerBlock().ToString("F1", CultureInfo.CurrentCulture) + " texel je block");
-        }
-        if (PoolReclaimer.StatPoolsReclaimed > 0)
-            DebugHud.Row(sb, "vram frei", DebugHud.N(PoolReclaimer.StatBytesReclaimed / 1048576.0) + " MB", null,
-                DebugHud.N(PoolReclaimer.StatPoolsReclaimed) + " pools zurueckgegeben");
+        if (InflowBrake.Enabled)
+            DebugHud.Row(sb, "zufluss", InflowBrake.CurrentPercent + " %", null,
+                InflowBrake.CurrentPercent < 100
+                    ? InflowBrake.CurrentColumns + " spalten / " + InflowBrake.CurrentTickMs + " ms"
+                    : "voll");
         if (Patches.TesselationPatches.StatPrefetchedUnpacks > 0)
             DebugHud.Row(sb, "prefetch", DebugHud.N(Patches.TesselationPatches.StatPrefetchedUnpacks), null,
                 "chunks vorentpackt");
-        if (Patches.FirepitPatches.StatSkipped > 0 || Patches.FirepitPatches.StatFastPath > 0
-            || Patches.FirepitPatches.StatNearVanilla > 0)
-            DebugHud.Row(sb, "firepit-gate", DebugHud.N(Patches.FirepitPatches.StatSkipped), null,
-                "weg, " + DebugHud.N(Patches.FirepitPatches.StatFastPath) + " cache, "
-                + DebugHud.N(Patches.FirepitPatches.StatNearVanilla) + " vanilla"
-                + (Patches.FirepitPatches.FastPathBroken ? " !! CACHE DEFEKT (log)" : ""));
-        if (Patches.RetessSourcePatches.MarksPerSecond > 0.5)
-            DebugHud.Row(sb, "dirty-marks",
-                Patches.RetessSourcePatches.MarksPerSecond.ToString("F0", CultureInfo.CurrentCulture) + "/s",
-                null,
-                Patches.RetessSourcePatches.EdgeMarksPerSecond.ToString("F0", CultureInfo.CurrentCulture)
-                + "/s rand, '.komet retess'");
-        if (Patches.EdgeCoalescePatches.StatAbsorbed + Patches.EdgeCoalescePatches.StatFlushed > 0)
-            DebugHud.Row(sb, "edge-koalesz", DebugHud.N(Patches.EdgeCoalescePatches.StatAbsorbed), null,
-                "gespart, " + DebugHud.N(Patches.EdgeCoalescePatches.StatFlushed) + " ausgegeben, "
-                + DebugHud.N(Patches.EdgeCoalescePatches.PendingCount) + " offen"
-                + (Patches.EdgeCoalescePatches.Enabled ? "" : " (AUS)"));
-        // Always shown while the feature is on: "0 vorgezogen ueber N sweeps" is the line
-        // that separates "correctly idle" from "prefix never ran" - the first field report
-        // could not tell the two apart, which is this project's oldest trap.
-        if (Patches.EdgeRetessPriorityPatches.Enabled || Patches.EdgeRetessPriorityPatches.StatPromoted > 0)
-            DebugHud.Row(sb, "edge-prio", DebugHud.N(Patches.EdgeRetessPriorityPatches.StatPromoted), null,
-                "rand-reparaturen vorgezogen, " + DebugHud.N(Patches.EdgeRetessPriorityPatches.StatSweeps)
-                + " sweeps"
-                + (Patches.EdgeRetessPriorityPatches.StatBusySkips > 0
-                    ? ", " + DebugHud.N(Patches.EdgeRetessPriorityPatches.StatBusySkips) + "x prio-voll"
-                    : "")
-                + (Patches.EdgeRetessPriorityPatches.Enabled ? "" : " (AUS)"));
-        if (Patches.EntityTessPatches.StatAllowed + Patches.EntityTessPatches.StatDeferred > 0)
-            DebugHud.Row(sb, "entity-tess", DebugHud.N(Patches.EntityTessPatches.StatAllowed), null,
-                DebugHud.N(Patches.EntityTessPatches.StatDeferred) + " verschoben"
-                + (Patches.EntityTessPatches.Enabled ? "" : " (AUS)"));
         long pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
         if (pipeTotal > 0)
         {
@@ -227,6 +201,43 @@ public partial class KometModSystem
                 (100.0 * WindowPrebuilder.StatHits / pipeTotal).ToString("F0", CultureInfo.CurrentCulture) + " %",
                 null, tail);
         }
+        // Always shown while the feature is on: "0 vorgezogen über N sweeps" is the line
+        // that separates "correctly idle" from "prefix never ran" - the first field report
+        // could not tell the two apart, which is this project's oldest trap.
+        if (Patches.EdgeRetessPriorityPatches.Enabled || Patches.EdgeRetessPriorityPatches.StatPromoted > 0)
+            DebugHud.Row(sb, "edge-prio", DebugHud.N(Patches.EdgeRetessPriorityPatches.StatPromoted), null,
+                "rand-reparaturen vorgezogen, " + DebugHud.N(Patches.EdgeRetessPriorityPatches.StatSweeps)
+                + " sweeps"
+                + (Patches.EdgeRetessPriorityPatches.StatBusySkips > 0
+                    ? ", " + DebugHud.N(Patches.EdgeRetessPriorityPatches.StatBusySkips) + "x prio-voll"
+                    : "")
+                + (Patches.EdgeRetessPriorityPatches.Enabled ? "" : " (AUS)"));
+        if (Patches.EdgeCoalescePatches.StatAbsorbed + Patches.EdgeCoalescePatches.StatFlushed > 0)
+            DebugHud.Row(sb, "edge-koalesz", DebugHud.N(Patches.EdgeCoalescePatches.StatAbsorbed), null,
+                "gespart, " + DebugHud.N(Patches.EdgeCoalescePatches.StatFlushed) + " ausgegeben, "
+                + DebugHud.N(Patches.EdgeCoalescePatches.PendingCount) + " offen"
+                + (Patches.EdgeCoalescePatches.Enabled ? "" : " (AUS)"));
+        if (Patches.RetessSourcePatches.MarksPerSecond > 0.5)
+            DebugHud.Row(sb, "dirty-marks",
+                Patches.RetessSourcePatches.MarksPerSecond.ToString("F0", CultureInfo.CurrentCulture) + "/s",
+                null,
+                Patches.RetessSourcePatches.EdgeMarksPerSecond.ToString("F0", CultureInfo.CurrentCulture)
+                + "/s rand, '.komet retess'");
+
+        // -- the rest --
+        if (Patches.EntityTessPatches.StatAllowed + Patches.EntityTessPatches.StatDeferred > 0)
+            DebugHud.Row(sb, "entity-tess", DebugHud.N(Patches.EntityTessPatches.StatAllowed), null,
+                DebugHud.N(Patches.EntityTessPatches.StatDeferred) + " verschoben"
+                + (Patches.EntityTessPatches.Enabled ? "" : " (AUS)"));
+        if (Patches.FirepitPatches.StatSkipped > 0 || Patches.FirepitPatches.StatFastPath > 0
+            || Patches.FirepitPatches.StatNearVanilla > 0)
+            DebugHud.Row(sb, "firepit-gate", DebugHud.N(Patches.FirepitPatches.StatSkipped), null,
+                "weg, " + DebugHud.N(Patches.FirepitPatches.StatFastPath) + " cache, "
+                + DebugHud.N(Patches.FirepitPatches.StatNearVanilla) + " vanilla"
+                + (Patches.FirepitPatches.FastPathBroken ? " !! CACHE DEFEKT (log)" : ""));
+        if (PoolReclaimer.StatPoolsReclaimed > 0)
+            DebugHud.Row(sb, "vram frei", DebugHud.N(PoolReclaimer.StatBytesReclaimed / 1048576.0) + " MB", null,
+                DebugHud.N(PoolReclaimer.StatPoolsReclaimed) + " pools zurückgegeben");
     }
 
     /// <summary>Which of the two bit-identical sweep kernels is running, and on how many threads.</summary>
@@ -239,6 +250,15 @@ public partial class KometModSystem
         return helpers == 0
             ? kernel + ", 1 thread"
             : kernel + ", " + (helpers + 1) + " threads (eigene, nicht der threadpool)";
+    }
+
+    /// <summary>The same, but sized for a HUD tail - the long form was the widest line of the
+    /// whole overlay and stretched every other row's whitespace with it.</summary>
+    private static string CullKernelShort()
+    {
+        string kernel = FastCuller.VectorAvailable && FastCuller.VectorCulling ? "avx2" : "skalar";
+        int threads = FastCuller.Workers.ThreadCount + 1;
+        return kernel + " · " + (threads == 1 ? "1 thread" : threads + " threads");
     }
 
     /// <summary>
