@@ -6,6 +6,11 @@ using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Measure;
 
 /// <summary>
@@ -28,9 +33,9 @@ public static class MeasurementPatches
 
     public static void Apply(Harmony harmony)
     {
-        MethodInfo stage = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.TriggerRenderStage),
-                                              [typeof(EnumRenderStage), typeof(float)])
-                           ?? throw new InvalidOperationException("ClientMain.TriggerRenderStage not found");
+        var stage = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.TriggerRenderStage),
+                        [typeof(EnumRenderStage), typeof(float)])
+                    ?? throw new InvalidOperationException("ClientMain.TriggerRenderStage not found");
 
         harmony.Patch(stage,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(StagePrefix))),
@@ -38,16 +43,16 @@ public static class MeasurementPatches
 
         // EventManager.TriggerGameTick is the client's whole game tick; ClientEventManager does
         // not override it, so the base method is what runs.
-        MethodInfo tick = AccessTools.Method(typeof(Vintagestory.Common.EventManager), "TriggerGameTick",
-                                             [typeof(long), typeof(IWorldAccessor)])
-                          ?? throw new InvalidOperationException("EventManager.TriggerGameTick not found");
+        var tick = AccessTools.Method(typeof(Vintagestory.Common.EventManager), "TriggerGameTick",
+                       [typeof(long), typeof(IWorldAccessor)])
+                   ?? throw new InvalidOperationException("EventManager.TriggerGameTick not found");
 
         harmony.Patch(tick,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TickPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TickPostfix))));
 
-        Type tesselator = AccessTools.TypeByName("Vintagestory.Client.NoObf.ChunkTesselatorManager")
-                          ?? throw new InvalidOperationException("ChunkTesselatorManager not found");
+        var tesselator = AccessTools.TypeByName("Vintagestory.Client.NoObf.ChunkTesselatorManager")
+                         ?? throw new InvalidOperationException("ChunkTesselatorManager not found");
         UploadMethod = AccessTools.Method(tesselator, "OnBeforeFrame", [typeof(float)])
                        ?? throw new InvalidOperationException("OnBeforeFrame(float) not found");
 
@@ -58,24 +63,24 @@ public static class MeasurementPatches
         // Tesselation throughput: how long one chunk takes to mesh, and how much of that is
         // spent unpacking and assembling the 27 neighbouring chunks. Runs on the tesselation
         // thread; TesselationStats does the cross-thread bookkeeping.
-        MethodInfo tesselate = AccessTools.Method(tesselator, "TesselateChunk",
-                                   [typeof(int), typeof(int), typeof(int), typeof(bool), typeof(bool), typeof(bool).MakeByRefType()])
-                               ?? throw new InvalidOperationException("TesselateChunk not found");
+        var tesselate = AccessTools.Method(tesselator, "TesselateChunk",
+                            [typeof(int), typeof(int), typeof(int), typeof(bool), typeof(bool), typeof(bool).MakeByRefType()])
+                        ?? throw new InvalidOperationException("TesselateChunk not found");
         harmony.Patch(tesselate,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TesselatePrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TesselatePostfix))));
 
-        MethodInfo buildExt = AccessTools.Method(typeof(ChunkTesselator), "BuildExtendedChunkData")
-                              ?? throw new InvalidOperationException("ChunkTesselator.BuildExtendedChunkData not found");
+        var buildExt = AccessTools.Method(typeof(ChunkTesselator), "BuildExtendedChunkData")
+                       ?? throw new InvalidOperationException("ChunkTesselator.BuildExtendedChunkData not found");
         harmony.Patch(buildExt,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NeighbourPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NeighbourPostfix))));
 
         // Sun relighting that TesselateChunk runs inline before meshing - kept in its own
         // bucket so its share of the per-chunk cost is readable.
-        MethodInfo relight = AccessTools.Method(typeof(TerrainIlluminator), "SunRelightChunk",
-                                 [typeof(ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)])
-                             ?? throw new InvalidOperationException("SunRelightChunk not found");
+        var relight = AccessTools.Method(typeof(TerrainIlluminator), "SunRelightChunk",
+                          [typeof(ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)])
+                      ?? throw new InvalidOperationException("SunRelightChunk not found");
         harmony.Patch(relight,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(RelightPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(RelightPostfix))));
@@ -86,17 +91,17 @@ public static class MeasurementPatches
         // split it: the per-part clones (populateTesselatedChunkPart -> CloneUsingRecycler,
         // whose small-mesh fallback and extra arrays allocate fresh) versus the per-block
         // JSON shape tesselation. Alloc-only brackets: two thread-local reads per call.
-        MethodInfo populate = AccessTools.Method(typeof(ChunkTesselator), "populateTesselatedChunkPart")
-                              ?? throw new InvalidOperationException("populateTesselatedChunkPart not found");
+        var populate = AccessTools.Method(typeof(ChunkTesselator), "populateTesselatedChunkPart")
+                       ?? throw new InvalidOperationException("populateTesselatedChunkPart not found");
         harmony.Patch(populate,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(AllocPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(PartsAllocPostfix))));
 
         // the 5-arg overload delegates here, so this one bracket sees every call
-        MethodInfo json = AccessTools.Method(typeof(JsonTesselator), "AddJsonModelDataToMesh",
-                              [typeof(MeshData), typeof(int), typeof(TCTCache), typeof(IMeshPoolSupplier),
-                               typeof(float[]), typeof(IJsonTesselatorHooks), typeof(int)])
-                          ?? throw new InvalidOperationException("AddJsonModelDataToMesh not found");
+        var json = AccessTools.Method(typeof(JsonTesselator), "AddJsonModelDataToMesh",
+                   [typeof(MeshData), typeof(int), typeof(TCTCache), typeof(IMeshPoolSupplier),
+                       typeof(float[]), typeof(IJsonTesselatorHooks), typeof(int)])
+                   ?? throw new InvalidOperationException("AddJsonModelDataToMesh not found");
         harmony.Patch(json,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(AllocPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(JsonAllocPostfix))));
@@ -106,11 +111,11 @@ public static class MeasurementPatches
         // allocations were the largest unmeasured block in a field report (150 of 161
         // hitches with a gc pause, ~220 MB/s that no existing row could name). Pure
         // measurement: two thread-local reads per 1 ms tick, behaviour untouched.
-        MethodInfo netTick = AccessTools.Method(
-                                 AccessTools.TypeByName("Vintagestory.Client.NoObf.SystemNetworkProcess"),
-                                 "OnSeperateThreadGameTick")
-                             ?? throw new InvalidOperationException(
-                                 "SystemNetworkProcess.OnSeperateThreadGameTick not found");
+        var netTick = AccessTools.Method(
+                          AccessTools.TypeByName("Vintagestory.Client.NoObf.SystemNetworkProcess"),
+                          "OnSeperateThreadGameTick")
+                      ?? throw new InvalidOperationException(
+                          "SystemNetworkProcess.OnSeperateThreadGameTick not found");
         harmony.Patch(netTick,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NetAllocPrefix))),
             postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NetAllocPostfix))));
@@ -122,8 +127,8 @@ public static class MeasurementPatches
         // caller rather than a patch on SwapBuffers, because GameWindow.SwapBuffers is a
         // one-line non-virtual method the JIT inlines into window_RenderFrame - a prefix on
         // it would apply cleanly and never run (the dead-profiler lesson).
-        MethodInfo renderFrame = AccessTools.Method(typeof(ClientPlatformWindows), "window_RenderFrame")
-                                 ?? throw new InvalidOperationException("window_RenderFrame not found");
+        var renderFrame = AccessTools.Method(typeof(ClientPlatformWindows), "window_RenderFrame")
+                          ?? throw new InvalidOperationException("window_RenderFrame not found");
         harmony.Patch(renderFrame, transpiler: new HarmonyMethod(
             AccessTools.Method(typeof(MeasurementPatches), nameof(WrapSwapBuffers))));
     }
@@ -150,13 +155,13 @@ public static class MeasurementPatches
     public static System.Collections.Generic.IEnumerable<CodeInstruction> WrapSwapBuffers(
         System.Collections.Generic.IEnumerable<CodeInstruction> instructions)
     {
-        MethodInfo prefix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPrefix));
-        MethodInfo postfix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPostfix));
+        var prefix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPrefix));
+        var postfix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPostfix));
 
-        int wrapped = 0;
-        foreach (CodeInstruction ins in instructions)
+        var wrapped = 0;
+        foreach (var ins in instructions)
         {
-            bool isSwap = ins.operand is MethodInfo m && m.Name == "SwapBuffers" && m.GetParameters().Length == 0;
+            var isSwap = ins.operand is MethodInfo m && m.Name == "SwapBuffers" && m.GetParameters().Length == 0;
             if (isSwap)
             {
                 // the receiver is already on the stack; a static void() call leaves it alone.

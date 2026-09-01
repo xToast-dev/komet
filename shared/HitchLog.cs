@@ -97,6 +97,14 @@ public static class HitchLog
         /// else had the cores - and no amount of making the kernel faster touches it.
         /// </summary>
         public double SweepWaitMs;
+
+        /// <summary>
+        /// The part of <see cref="SweepMs"/> spent rebuilding pool caches from their location
+        /// objects, and how many pools were rebuilt. A sweep that is mostly rebuild after a
+        /// chunk-unload burst is index maintenance, not culling arithmetic - a different fix.
+        /// </summary>
+        public double SweepRebuildMs;
+        public int SweepRebuilds;
     }
 
     private const int Capacity = 48;
@@ -141,7 +149,8 @@ public static class HitchLog
     /// </summary>
     public static void OnFrame(double frameMs, double avgFrameMs, double gcPauseMs, double[] buckets,
                                string gcTag = null, double sweepMs = 0, double uploadMs = 0,
-                               double sweepWaitMs = 0, double hudMs = 0, double entityTessMs = 0)
+                               double sweepWaitMs = 0, double hudMs = 0, double entityTessMs = 0,
+                               double sweepRebuildMs = 0, int sweepRebuilds = 0)
     {
         // a pending hitch whose camera sample never came (main menu, no wiring) is booked
         // without one rather than lost
@@ -169,6 +178,8 @@ public static class HitchLog
             SweepMs = sweepMs,
             UploadMs = uploadMs,
             SweepWaitMs = sweepWaitMs,
+            SweepRebuildMs = sweepRebuildMs,
+            SweepRebuilds = sweepRebuilds,
             HudMs = hudMs,
             EntityTessMs = entityTessMs,
         };
@@ -176,7 +187,7 @@ public static class HitchLog
         // an unsampled frame the "top renderer" is merely the top BEFORE renderer, and a
         // 30 ms opaque hitch must not get a meaningless "renderer Before-camera 0,02 ms"
         // stamped on it - absence says "no measured renderer explains this" more honestly.
-        (string name, double ms)? top = TopRendererProvider?.Invoke();
+        var top = TopRendererProvider?.Invoke();
         if (top.HasValue && top.Value.ms >= 0.5)
         {
             pending.TopRenderer = top.Value.name;
@@ -194,8 +205,8 @@ public static class HitchLog
     {
         if (hasCamera)
         {
-            double dYaw = WrappedDeltaRad(prevYaw, yawRad);
-            double dPitch = WrappedDeltaRad(prevPitch, pitchRad);
+            var dYaw = WrappedDeltaRad(prevYaw, yawRad);
+            var dPitch = WrappedDeltaRad(prevPitch, pitchRad);
             lastTurnDeg = Math.Sqrt(dYaw * dYaw + dPitch * dPitch) * (180.0 / Math.PI);
             double dx = x - prevX, dy = y - prevY, dz = z - prevZ;
             lastMoveBlocks = Math.Sqrt(dx * dx + dy * dy + dz * dz);
@@ -206,7 +217,7 @@ public static class HitchLog
 
         if (hasPending)
         {
-            double seconds = pending.FrameMs / 1000.0;
+            var seconds = pending.FrameMs / 1000.0;
             if (seconds > 0)
             {
                 pending.TurnDegPerSec = lastTurnDeg / seconds;
@@ -222,7 +233,7 @@ public static class HitchLog
     /// </summary>
     internal static double WrappedDeltaRad(double from, double to)
     {
-        double d = (to - from) % (2 * Math.PI);
+        var d = (to - from) % (2 * Math.PI);
         if (d > Math.PI) d -= 2 * Math.PI;
         if (d < -Math.PI) d += 2 * Math.PI;
         return d;
@@ -230,8 +241,8 @@ public static class HitchLog
 
     internal static int DominantBucket(double[] buckets)
     {
-        int best = 0;
-        for (int i = 1; i < BucketCount; i++)
+        var best = 0;
+        for (var i = 1; i < BucketCount; i++)
             if (buckets[i] > buckets[best]) best = i;
         return best;
     }
@@ -239,15 +250,15 @@ public static class HitchLog
     private static void CommitPending()
     {
         hasPending = false;
-        int slot = ringNext;
+        var slot = ringNext;
         ring[slot] = pending;
         ringNext = (ringNext + 1) % Capacity;
         if (ringCount < Capacity) ringCount++;
 
         TotalHitches++;
         dominantCounts[DominantBucket(pending.Buckets)]++;
-        bool turning = pending.TurnDegPerSec >= TurnThresholdDegPerSec;
-        bool moving = pending.MoveBlocksPerSec >= MoveThresholdBlocksPerSec;
+        var turning = pending.TurnDegPerSec >= TurnThresholdDegPerSec;
+        var moving = pending.MoveBlocksPerSec >= MoveThresholdBlocksPerSec;
         if (turning) CountTurning++;
         if (moving) CountMoving++;
         if (!turning && !moving && !double.IsNaN(pending.TurnDegPerSec)) CountStill++;
@@ -277,16 +288,16 @@ public static class HitchLog
     /// angle brackets in strings that may end up there.</summary>
     public static string FormatEntry(in Entry e)
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(160);
         sb.AppendFormat(ci, "{0:F1} ms (avg {1:F1}) bei {2:F0}s: ", e.FrameMs, e.AvgMs, e.AtSeconds);
 
-        double[] b = (double[])e.Buckets.Clone();
-        bool any = false;
-        for (int rank = 0; rank < 3; rank++)
+        var b = (double[])e.Buckets.Clone();
+        var any = false;
+        for (var rank = 0; rank < 3; rank++)
         {
-            int best = 0;
-            for (int i = 1; i < BucketCount; i++)
+            var best = 0;
+            for (var i = 1; i < BucketCount; i++)
                 if (b[i] > b[best]) best = i;
             if (b[best] < 0.5) break;
             if (any) sb.Append(" + ");
@@ -313,6 +324,9 @@ public static class HitchLog
             // case that needs naming.
             if (e.SweepWaitMs >= 1.0 && e.SweepWaitMs >= e.SweepMs * 0.25)
                 sb.AppendFormat(ci, " (davon {0:F1} warten auf threads)", e.SweepWaitMs);
+            // Same rule for the rebuild share: only when it explains a real part of the sweep.
+            if (e.SweepRebuildMs >= 1.0 && e.SweepRebuildMs >= e.SweepMs * 0.25)
+                sb.AppendFormat(ci, " (davon {0:F1} rebuild, {1} pools)", e.SweepRebuildMs, e.SweepRebuilds);
             sb.AppendFormat(ci, ", upload {0:F1}", e.UploadMs);
             if (e.EntityTessMs >= 1.0)
                 sb.AppendFormat(ci, ", enttess {0:F1}", e.EntityTessMs);
@@ -333,8 +347,8 @@ public static class HitchLog
         get
         {
             if (observingSince == 0) return 0;
-            double minutes = (Stopwatch.GetTimestamp() - observingSince)
-                             / (double)Stopwatch.Frequency / 60.0;
+            var minutes = (Stopwatch.GetTimestamp() - observingSince)
+                          / (double)Stopwatch.Frequency / 60.0;
             return minutes > 0.05 ? TotalHitches / minutes : 0;
         }
     }
@@ -343,11 +357,11 @@ public static class HitchLog
     public static string LastTail()
     {
         if (ringCount == 0) return null;
-        ref Entry e = ref ring[(ringNext - 1 + Capacity) % Capacity];
-        CultureInfo ci = CultureInfo.CurrentCulture;
-        int dom = DominantBucket(e.Buckets);
-        string s = e.FrameMs.ToString("F1", ci) + " ms, " + BucketNames[dom] + " "
-                 + e.Buckets[dom].ToString("F1", ci);
+        ref var e = ref ring[(ringNext - 1 + Capacity) % Capacity];
+        var ci = CultureInfo.CurrentCulture;
+        var dom = DominantBucket(e.Buckets);
+        var s = e.FrameMs.ToString("F1", ci) + " ms, " + BucketNames[dom] + " "
+                + e.Buckets[dom].ToString("F1", ci);
         if (e.GcPauseMs > 0.5)
             s += ", gc " + e.GcPauseMs.ToString("F1", ci) + (e.GcTag != null ? " " + e.GcTag : "");
         if (!double.IsNaN(e.TurnDegPerSec)) s += ", " + e.TurnDegPerSec.ToString("F0", ci) + " grad/s";
@@ -357,7 +371,7 @@ public static class HitchLog
     /// <summary>One line for the .komet stats text.</summary>
     public static string SummaryLine()
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var ci = CultureInfo.CurrentCulture;
         if (TotalHitches == 0)
             return string.Format(ci, "keine (schwelle mind. {0:F0} ms und {1:F1}x avg)", MinMs, Factor);
         return string.Format(ci, "{0} ({1:F1}/min): {2} beim drehen, {3} in bewegung, {4} im stand, {5} mit gc-pause ({6} gen2)",
@@ -367,7 +381,7 @@ public static class HitchLog
     /// <summary>The .komet hitch report: aggregates first, then the most recent entries.</summary>
     public static string BuildReport()
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(1024);
         sb.AppendFormat(ci, "ruckler seit reset: {0} ({1:F1}/min) | schwelle: mind. {2:F0} ms und {3:F1}x avg-frame\n",
             TotalHitches, PerMinute, MinMs, Factor);
@@ -383,11 +397,11 @@ public static class HitchLog
 
         // ordered by count, descending - small fixed array, done the plain way
         sb.Append("dominanter bucket: ");
-        bool first = true;
+        var first = true;
         var order = new int[BucketCount];
-        for (int i = 0; i < BucketCount; i++) order[i] = i;
+        for (var i = 0; i < BucketCount; i++) order[i] = i;
         Array.Sort(order, (a, bIdx) => dominantCounts[bIdx].CompareTo(dominantCounts[a]));
-        foreach (int i in order)
+        foreach (var i in order)
         {
             if (dominantCounts[i] == 0) break;
             if (!first) sb.Append(", ");
@@ -399,11 +413,11 @@ public static class HitchLog
         if (suppressedLogs > 0)
             sb.AppendFormat(ci, "({0} weitere nicht einzeln geloggt)\n", suppressedLogs);
 
-        int show = Math.Min(ringCount, 8);
+        var show = Math.Min(ringCount, 8);
         sb.Append("letzte ").Append(show).Append(":\n");
-        for (int k = 0; k < show; k++)
+        for (var k = 0; k < show; k++)
         {
-            int idx = (ringNext - show + k + Capacity) % Capacity;
+            var idx = (ringNext - show + k + Capacity) % Capacity;
             sb.Append("  ").Append(FormatEntry(in ring[idx])).Append('\n');
         }
 
@@ -415,7 +429,7 @@ public static class HitchLog
             sb.AppendFormat(CultureInfo.CurrentCulture,
                 ", laengste gen0/gen1-pause {0:F0} ms", WorstEphemeralPauseMs);
 
-        string verdict = GcModeVerdict(System.Runtime.GCSettings.IsServerGC, WorstEphemeralPauseMs);
+        var verdict = GcModeVerdict(System.Runtime.GCSettings.IsServerGC, WorstEphemeralPauseMs);
         if (verdict != null) sb.Append('\n').Append(verdict);
         return sb.ToString();
     }

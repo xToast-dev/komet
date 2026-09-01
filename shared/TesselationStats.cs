@@ -125,46 +125,46 @@ public static class TesselationStats
     /// </summary>
     public static void Sample()
     {
-        long now = Stopwatch.GetTimestamp();
-        long ticks = Interlocked.Read(ref totalTicks);
-        long nTicks = Interlocked.Read(ref neighbourTicks);
-        long rTicks = Interlocked.Read(ref relightTicks);
-        long count = Interlocked.Read(ref chunkCount);
-        long edges = Interlocked.Read(ref edgeCount);
-        long allocB = Interlocked.Read(ref totalAllocBytes);
+        var now = Stopwatch.GetTimestamp();
+        var ticks = Interlocked.Read(ref totalTicks);
+        var nTicks = Interlocked.Read(ref neighbourTicks);
+        var rTicks = Interlocked.Read(ref relightTicks);
+        var count = Interlocked.Read(ref chunkCount);
+        var edges = Interlocked.Read(ref edgeCount);
+        var allocB = Interlocked.Read(ref totalAllocBytes);
 
-        long dCount = count - seenCount;
-        double dSeconds = seenAtTimestamp == 0 ? 0 : (now - seenAtTimestamp) / (double)Stopwatch.Frequency;
+        var dCount = count - seenCount;
+        var dSeconds = seenAtTimestamp == 0 ? 0 : (now - seenAtTimestamp) / (double)Stopwatch.Frequency;
 
-        bool first = seenCount == 0; // snap to the first sample instead of crawling up from zero
+        var first = seenCount == 0; // snap to the first sample instead of crawling up from zero
         if (dCount > 0)
         {
-            double msPer = (ticks - seenTicks) * 1000.0 / Stopwatch.Frequency / dCount;
-            double nMsPer = (nTicks - seenNeighbourTicks) * 1000.0 / Stopwatch.Frequency / dCount;
+            var msPer = (ticks - seenTicks) * 1000.0 / Stopwatch.Frequency / dCount;
+            var nMsPer = (nTicks - seenNeighbourTicks) * 1000.0 / Stopwatch.Frequency / dCount;
             // one-quarter blend: jumpy enough to follow a load burst, calm enough to read
             MsPerChunk = MsPerChunk <= 0 ? msPer : MsPerChunk + (msPer - MsPerChunk) * 0.25;
             NeighbourMsPerChunk = NeighbourMsPerChunk <= 0 ? nMsPer : NeighbourMsPerChunk + (nMsPer - NeighbourMsPerChunk) * 0.25;
-            double rMsPer = (rTicks - seenRelightTicks) * 1000.0 / Stopwatch.Frequency / dCount;
+            var rMsPer = (rTicks - seenRelightTicks) * 1000.0 / Stopwatch.Frequency / dCount;
             RelightMsPerChunk = RelightMsPerChunk <= 0 ? rMsPer : RelightMsPerChunk + (rMsPer - RelightMsPerChunk) * 0.25;
-            double edgeShare = 100.0 * (edges - seenEdges) / dCount;
+            var edgeShare = 100.0 * (edges - seenEdges) / dCount;
             EdgeSharePercent = first ? edgeShare : EdgeSharePercent + (edgeShare - EdgeSharePercent) * 0.25;
         }
 
         long received = RuntimeStats.chunksReceived;
         if (dSeconds > 0)
         {
-            double rate = dCount / dSeconds;
+            var rate = dCount / dSeconds;
             ChunksPerSecond += (rate - ChunksPerSecond) * 0.25;
             if (ChunksPerSecond < 0.05) ChunksPerSecond = 0;
 
-            double allocRate = (allocB - seenAllocB) / dSeconds / 1048576.0;
+            var allocRate = (allocB - seenAllocB) / dSeconds / 1048576.0;
             AllocMbPerSecond += (allocRate - AllocMbPerSecond) * 0.4;
             if (AllocMbPerSecond < 0.05) AllocMbPerSecond = 0;
 
-            long nAllocB = Interlocked.Read(ref neighbourAllocBytes);
-            long rAllocB = Interlocked.Read(ref relightAllocBytes);
-            double nAllocRate = (nAllocB - seenNeighbourAllocB) / dSeconds / 1048576.0;
-            double rAllocRate = (rAllocB - seenRelightAllocB) / dSeconds / 1048576.0;
+            var nAllocB = Interlocked.Read(ref neighbourAllocBytes);
+            var rAllocB = Interlocked.Read(ref relightAllocBytes);
+            var nAllocRate = (nAllocB - seenNeighbourAllocB) / dSeconds / 1048576.0;
+            var rAllocRate = (rAllocB - seenRelightAllocB) / dSeconds / 1048576.0;
             NeighbourAllocMbPerSecond += (nAllocRate - NeighbourAllocMbPerSecond) * 0.4;
             RelightAllocMbPerSecond += (rAllocRate - RelightAllocMbPerSecond) * 0.4;
             if (NeighbourAllocMbPerSecond < 0.05) NeighbourAllocMbPerSecond = 0;
@@ -172,10 +172,10 @@ public static class TesselationStats
             seenNeighbourAllocB = nAllocB;
             seenRelightAllocB = rAllocB;
 
-            long pAllocB = Interlocked.Read(ref partsAllocBytes);
-            long jAllocB = Interlocked.Read(ref jsonAllocBytes);
-            double pAllocRate = (pAllocB - seenPartsAllocB) / dSeconds / 1048576.0;
-            double jAllocRate = (jAllocB - seenJsonAllocB) / dSeconds / 1048576.0;
+            var pAllocB = Interlocked.Read(ref partsAllocBytes);
+            var jAllocB = Interlocked.Read(ref jsonAllocBytes);
+            var pAllocRate = (pAllocB - seenPartsAllocB) / dSeconds / 1048576.0;
+            var jAllocRate = (jAllocB - seenJsonAllocB) / dSeconds / 1048576.0;
             PartsAllocMbPerSecond += (pAllocRate - PartsAllocMbPerSecond) * 0.4;
             JsonAllocMbPerSecond += (jAllocRate - JsonAllocMbPerSecond) * 0.4;
             if (PartsAllocMbPerSecond < 0.05) PartsAllocMbPerSecond = 0;
@@ -183,9 +183,9 @@ public static class TesselationStats
             seenPartsAllocB = pAllocB;
             seenJsonAllocB = jAllocB;
 
-            long dReceived = received - seenReceived;
+            var dReceived = received - seenReceived;
             if (dReceived < 0) dReceived = 0; // the vanilla debug screen resets the counter
-            double rxRate = dReceived / dSeconds;
+            var rxRate = dReceived / dSeconds;
             ReceivedPerSecond += (rxRate - ReceivedPerSecond) * 0.25;
             if (ReceivedPerSecond < 0.05) ReceivedPerSecond = 0;
         }

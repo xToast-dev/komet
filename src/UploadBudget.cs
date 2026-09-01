@@ -66,7 +66,7 @@ public static class UploadBudget
     public static int Scale(int vanillaBudget)
     {
         if (!Enabled) return vanillaBudget;
-        int scaled = (int)(vanillaBudget * gain);
+        var scaled = (int)(vanillaBudget * gain);
         // never throttle to a standstill: one average chunk part must always get through
         return scaled < 2048 ? 2048 : scaled;
     }
@@ -82,7 +82,7 @@ public static class UploadBudget
 
     public static void FrameEnd()
     {
-        double ms = Watch.Elapsed.TotalMilliseconds;
+        var ms = Watch.Elapsed.TotalMilliseconds;
         LastMs = ms;
         if (ms > PeakMs) PeakMs = ms;
         Frames++;
@@ -130,7 +130,7 @@ public static class UploadBudget
     public static void NotePressure(double frameMs, double avgFrameMs, double gcPauseMs, double uploadMs)
     {
         if (!Enabled || !FramePressureInput) return;
-        double correction = PressureCorrection(frameMs, avgFrameMs, gcPauseMs, uploadMs, PressureFactor);
+        var correction = PressureCorrection(frameMs, avgFrameMs, gcPauseMs, uploadMs, PressureFactor);
         if (correction >= 1.0) return;
         gain *= Math.Max(MaxCut, correction);
         if (gain < 0.02) gain = 0.02;
@@ -149,8 +149,8 @@ public static class UploadBudget
                                               double uploadMs, double factor)
     {
         if (avgFrameMs <= 0 || uploadMs <= 0.05) return 1.0;
-        double work = frameMs - Math.Max(0, gcPauseMs);
-        double limit = avgFrameMs * factor;
+        var work = frameMs - Math.Max(0, gcPauseMs);
+        var limit = avgFrameMs * factor;
         return work <= limit ? 1.0 : limit / work;
     }
 

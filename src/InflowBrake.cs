@@ -105,16 +105,16 @@ public static class InflowBrake
         if (highWater <= lowWater) highWater = lowWater + 1;
         if (backlog <= lowWater) return 1.0;
 
-        long deepWater = (long)highWater * DeepWaterMultiple;
+        var deepWater = (long)highWater * DeepWaterMultiple;
         if (backlog >= deepWater) return DeepMinFactor;
 
         if (backlog >= highWater)
         {
-            double d = (double)(backlog - highWater) / (deepWater - highWater);
+            var d = (double)(backlog - highWater) / (deepWater - highWater);
             return MinFactor - d * (MinFactor - DeepMinFactor);
         }
 
-        double t = (double)(backlog - lowWater) / (highWater - lowWater);
+        var t = (double)(backlog - lowWater) / (highWater - lowWater);
         return 1.0 - t * (1.0 - MinFactor);
     }
 
@@ -134,7 +134,7 @@ public static class InflowBrake
         if (factor < DeepMinFactor) factor = DeepMinFactor;
 
         columns = Math.Max(1, (int)Math.Round(baseColumns * factor));
-        double achieved = (double)columns / baseColumns;   // what the column count alone gives
+        var achieved = (double)columns / baseColumns;   // what the column count alone gives
         tickMs = (int)Math.Round(baseTickMs * achieved / factor);
         tickMs = Math.Clamp(tickMs, baseTickMs, 500);
     }
@@ -144,11 +144,11 @@ public static class InflowBrake
     {
         if (!Enabled) return;
 
-        int backlog = RuntimeStats.chunksAwaitingTesselation;
-        double factor = Math.Min(
+        var backlog = RuntimeStats.chunksAwaitingTesselation;
+        var factor = Math.Min(
             FactorFor(backlog, LowWater, HighWater),
             RateFactorFor(TesselationStats.ReceivedPerSecond, TesselationStats.ChunksPerSecond));
-        KnobsFor(factor, BaseColumns, BaseTickMs, out int columns, out int tickMs);
+        KnobsFor(factor, BaseColumns, BaseTickMs, out var columns, out var tickMs);
 
         if (factor < 1.0) SecondsBraking += dtSeconds;
         CurrentPercent = (int)Math.Round(factor * 100);

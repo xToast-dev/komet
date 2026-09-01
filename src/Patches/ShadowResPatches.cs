@@ -7,6 +7,11 @@ using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -54,8 +59,8 @@ public static class ShadowResPatches
         ExtraSteps = Math.Clamp(extraSteps, 0, 4);
         if (ExtraSteps == 0) return;
 
-        MethodInfo setup = AccessTools.Method(typeof(ClientPlatformWindows), "SetupDefaultFrameBuffers")
-                           ?? throw new InvalidOperationException("SetupDefaultFrameBuffers not found");
+        var setup = AccessTools.Method(typeof(ClientPlatformWindows), "SetupDefaultFrameBuffers")
+                    ?? throw new InvalidOperationException("SetupDefaultFrameBuffers not found");
 
         harmony.Patch(setup, transpiler: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowResPatches), nameof(EnlargeShadowMaps))));
@@ -70,12 +75,12 @@ public static class ShadowResPatches
     public static IEnumerable<CodeInstruction> EnlargeShadowMaps(IEnumerable<CodeInstruction> instructions)
     {
         var code = new List<CodeInstruction>(instructions);
-        MethodInfo addSteps = AccessTools.Method(typeof(ShadowResPatches), nameof(AddSteps));
-        int patched = 0;
+        var addSteps = AccessTools.Method(typeof(ShadowResPatches), nameof(AddSteps));
+        var patched = 0;
 
-        for (int i = 0; i < code.Count - 1; i++)
+        for (var i = 0; i < code.Count - 1; i++)
         {
-            bool isMax = code[i].operand is MethodInfo m && m.Name == "Max" && m.DeclaringType == typeof(Math);
+            var isMax = code[i].operand is MethodInfo m && m.Name == "Max" && m.DeclaringType == typeof(Math);
             if (!isMax) continue;
             // the size expression is Max(...) * 1024; the multiply follows the constant
             if (!code[i + 1].LoadsConstant(1024) || i + 2 >= code.Count || code[i + 2].opcode != OpCodes.Mul)
@@ -96,7 +101,7 @@ public static class ShadowResPatches
     /// <summary>Called with the engine's quality steps, returns the steps to allocate for.</summary>
     public static int AddSteps(int steps)
     {
-        int result = steps + ExtraSteps;
+        var result = steps + ExtraSteps;
         ShadowMapSize = result * 1024;
         return result;
     }
@@ -160,5 +165,5 @@ public static class ShadowResPatches
     /// so a 1x1 window at SSAA 0.5 is just as fatal as a 0x0 one.
     /// </summary>
     internal static bool CanHostFramebuffers(bool minimized, int width, int height, float ssaa)
-        => !minimized && (int)((float)width * ssaa) > 0 && (int)((float)height * ssaa) > 0;
+        => !minimized && (int)(width * ssaa) > 0 && (int)(height * ssaa) > 0;
 }

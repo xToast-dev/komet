@@ -5,6 +5,11 @@ using System.Reflection.Emit;
 using HarmonyLib;
 using Vintagestory.API.Common;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -28,7 +33,7 @@ public static class AnimationPatches
     /// </summary>
     public static void SwitchToCaseInsensitiveLookup(AnimatorBase animator)
     {
-        ref Dictionary<string, RunningAnimation> byCode = ref AnimsByCodeRef(animator);
+        ref var byCode = ref AnimsByCodeRef(animator);
         if (byCode == null || ReferenceEquals(byCode.Comparer, StringComparer.OrdinalIgnoreCase)) return;
         byCode = new Dictionary<string, RunningAnimation>(byCode, StringComparer.OrdinalIgnoreCase);
     }
@@ -36,8 +41,8 @@ public static class AnimationPatches
     /// <summary>Deletes every call to String.ToLowerInvariant, leaving the receiver on the stack.</summary>
     public static IEnumerable<CodeInstruction> DropToLowerInvariant(IEnumerable<CodeInstruction> instructions)
     {
-        MethodInfo target = AccessTools.Method(typeof(string), nameof(string.ToLowerInvariant), Type.EmptyTypes);
-        foreach (CodeInstruction ins in instructions)
+        var target = AccessTools.Method(typeof(string), nameof(string.ToLowerInvariant), Type.EmptyTypes);
+        foreach (var ins in instructions)
         {
             if ((ins.opcode == OpCodes.Callvirt || ins.opcode == OpCodes.Call) && ReferenceEquals(ins.operand, target))
             {
@@ -63,7 +68,7 @@ public static class AnimationPatches
     /// </summary>
     public static bool AnyAdjustCollisionBox(Dictionary<string, AnimationMetaData> anims)
     {
-        foreach (KeyValuePair<string, AnimationMetaData> anim in anims)
+        foreach (var anim in anims)
         {
             if (anim.Value.AdjustCollisionBox) return true;
         }
@@ -73,14 +78,14 @@ public static class AnimationPatches
     /// <summary>Rewrites the Enumerable.Any call site to the allocation free helper above.</summary>
     public static IEnumerable<CodeInstruction> ReplaceAnyWithLoop(IEnumerable<CodeInstruction> instructions)
     {
-        MethodInfo replacement = AccessTools.Method(typeof(AnimationPatches), nameof(AnyAdjustCollisionBox));
+        var replacement = AccessTools.Method(typeof(AnimationPatches), nameof(AnyAdjustCollisionBox));
         var buffer = new List<CodeInstruction>();
 
-        foreach (CodeInstruction ins in instructions) buffer.Add(ins);
+        foreach (var ins in instructions) buffer.Add(ins);
 
-        for (int i = 0; i < buffer.Count; i++)
+        for (var i = 0; i < buffer.Count; i++)
         {
-            CodeInstruction ins = buffer[i];
+            var ins = buffer[i];
             if (ins.opcode != OpCodes.Call || ins.operand is not MethodInfo m) continue;
             if (m.Name != "Any" || m.DeclaringType != typeof(System.Linq.Enumerable)) continue;
 

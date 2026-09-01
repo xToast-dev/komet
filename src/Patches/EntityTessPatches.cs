@@ -3,6 +3,11 @@ using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -58,10 +63,10 @@ public static class EntityTessPatches
 
         // VSEssentials is resolved at runtime, like the firepit gate - no compile-time
         // reference to the content mods.
-        Type esr = AccessTools.TypeByName("Vintagestory.GameContent.EntityShapeRenderer")
-                   ?? throw new InvalidOperationException("EntityShapeRenderer not found - VSEssentials not loaded?");
-        MethodInfo tess = AccessTools.Method(esr, "TesselateShape", Type.EmptyTypes)
-                          ?? throw new InvalidOperationException("EntityShapeRenderer.TesselateShape() not found");
+        var esr = AccessTools.TypeByName("Vintagestory.GameContent.EntityShapeRenderer")
+                  ?? throw new InvalidOperationException("EntityShapeRenderer not found - VSEssentials not loaded?");
+        var tess = AccessTools.Method(esr, "TesselateShape", Type.EmptyTypes)
+                   ?? throw new InvalidOperationException("EntityShapeRenderer.TesselateShape() not found");
 
         harmony.Patch(tess,
             prefix: new HarmonyMethod(typeof(EntityTessPatches), nameof(TessPrefix)),
@@ -103,7 +108,7 @@ public static class EntityTessPatches
     public static void TessPostfix(long __state, object __instance)
     {
         if (__state == 0) return; // skipped, or the budget is off
-        double ms = (Stopwatch.GetTimestamp() - __state) * 1000.0 / Stopwatch.Frequency;
+        var ms = (Stopwatch.GetTimestamp() - __state) * 1000.0 / Stopwatch.Frequency;
         spentThisFrameMs += ms;
         allowedThisFrame++;
         StatAllowed++;

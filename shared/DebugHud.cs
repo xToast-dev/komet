@@ -220,7 +220,7 @@ public class DebugHud : IRenderer
         // draw calls only ever increment, so the per-frame count is the delta. The vanilla
         // debug screen zeroes it, which would make the delta negative - ignore those frames.
         long now = RuntimeStats.drawCallsCount;
-        long delta = now - lastDrawCalls;
+        var delta = now - lastDrawCalls;
         if (delta >= 0 && delta < 1_000_000) drawCallsPerFrame = (int)delta;
         lastDrawCalls = now;
 
@@ -268,21 +268,21 @@ public class DebugHud : IRenderer
     /// the recurring 4 Hz refresh goes through <see cref="StartRebuild"/> instead.</summary>
     private void RebuildSync()
     {
-        long t0 = Stopwatch.GetTimestamp();
+        var t0 = Stopwatch.GetTimestamp();
         SampleWorld();
         ProbeMetrics();
-        string text = Compose();
+        var text = Compose();
         if (text != lastText || texture.TextureId == 0)
         {
             lastText = text;
-            if (Layout(text, out string[] lines, out int width, out int height))
+            if (Layout(text, out var lines, out var width, out var height))
             {
                 EnsureSurface(width, height);
                 Raster(lines, width, height);
                 Upload();
             }
         }
-        double ms = ElapsedMs(t0);
+        var ms = ElapsedMs(t0);
         FrameStats.AddHudMs(ms);
         FoldRebuild(ms);
     }
@@ -295,39 +295,39 @@ public class DebugHud : IRenderer
     /// </summary>
     private void StartRebuild()
     {
-        long t0 = Stopwatch.GetTimestamp();
+        var t0 = Stopwatch.GetTimestamp();
         SampleWorld();
         ProbeMetrics();
-        string text = Compose();
+        var text = Compose();
         if (text == lastText && texture.TextureId != 0)
         {
-            double ms0 = ElapsedMs(t0);
+            var ms0 = ElapsedMs(t0);
             FrameStats.AddHudMs(ms0);
             FoldRebuild(ms0);
             return;
         }
         lastText = text;
-        if (!Layout(text, out string[] lines, out int width, out int height)) return;
+        if (!Layout(text, out var lines, out var width, out var height)) return;
         EnsureSurface(width, height);
 
         if (!BackgroundRaster || rasterBroken)
         {
             Raster(lines, width, height);
             Upload();
-            double total = ElapsedMs(t0);
+            var total = ElapsedMs(t0);
             FrameStats.AddHudMs(total);
             FoldRebuild(total);
             return;
         }
 
-        double mainMs = ElapsedMs(t0);
+        var mainMs = ElapsedMs(t0);
         FrameStats.AddHudMs(mainMs);
         pendingMainMs = mainMs;
         // The task owns surface and ctx until it completes. Nothing else can touch them in
         // between: NextStep only allows Start and RebuildNow when no raster is in flight.
         rasterTask = System.Threading.Tasks.Task.Run(() =>
         {
-            long r0 = Stopwatch.GetTimestamp();
+            var r0 = Stopwatch.GetTimestamp();
             Raster(lines, width, height);
             pendingRasterMs = ElapsedMs(r0);
         });
@@ -336,7 +336,7 @@ public class DebugHud : IRenderer
     /// <summary>The main-thread tail of a background raster: hand the pixels to the driver.</summary>
     private void FinishRaster()
     {
-        System.Threading.Tasks.Task t = rasterTask;
+        var t = rasterTask;
         rasterTask = null;
         if (t.IsFaulted)
         {
@@ -348,7 +348,7 @@ public class DebugHud : IRenderer
                 title, t.Exception?.GetBaseException()?.Message);
             return;
         }
-        double uploadMs = Upload();
+        var uploadMs = Upload();
         FrameStats.AddHudMs(uploadMs);
         FoldRebuild(pendingMainMs + pendingRasterMs + uploadMs);
     }
@@ -386,10 +386,10 @@ public class DebugHud : IRenderer
             // with - earns its smallness by not paying for them either.
             if (!Compact)
             {
-                ChunkRenderer renderer = ChunkRendererRef(game);
+                var renderer = ChunkRendererRef(game);
                 if (renderer != null)
                 {
-                    renderer.GetStats(out long used, out long rendered, out long allocated);
+                    renderer.GetStats(out var used, out var rendered, out var allocated);
                     vramBytes = used;
                     renderedTris = rendered;
                     allocatedTris = allocated;
@@ -423,9 +423,9 @@ public class DebugHud : IRenderer
         // A font that substitutes them from a differently-sized fallback would make
         // bar-carrying lines wider than the computed raster - probed once, and the bars
         // degrade to '#' rather than overflowing the box.
-        double barAdvance = font.GetTextExtents("████").Width / 4.0;
+        var barAdvance = font.GetTextExtents("████").Width / 4.0;
         BarAscii = charAdvance <= 0 || Math.Abs(barAdvance - charAdvance) > charAdvance * 0.05;
-        FontExtents fe = font.GetFontExtents();
+        var fe = font.GetFontExtents();
         ascent = fe.Ascent;
         lineHeight = (int)fe.Height;
         metricsScale = RuntimeEnv.GUIScale;
@@ -442,8 +442,8 @@ public class DebugHud : IRenderer
     private bool Layout(string text, out string[] lines, out int width, out int height)
     {
         lines = text.Split('\n');
-        int longest = 0;
-        for (int i = 0; i < lines.Length; i++)
+        var longest = 0;
+        for (var i = 0; i < lines.Length; i++)
         {
             lines[i] = lines[i].TrimEnd();
             longest = Math.Max(longest, lines[i].Length);
@@ -455,7 +455,7 @@ public class DebugHud : IRenderer
 
     private void EnsureSurface(int width, int height)
     {
-        (int surfW, int surfH) = NextSurfaceSize(
+        (var surfW, var surfH) = NextSurfaceSize(
             surface?.Width ?? 0, surface?.Height ?? 0, width, height, lineHeight);
         if (surface != null && surfW == surface.Width && surfH == surface.Height) return;
         ctx?.Dispose();
@@ -497,7 +497,7 @@ public class DebugHud : IRenderer
         }
 
         font.SetupContext(ctx);
-        for (int i = 0; i < lines.Length; i++)
+        for (var i = 0; i < lines.Length; i++)
         {
             if (lines[i].Length == 0) continue;
             ctx.MoveTo(xOff + background.HorPadding, background.VerPadding + ascent + i * lineHeight);
@@ -509,9 +509,9 @@ public class DebugHud : IRenderer
     /// <summary>Hands the surface to the driver. Render thread only (GL).</summary>
     private double Upload()
     {
-        long t0 = Stopwatch.GetTimestamp();
+        var t0 = Stopwatch.GetTimestamp();
         capi.Gui.LoadOrUpdateCairoTexture(surface, false, ref texture);
-        double uploadMs = ElapsedMs(t0);
+        var uploadMs = ElapsedMs(t0);
         AvgUploadMs = AvgUploadMs <= 0 ? uploadMs : AvgUploadMs * 0.8 + uploadMs * 0.2;
         return uploadMs;
     }
@@ -525,9 +525,9 @@ public class DebugHud : IRenderer
     /// </summary>
     public static (int w, int h) NextSurfaceSize(int haveW, int haveH, int contentW, int contentH, int lineHeight)
     {
-        int stepH = Math.Max(1, lineHeight) * 4;
-        int w = Math.Max(haveW, (contentW + 63) / 64 * 64);
-        int h = Math.Max(haveH, (contentH + stepH - 1) / stepH * stepH);
+        var stepH = Math.Max(1, lineHeight) * 4;
+        var w = Math.Max(haveW, (contentW + 63) / 64 * 64);
+        var h = Math.Max(haveH, (contentH + stepH - 1) / stepH * stepH);
         return (w, h);
     }
 
@@ -559,8 +559,8 @@ public class DebugHud : IRenderer
     internal static string Bar(double ms, double frameMs)
     {
         if (frameMs <= 0 || ms < 0.05) return "";
-        double frac = Math.Min(1.0, ms / frameMs);
-        int eighths = Math.Max(1, (int)Math.Round(frac * BarCells * 8));
+        var frac = Math.Min(1.0, ms / frameMs);
+        var eighths = Math.Max(1, (int)Math.Round(frac * BarCells * 8));
         int full = eighths / 8, rem = eighths % 8;
         if (BarAscii) return new string('#', Math.Max(1, full + (rem >= 4 ? 1 : 0)));
         return rem > 0 ? new string('█', full) + BarEighths[rem] : new string('█', full);
@@ -569,8 +569,8 @@ public class DebugHud : IRenderer
     /// <summary>One frame bucket: percent, milliseconds, bar, optional note after the bar.</summary>
     private static void BucketRow(StringBuilder sb, string label, double ms, double frame, string note = null)
     {
-        string bar = Bar(ms, frame);
-        string tail = note == null
+        var bar = Bar(ms, frame);
+        var tail = note == null
             ? (bar.Length > 0 ? bar : null)
             : bar.PadRight(BarCells + 1) + note;
         Row(sb, label, Pct(ms, frame), Ms(ms), tail);
@@ -588,7 +588,7 @@ public class DebugHud : IRenderer
 
     public static void Section(StringBuilder sb, string heading)
     {
-        string head = "── " + heading + " ";
+        var head = "── " + heading + " ";
         sb.Append(head).Append('─', Math.Max(0, Rule.Length - head.Length)).Append('\n');
     }
 
@@ -619,14 +619,14 @@ public class DebugHud : IRenderer
         };
 
         double total = 0;
-        foreach ((_, double ms) in buckets) total += ms;
+        foreach ((_, var ms) in buckets) total += ms;
         if (total <= 0) return null;
 
         var sb = new StringBuilder(48);
-        for (int rank = 0; rank < 3; rank++)
+        for (var rank = 0; rank < 3; rank++)
         {
-            int best = -1;
-            for (int i = 0; i < buckets.Length; i++)
+            var best = -1;
+            for (var i = 0; i < buckets.Length; i++)
                 if (best < 0 || buckets[i].ms > buckets[best].ms) best = i;
             if (buckets[best].ms < 0.5) break;
 
@@ -665,9 +665,9 @@ public class DebugHud : IRenderer
             return sb.ToString();
         }
 
-        double frame = FrameStats.AvgFrameMs;
-        double fps = frame > 0 ? 1000.0 / frame : 0;
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var frame = FrameStats.AvgFrameMs;
+        var fps = frame > 0 ? 1000.0 / frame : 0;
+        var ci = CultureInfo.CurrentCulture;
 
         sb.Append(title).Append('\n');
         sb.Append(Rule, 0, 34).Append('\n');
@@ -679,7 +679,7 @@ public class DebugHud : IRenderer
         {
             Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
                 HitchLog.PerMinute.ToString("F1", ci) + "/min");
-            string lastHitch = HitchLog.LastTail();
+            var lastHitch = HitchLog.LastTail();
             if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
         }
         if (FrameStats.GcPauseMsPerSecond > 0.05)
@@ -713,9 +713,9 @@ public class DebugHud : IRenderer
             return sb.ToString();
         }
 
-        double frame = FrameStats.AvgFrameMs;
-        double fps = frame > 0 ? 1000.0 / frame : 0;
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var frame = FrameStats.AvgFrameMs;
+        var fps = frame > 0 ? 1000.0 / frame : 0;
+        var ci = CultureInfo.CurrentCulture;
 
         sb.Append(title).Append(" · Mittelwerte\n");
         sb.Append(Rule).Append('\n');
@@ -726,13 +726,13 @@ public class DebugHud : IRenderer
         {
             // The one comparison that settles CPU-bound vs GPU-bound: gpu >= cpu frame time
             // means the GPU is the wall and CPU work cannot move the framerate.
-            double gpu = GpuFrameTimer.GpuMs;
+            var gpu = GpuFrameTimer.GpuMs;
             Row(sb, "gpu-frame", Pct(gpu, frame), Ms(gpu), gpu >= frame * 0.95 ? "GPU-LIMITIERT" : null);
         }
         Row(sb, "schlechtester", null, Ms(FrameStats.MaxFrameMs));
         // where the worst frame actually went - a hitch's cause is invisible in the smoothed
         // averages precisely because it is rare
-        string worst = WorstFrameTail();
+        var worst = WorstFrameTail();
         if (worst != null) Row(sb, "  davon", null, null, worst);
         // Every frame over the hitch threshold, attributed and split by camera movement -
         // the row that turns "es ruckelt beim drehen" into a countable statement.
@@ -740,7 +740,7 @@ public class DebugHud : IRenderer
         {
             Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
                 HitchLog.PerMinute.ToString("F1", ci) + "/min, " + HitchLog.CommandHint);
-            string lastHitch = HitchLog.LastTail();
+            var lastHitch = HitchLog.LastTail();
             if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
         }
 
@@ -789,8 +789,8 @@ public class DebugHud : IRenderer
         // was exactly the unmeasured one.
         if (FrameStats.AllocMbPerSecond >= 32)
         {
-            double tessAlloc = TesselationStats.AllocMbPerSecond;
-            double unattributed = Math.Max(0.0,
+            var tessAlloc = TesselationStats.AllocMbPerSecond;
+            var unattributed = Math.Max(0.0,
                 FrameStats.AllocMbPerSecond - FrameStats.MainAllocMbPerSecond
                 - FrameStats.NetAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond - tessAlloc);
             Row(sb, "alloc-quellen", "MB/s", null,
@@ -873,7 +873,7 @@ public class DebugHud : IRenderer
         // A raster still painting owns surface and ctx. Waiting a moment is fine here (world
         // leave, not a frame); if it is genuinely hung, leak both to the finaliser rather
         // than dispose them under the worker's brush.
-        bool rasterDone = true;
+        var rasterDone = true;
         try { rasterDone = rasterTask?.Wait(500) ?? true; } catch { /* faulted counts as done */ }
         rasterTask = null;
 

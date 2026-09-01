@@ -4,6 +4,11 @@ using Vintagestory.API.Common;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>

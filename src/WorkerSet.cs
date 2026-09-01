@@ -144,12 +144,12 @@ public sealed class WorkerSet
 
             var t = new Thread[workers];
             var g = new ManualResetEventSlim[workers];
-            for (int i = 0; i < workers; i++) g[i] = new ManualResetEventSlim(false, 200);
+            for (var i = 0; i < workers; i++) g[i] = new ManualResetEventSlim(false, 200);
             gates = g;
 
-            for (int i = 0; i < workers; i++)
+            for (var i = 0; i < workers; i++)
             {
-                int index = i;
+                var index = i;
                 t[i] = new Thread(() => Loop(index))
                 {
                     IsBackground = true,
@@ -166,8 +166,8 @@ public sealed class WorkerSet
         lock (startLock)
         {
             shutdown = true;
-            ManualResetEventSlim[] g = gates;
-            if (g != null) for (int i = 0; i < g.Length; i++) g[i].Set();
+            var g = gates;
+            if (g != null) for (var i = 0; i < g.Length; i++) g[i].Set();
             threads = null;
         }
     }
@@ -195,7 +195,7 @@ public sealed class WorkerSet
         if (itemCount <= 0) return;
         if (chunkSize < 1) chunkSize = 1;
 
-        Thread[] t = threads;
+        var t = threads;
         if (t == null || t.Length == 0 || itemCount <= chunkSize)
         {
             StatInline++;
@@ -227,8 +227,8 @@ public sealed class WorkerSet
         // wake observes all of the above
         body = work;
 
-        ManualResetEventSlim[] g = gates;
-        for (int i = 0; i < t.Length; i++) g[i].Set();
+        var g = gates;
+        for (var i = 0; i < t.Length; i++) g[i].Set();
 
         // The caller is a worker too - it would otherwise sit idle through its own batch, and
         // on a small batch it can finish the whole thing before the first helper even wakes.
@@ -246,11 +246,11 @@ public sealed class WorkerSet
         // this never fires. Leaving while a slice is unfinished would let the caller reuse the
         // batch buffers under a helper that is still reading them - so the wait is not
         // optional, but it also never outlasts the work itself.
-        long t0 = Stopwatch.GetTimestamp();
+        var t0 = Stopwatch.GetTimestamp();
         allDone.Wait();
         StatWaitTicks += Stopwatch.GetTimestamp() - t0;
 
-        Exception failed = failure;
+        var failed = failure;
         if (failed != null) throw new InvalidOperationException("parallel work item failed", failed);
     }
 
@@ -273,9 +273,9 @@ public sealed class WorkerSet
         int n = count, c = chunk;
         while (true)
         {
-            int from = Interlocked.Add(ref nextIndex, c) - c;
+            var from = Interlocked.Add(ref nextIndex, c) - c;
             if (from >= n) return;
-            int to = from + c;
+            var to = from + c;
             if (to > n) to = n;
             // The item count advances even when the slice throws (the exception still
             // propagates): a claimed slice that never counted would leave the caller waiting
@@ -302,9 +302,9 @@ public sealed class WorkerSet
         int n = count, c = chunk;
         while (true)
         {
-            int from = Interlocked.Add(ref nextIndex, c) - c;
+            var from = Interlocked.Add(ref nextIndex, c) - c;
             if (from >= n) return;
-            int to = from + c;
+            var to = from + c;
             if (to > n) to = n;
             if (Interlocked.Add(ref itemsDone, to - from) == n) allDone.Set();
         }
@@ -313,7 +313,7 @@ public sealed class WorkerSet
     private void Loop(int index)
     {
         LowerOwnPriority();
-        ManualResetEventSlim gate = gates[index];
+        var gate = gates[index];
         while (true)
         {
             gate.Wait();
@@ -353,10 +353,10 @@ public sealed class WorkerSet
     /// </summary>
     public static int AutoThreads(int share)
     {
-        int cores = Environment.ProcessorCount;
+        var cores = Environment.ProcessorCount;
         // SMT is not detectable portably; assuming two-way on anything above four hardware
         // threads costs nothing when wrong (a few more threads than needed, all parked).
-        int physical = cores > 4 ? cores / 2 : cores;
+        var physical = cores > 4 ? cores / 2 : cores;
         return Math.Clamp(physical - share, 1, 8);
     }
 }

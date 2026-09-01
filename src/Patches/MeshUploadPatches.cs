@@ -6,6 +6,11 @@ using HarmonyLib;
 using OpenTK.Graphics.OpenGL;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -43,8 +48,8 @@ public static class MeshUploadPatches
 
     public static void Apply(Harmony harmony)
     {
-        Type platform = typeof(ClientPlatformWindows);
-        int patched = 0;
+        var platform = typeof(ClientPlatformWindows);
+        var patched = 0;
 
         patched += PatchOne(harmony, platform, "updateVAO", typeof(float[]), nameof(FloatPrefix));
         patched += PatchOne(harmony, platform, "updateVAO", typeof(int[]), nameof(IntPrefix));
@@ -52,7 +57,7 @@ public static class MeshUploadPatches
         patched += PatchOne(harmony, platform, "updateVAO", typeof(ushort[]), nameof(UShortPrefix));
         patched += PatchOne(harmony, platform, "updateVAO", typeof(byte[]), nameof(BytePrefix));
 
-        MethodInfo indices = AccessTools.Method(platform, "updateIndices",
+        var indices = AccessTools.Method(platform, "updateIndices",
             new[] { typeof(int[]), typeof(int), typeof(int), typeof(VAO), typeof(bool) });
         if (indices != null)
         {
@@ -65,7 +70,7 @@ public static class MeshUploadPatches
 
     private static int PatchOne(Harmony harmony, Type platform, string name, Type arrayType, string prefix)
     {
-        MethodInfo target = AccessTools.Method(platform, name,
+        var target = AccessTools.Method(platform, name,
             new[] { arrayType, typeof(int), typeof(int), typeof(int), typeof(nint), typeof(bool) });
         if (target == null) return 0;
         harmony.Patch(target, prefix: new HarmonyMethod(AccessTools.Method(typeof(MeshUploadPatches), prefix)));
@@ -97,9 +102,9 @@ public static class MeshUploadPatches
             return true;
         }
 
-        long bytes = (long)count * sizeof(T);
-        ref byte src = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetArrayDataReference(data));
-        ref byte dst = ref Unsafe.AsRef<byte>((byte*)vboPtr + (nint)(offset / sizeof(T)) * sizeof(T));
+        var bytes = (long)count * sizeof(T);
+        ref var src = ref Unsafe.As<T, byte>(ref MemoryMarshal.GetArrayDataReference(data));
+        ref var dst = ref Unsafe.AsRef<byte>((byte*)vboPtr + (nint)(offset / sizeof(T)) * sizeof(T));
         Unsafe.CopyBlockUnaligned(ref dst, ref src, (uint)bytes);
 
         StatBulkCalls++;
@@ -141,9 +146,9 @@ public static class MeshUploadPatches
 
         if (IndicesCount > 0)
         {
-            long bytes = (long)IndicesCount * sizeof(int);
-            byte* dst = (byte*)vao.indicesPtr + (nint)(IndicesOffset / sizeof(int)) * sizeof(int);
-            ref byte from = ref Unsafe.As<int, byte>(ref MemoryMarshal.GetArrayDataReference(Indices));
+            var bytes = (long)IndicesCount * sizeof(int);
+            var dst = (byte*)vao.indicesPtr + (nint)(IndicesOffset / sizeof(int)) * sizeof(int);
+            ref var from = ref Unsafe.As<int, byte>(ref MemoryMarshal.GetArrayDataReference(Indices));
             Unsafe.CopyBlockUnaligned(ref Unsafe.AsRef<byte>(dst), ref from, (uint)bytes);
             StatBulkCalls++;
             StatBytesCopied += bytes;

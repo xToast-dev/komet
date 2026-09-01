@@ -62,7 +62,7 @@ public class KometServerModSystem : ModSystem
         // from servermagicnumbers.json, and whatever that file says is deliberately ignored
         // here - one source of truth, and it is komet.json. A value outside the usable range
         // is clamped rather than refused; 1 behaves exactly like vanilla.
-        int threads = Math.Clamp(config.ServerWorldgenThreads, 1, 6);
+        var threads = Math.Clamp(config.ServerWorldgenThreads, 1, 6);
         MagicNum.MaxWorldgenThreads = threads;
 
         // The ChunkServerThread already computed its extra-thread count from the file's
@@ -70,7 +70,7 @@ public class KometServerModSystem : ModSystem
         // at GameReady, so correcting the field here still takes effect.
         if (api.World is ServerMain server)
         {
-            ChunkServerThread chunkThread = ChunkThreadRef(server);
+            var chunkThread = ChunkThreadRef(server);
             if (chunkThread != null && !server.ReducedServerThreads)
                 chunkThread.additionalWorldGenThreadsCount = Math.Clamp(threads - 1, 0, 5);
         }

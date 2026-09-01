@@ -21,8 +21,8 @@ public sealed class SmoothedCounter
 
     internal void Advance(bool first, double alpha)
     {
-        long now = read();
-        long delta = now - previous;
+        var now = read();
+        var delta = now - previous;
         previous = now;
         if (delta < 0) delta = 0;
         PerFrame = first ? delta : PerFrame + (delta - PerFrame) * alpha;
@@ -60,6 +60,8 @@ public static class FrameStats
     // accumulated inside the current frame
     private static long cullTicks;
     private static long cullWaitTicks;
+    private static long cullRebuildTicks;
+    private static int cullRebuilds;
     private static long gameTickTicks;
     private static long swapTicks;
     private static readonly long[] stageTicks = new long[StageCount];
@@ -179,22 +181,22 @@ public static class FrameStats
     /// <summary>Folds the GC counters into per-second rates. Call about once a second.</summary>
     public static void SampleGc()
     {
-        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
         int g0 = GC.CollectionCount(0), g2 = GC.CollectionCount(2);
-        double pauseMs = GC.GetTotalPauseDuration().TotalMilliseconds;
-        long alloc = GC.GetTotalAllocatedBytes(precise: false);
-        long mainAlloc = GC.GetAllocatedBytesForCurrentThread();
-        long netAlloc = System.Threading.Interlocked.Read(ref netAllocBytes);
-        long prefetchAlloc = System.Threading.Interlocked.Read(ref prefetchAllocBytes);
+        var pauseMs = GC.GetTotalPauseDuration().TotalMilliseconds;
+        var alloc = GC.GetTotalAllocatedBytes(precise: false);
+        var mainAlloc = GC.GetAllocatedBytesForCurrentThread();
+        var netAlloc = System.Threading.Interlocked.Read(ref netAllocBytes);
+        var prefetchAlloc = System.Threading.Interlocked.Read(ref prefetchAllocBytes);
 
-        TimeSpan cpuTime = Environment.CpuUsage.TotalTime;
+        var cpuTime = Environment.CpuUsage.TotalTime;
 
         if (gcSeenAt != 0)
         {
-            double dt = (now - gcSeenAt) / (double)System.Diagnostics.Stopwatch.Frequency;
+            var dt = (now - gcSeenAt) / (double)System.Diagnostics.Stopwatch.Frequency;
             if (dt > 0.2)
             {
-                double a = 0.4; // fast enough to catch an underwater excursion while it lasts
+                var a = 0.4; // fast enough to catch an underwater excursion while it lasts
                 Gen0PerSecond += ((g0 - seenGen0) / dt - Gen0PerSecond) * a;
                 Gen2PerSecond += ((g2 - seenGen2) / dt - Gen2PerSecond) * a;
                 GcPauseMsPerSecond += ((pauseMs - seenPauseMs) / dt - GcPauseMsPerSecond) * a;
@@ -254,7 +256,7 @@ public static class FrameStats
     private static void SnapshotWorstFrame(double frameMs, double gcPauseMs)
     {
         double staged = 0;
-        for (int i = 0; i < StageCount; i++)
+        for (var i = 0; i < StageCount; i++)
         {
             pendingStageMs[i] = stageTicks[i] * TicksToMs;
             staged += pendingStageMs[i];
@@ -302,6 +304,15 @@ public static class FrameStats
     /// distinction that took two wrong diagnoses to start measuring.
     /// </summary>
     public static void AddCullWaitTicks(long ticks) => cullWaitTicks += ticks;
+
+    /// <summary>Stopwatch ticks the sweep spent rebuilding pool caches this frame, and how many
+    /// pools it rebuilt - the hitch log's answer to "was the long sweep sweeping or rebuilding".
+    /// Reported by the optimising mod after each cull; never called in the baseline.</summary>
+    public static void AddCullRebuild(long ticks, int pools)
+    {
+        cullRebuildTicks += ticks;
+        cullRebuilds += pools;
+    }
     public static void AddGameTickTicks(long ticks) => gameTickTicks += ticks;
     public static void AddSwapTicks(long ticks) => swapTicks += ticks;
     public static void AddUploadMs(double ms) => uploadMsThisFrame += ms;
@@ -341,12 +352,12 @@ public static class FrameStats
     {
         if (prevFrameTs != 0)
         {
-            bool first = TotalFrames == 0;
+            var first = TotalFrames == 0;
             TotalFrames++;
 
-            double frameMs = (now - prevFrameTs) * TicksToMs;
-            double cullMs = cullTicks * TicksToMs;
-            double gcPauseMs = prevGcPauseMs > 0 ? Math.Max(0, gcPauseTotalMs - prevGcPauseMs) : 0;
+            var frameMs = (now - prevFrameTs) * TicksToMs;
+            var cullMs = cullTicks * TicksToMs;
+            var gcPauseMs = prevGcPauseMs > 0 ? Math.Max(0, gcPauseTotalMs - prevGcPauseMs) : 0;
 
             AvgFrameMs = Blend(AvgFrameMs, frameMs, first);
             AvgCullMs = Blend(AvgCullMs, cullMs, first);
@@ -356,10 +367,10 @@ public static class FrameStats
             LastShadowMs = StageTickSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone,
                                         EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone);
             GameTickMs = Blend(GameTickMs, gameTickTicks * TicksToMs, first);
-            for (int i = 0; i < StageCount; i++)
+            for (var i = 0; i < StageCount; i++)
                 StageMs[i] = Blend(StageMs[i], stageTicks[i] * TicksToMs, first);
 
-            for (int i = 0; i < Counters.Count; i++) Counters[i].Advance(first, Alpha);
+            for (var i = 0; i < Counters.Count; i++) Counters[i].Advance(first, Alpha);
 
             // Rolling peaks, so a single hitch does not stick to the display forever. The
             // breakdown snapshot must happen here, while this frame's buckets are still
@@ -399,10 +410,10 @@ public static class FrameStats
             if (TotalFrames > WarmupFrames)
             {
                 double stagedMs = 0;
-                for (int i = 0; i < StageCount; i++) stagedMs += stageTicks[i] * TicksToMs;
-                double tickMs = gameTickTicks * TicksToMs;
-                double swapMs = swapTicks * TicksToMs;
-                double outsideMs = Math.Max(0, frameMs - stagedMs - tickMs);
+                for (var i = 0; i < StageCount; i++) stagedMs += stageTicks[i] * TicksToMs;
+                var tickMs = gameTickTicks * TicksToMs;
+                var swapMs = swapTicks * TicksToMs;
+                var outsideMs = Math.Max(0, frameMs - stagedMs - tickMs);
 
                 hitchBuckets[HitchLog.Before] = stageTicks[(int)EnumRenderStage.Before] * TicksToMs;
                 hitchBuckets[HitchLog.Schatten] = StageTickSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone,
@@ -425,7 +436,8 @@ public static class FrameStats
 
                 HitchLog.OnFrame(frameMs, AvgFrameMs, gcPauseMs, hitchBuckets, gcTag,
                                  cullMs, uploadMsThisFrame, cullWaitTicks * TicksToMs,
-                                 hudMsThisFrame, entityTessMsThisFrame);
+                                 hudMsThisFrame, entityTessMsThisFrame,
+                                 cullRebuildTicks * TicksToMs, cullRebuilds);
 
                 // The finished frame's totals for anyone steering off them (the upload
                 // budget's frame-pressure input). Same warmup gate as the hitch log: the
@@ -437,11 +449,13 @@ public static class FrameStats
         }
         else
         {
-            for (int i = 0; i < Counters.Count; i++) Counters[i].Rebase();
+            for (var i = 0; i < Counters.Count; i++) Counters[i].Rebase();
         }
 
         cullTicks = 0;
         cullWaitTicks = 0;
+        cullRebuildTicks = 0;
+        cullRebuilds = 0;
         gameTickTicks = 0;
         swapTicks = 0;
         uploadMsThisFrame = 0;
@@ -472,7 +486,7 @@ public static class FrameStats
         get
         {
             double staged = 0;
-            for (int i = 0; i < StageCount; i++) staged += StageMs[i];
+            for (var i = 0; i < StageCount; i++) staged += StageMs[i];
             return AvgFrameMs - staged - GameTickMs;
         }
     }
@@ -503,7 +517,8 @@ public static class FrameStats
         prevFrameTs = 0;
         prevGcPauseMs = 0;
         prevGen0 = prevGen1 = prevGen2 = -1;
-        cullTicks = cullWaitTicks = gameTickTicks = swapTicks = 0;
+        cullTicks = cullWaitTicks = cullRebuildTicks = gameTickTicks = swapTicks = 0;
+        cullRebuilds = 0;
         uploadMsThisFrame = 0;
         hudMsThisFrame = 0;
         entityTessMsThisFrame = 0;
@@ -517,6 +532,6 @@ public static class FrameStats
         WorstGameTickMs = WorstUploadMs = WorstGcPauseMs = WorstOutsideMs = WorstSwapMs = 0;
         AvgFrameMs = MaxFrameMs = AvgCullMs = MaxCullMs = AvgUploadMs = MaxUploadMs = GameTickMs = AvgSwapMs = 0;
         LastSwapMs = LastShadowMs = 0;
-        for (int i = 0; i < Counters.Count; i++) Counters[i].Rebase();
+        for (var i = 0; i < Counters.Count; i++) Counters[i].Rebase();
     }
 }

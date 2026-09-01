@@ -133,18 +133,18 @@ public static class WindowPrebuilder
     /// <summary>ldarg*, castclass on the receiver, call, ret - visibility checks skipped.</summary>
     private static TDel Emit<TDel>(MethodInfo target) where TDel : Delegate
     {
-        MethodInfo invoke = typeof(TDel).GetMethod("Invoke");
-        ParameterInfo[] pars = invoke.GetParameters();
-        Type[] argTypes = new Type[pars.Length];
-        for (int i = 0; i < pars.Length; i++) argTypes[i] = pars[i].ParameterType;
+        var invoke = typeof(TDel).GetMethod("Invoke");
+        var pars = invoke.GetParameters();
+        var argTypes = new Type[pars.Length];
+        for (var i = 0; i < pars.Length; i++) argTypes[i] = pars[i].ParameterType;
 
         var dm = new DynamicMethod("komet_" + target.Name, invoke.ReturnType, argTypes,
                                    typeof(WindowPrebuilder).Module, skipVisibility: true);
-        ILGenerator il = dm.GetILGenerator();
+        var il = dm.GetILGenerator();
         il.Emit(OpCodes.Ldarg_0);
         if (!target.IsStatic && argTypes[0] == typeof(object))
             il.Emit(OpCodes.Castclass, target.DeclaringType);
-        for (int i = 1; i < argTypes.Length; i++) il.Emit(OpCodes.Ldarg, i);
+        for (var i = 1; i < argTypes.Length; i++) il.Emit(OpCodes.Ldarg, i);
         il.Emit(OpCodes.Call, target);
         il.Emit(OpCodes.Ret);
         return (TDel)dm.CreateDelegate(typeof(TDel));
@@ -160,8 +160,8 @@ public static class WindowPrebuilder
             || ClientQueues.DirtyLock == null || ClientQueues.DirtyPrioLock == null)
             throw new InvalidOperationException("ChunkTesselator/ClientMain internals not found");
 
-        Type dataType = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientChunkData")
-                        ?? throw new InvalidOperationException("ClientChunkData not found");
+        var dataType = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientChunkData")
+                       ?? throw new InvalidOperationException("ClientChunkData not found");
         blocksLayerField = AccessTools.Field(dataType, "blocksLayer")
                            ?? throw new InvalidOperationException("blocksLayer not found");
 
@@ -194,14 +194,14 @@ public static class WindowPrebuilder
     internal static int[] BuildCenterPlan(bool skipChunkCenter)
     {
         var plan = new List<int>(skipChunkCenter ? 32 * 32 * 3 * 2 : 32 * 32 * 3);
-        int src = 0;
+        var src = 0;
         const int dstBase = (1 * WindowDim + 1) * WindowDim; // 1190: window cell (y=1, z=1, x=0)
 
-        for (int i = 0; i < 32; i++)
+        for (var i = 0; i < 32; i++)
         {
-            for (int j = 0; j < 32; j++)
+            for (var j = 0; j < 32; j++)
             {
-                int dst = (i * WindowDim + j) * WindowDim + dstBase;
+                var dst = (i * WindowDim + j) * WindowDim + dstBase;
                 if (!skipChunkCenter || (i + 2) % 32 <= 3 || (j + 2) % 32 <= 3)
                 {
                     plan.Add(dst); plan.Add(src); plan.Add(src + 32);
@@ -231,16 +231,16 @@ public static class WindowPrebuilder
     internal static int[] BuildBorderPlan()
     {
         var plan = new List<int>(WindowDim * WindowDim * 4 * 3);
-        int dst = -1;
+        var dst = -1;
 
-        for (int m = 0; m < WindowDim; m++)          // window y
+        for (var m = 0; m < WindowDim; m++)          // window y
         {
-            for (int n = 0; n < WindowDim; n++)      // window z
+            for (var n = 0; n < WindowDim; n++)      // window z
             {
-                int dy = m == 0 ? 0 : m == WindowDim - 1 ? 2 : 1;
-                int dz = n == 0 ? 0 : n == WindowDim - 1 ? 2 : 1;
-                int srcRow = (((m - 1) & 0x1F) * 32 + ((n - 1) & 0x1F)) * 32;
-                int chunk = dy * 3 + dz;             // dx = -1 layer
+                var dy = m == 0 ? 0 : m == WindowDim - 1 ? 2 : 1;
+                var dz = n == 0 ? 0 : n == WindowDim - 1 ? 2 : 1;
+                var srcRow = (((m - 1) & 0x1F) * 32 + ((n - 1) & 0x1F)) * 32;
+                var chunk = dy * 3 + dz;             // dx = -1 layer
 
                 plan.Add(OpOne); plan.Add(chunk); plan.Add(srcRow + 31); plan.Add(++dst);
 
@@ -288,7 +288,7 @@ public static class WindowPrebuilder
     /// </summary>
     internal static bool NeighbourhoodUnchanged(long[] keys, long builtAt)
     {
-        for (int i = 0; i < keys.Length; i++)
+        for (var i = 0; i < keys.Length; i++)
             if (ChunkMarkClock.LastMark(keys[i]) >= builtAt) return false;
         return true;
     }
@@ -340,7 +340,7 @@ public static class WindowPrebuilder
     {
         if (ReferenceEquals(tess, t) && ReferenceEquals(game, GameRef(t))) return true;
 
-        Block[] engineArr = BlocksExtRef(t);
+        var engineArr = BlocksExtRef(t);
         if (engineArr == null || engineArr.Length != WindowCells)
         {
             // a different chunk size than the plans were built for - stand down entirely
@@ -386,8 +386,8 @@ public static class WindowPrebuilder
         // consumed either way from here on - a stale or validated window must not linger
         ready = false;
 
-        bool refsMatch = true;
-        for (int i = 0; i < 27 && refsMatch; i++)
+        var refsMatch = true;
+        for (var i = 0; i < 27 && refsMatch; i++)
             refsMatch = ReferenceEquals(((IWorldChunk)snapChunks[i]).Data, snapDatas[i]);
 
         if (!WindowIsCurrent(builtAt, Volatile.Read(ref lastRelightAt), refsMatch)
@@ -446,12 +446,12 @@ public static class WindowPrebuilder
     /// </summary>
     private static void CompareAgainstVanilla(ChunkTesselator t)
     {
-        Block[] vb = BlocksExtRef(t); Block[] vf = FluidsExtRef(t); int[] vr = RgbsExtRef(t);
-        for (int i = 0; i < WindowCells; i++)
+        var vb = BlocksExtRef(t); var vf = FluidsExtRef(t); var vr = RgbsExtRef(t);
+        for (var i = 0; i < WindowCells; i++)
         {
             if (!ReferenceEquals(vb[i], blocksExt[i]) || !ReferenceEquals(vf[i], fluidsExt[i]) || vr[i] != rgbsExt[i])
             {
-                bool disable = NoteMismatch();
+                var disable = NoteMismatch();
                 Log?.Invoke($"window prebuild validation mismatch {StatValidationMismatches}/{MismatchHardLimit} at cell {i} "
                     + $"(blocks {!ReferenceEquals(vb[i], blocksExt[i])}, fluids {!ReferenceEquals(vf[i], fluidsExt[i])}, "
                     + $"rgb {vr[i] != rgbsExt[i]}) - window discarded, vanilla build used"
@@ -479,22 +479,22 @@ public static class WindowPrebuilder
     /// <summary>Peeks the front of the tesselation queue - the chunk the thread pops next.</summary>
     private static void RequestNext()
     {
-        ClientMain g = game;
+        var g = game;
         if (g == null) return;
 
-        long key = long.MinValue;
-        UniqueQueue<long> prio = ClientQueues.DirtyPrio(g);
-        object prioLock = ClientQueues.DirtyPrioLock(g);
+        var key = long.MinValue;
+        var prio = ClientQueues.DirtyPrio(g);
+        var prioLock = ClientQueues.DirtyPrioLock(g);
         if (prio != null && prioLock != null && prio.Count > 0)
         {
-            lock (prioLock) { foreach (long k in prio) { key = k; break; } }
+            lock (prioLock) { foreach (var k in prio) { key = k; break; } }
         }
         if (key == long.MinValue)
         {
-            UniqueQueue<long> dirty = ClientQueues.Dirty(g);
-            object dirtyLock = ClientQueues.DirtyLock(g);
+            var dirty = ClientQueues.Dirty(g);
+            var dirtyLock = ClientQueues.DirtyLock(g);
             if (dirty == null || dirtyLock == null || dirty.Count == 0) return;
-            lock (dirtyLock) { foreach (long k in dirty) { key = k; break; } }
+            lock (dirtyLock) { foreach (var k in dirty) { key = k; break; } }
         }
         if (key == long.MinValue || (key & 0x7FFFFFFFFFFFFFFFL) >= ExtraDimensionsStart) return;
 
@@ -525,11 +525,11 @@ public static class WindowPrebuilder
                     gen = reqGen;
                 }
 
-                ClientMain g = game;
-                ClientWorldMap map = g?.WorldMap;
+                var g = game;
+                var map = g?.WorldMap;
                 if (g == null || g.disposed || map == null) continue;
 
-                bool skip = key < 0;
+                var skip = key < 0;
                 MapUtil.PosInt3d(key & 0x7FFFFFFFFFFFFFFFL, map.index3dMulX, map.index3dMulZ, pos);
 
                 lock (BuildLock)
@@ -554,40 +554,40 @@ public static class WindowPrebuilder
     private static void BuildWindow(ClientWorldMap map, int cx, int cy, int cz, bool skipChunkCenter)
     {
         ready = false;
-        long startedAt = Stopwatch.GetTimestamp();
+        var startedAt = Stopwatch.GetTimestamp();
 
         getNeighbours(map, hood, cx, cy, cz);        // locks chunksLock internally
         if (hood[13] == null || hood[13].Empty) return;
 
-        int blockCount = game.Blocks.Count;
-        for (int i = 26; i >= 0; i--)
+        var blockCount = game.Blocks.Count;
+        for (var i = 26; i >= 0; i--)
         {
             hood[i].Unpack();                        // idempotent under the chunk's own lock
             object data = ((IWorldChunk)hood[i]).Data;
             datas[i] = data;
-            object layer = blocksLayerField.GetValue(data);
+            var layer = blocksLayerField.GetValue(data);
             if (layer != null) clearPalette(layer, blockCount);
         }
 
-        Block[] blocksFast = BlocksFastRef(tess);    // id -> Block, filled once at startup
-        ColorUtil.LightUtil conv = LightConvRef(tess);
+        var blocksFast = BlocksFastRef(tess);    // id -> Block, filled once at startup
+        var conv = LightConvRef(tess);
         buildFastAccess(datas[13], blocksFast);      // writes the static palette table (under BuildLock)
 
-        int[] centerPlan = skipChunkCenter ? CenterPlanSkip : CenterPlanFull;
-        object center = datas[13];
-        for (int p = 0; p < centerPlan.Length; p += 3)
+        var centerPlan = skipChunkCenter ? CenterPlanSkip : CenterPlanFull;
+        var center = datas[13];
+        for (var p = 0; p < centerPlan.Length; p += 3)
             getRangeFaster(center, blocksExt, fluidsExt, rgbsExt,
                 centerPlan[p], centerPlan[p + 1], centerPlan[p + 2], blocksFast, conv);
 
-        int[] border = BorderPlan;
-        for (int p = 0; p < border.Length; p += 4)
+        var border = BorderPlan;
+        for (var p = 0; p < border.Length; p += 4)
         {
-            object data = datas[border[p + 1]];
-            int src = border[p + 2];
-            int dst = border[p + 3];
+            var data = datas[border[p + 1]];
+            var src = border[p + 2];
+            var dst = border[p + 3];
             if (border[p] == OpOne)
             {
-                int id = getOne(data, out ushort light, out int lightSat, out int fluidId, src);
+                var id = getOne(data, out var light, out var lightSat, out var fluidId, src);
                 blocksExt[dst] = blocksFast[id];
                 fluidsExt[dst] = blocksFast[fluidId];
                 rgbsExt[dst] = conv.ToRgba(light, lightSat);
@@ -598,11 +598,11 @@ public static class WindowPrebuilder
             }
         }
 
-        Block air = blocksFast[0];
-        for (int i = 0; i < WindowCells; i++)
+        var air = blocksFast[0];
+        for (var i = 0; i < WindowCells; i++)
             if (blocksExt[i] == null) blocksExt[i] = air;
 
-        for (int i = 0; i < 27; i++)
+        for (var i = 0; i < 27; i++)
         {
             snapChunks[i] = hood[i];
             snapDatas[i] = datas[i];
@@ -613,10 +613,10 @@ public static class WindowPrebuilder
         // The 27 keys this window was built from, so TryUse can ask whether any of them was
         // marked dirty since - the guard that a Data reference compare cannot provide.
         int mulX = MapMulXRef(map), mulZ = MapMulZRef(map);
-        int k = 0;
-        for (int dy = -1; dy <= 1; dy++)
-            for (int dz = -1; dz <= 1; dz++)
-                for (int dx = -1; dx <= 1; dx++)
+        var k = 0;
+        for (var dy = -1; dy <= 1; dy++)
+            for (var dz = -1; dz <= 1; dz++)
+                for (var dx = -1; dx <= 1; dx++)
                     snapKeys[k++] = ChunkMarkClock.Key(cx + dx, cy + dy, cz + dz, mulX, mulZ);
 
         readyCx = cx; readyCy = cy; readyCz = cz;

@@ -5,6 +5,11 @@ using System.Text;
 using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -111,15 +116,15 @@ public static class RendererProfiler
         }
 
         int total = 0, wrapped = 0;
-        for (int stage = first; stage <= last; stage++)
+        for (var stage = first; stage <= last; stage++)
         {
-            List<RenderHandler> list = manager.renderersByStage[stage];
+            var list = manager.renderersByStage[stage];
             if (list == null) continue;
 
-            int wrappedHere = 0;
-            for (int i = 0; i < list.Count; i++)
+            var wrappedHere = 0;
+            for (var i = 0; i < list.Count; i++)
             {
-                RenderHandler handler = list[i];
+                var handler = list[i];
                 if (handler?.Renderer == null) continue;
                 total++;
                 if (handler.Renderer is Timed) { wrapped++; wrappedHere++; continue; }
@@ -152,10 +157,10 @@ public static class RendererProfiler
     /// </summary>
     public static void ApplyUnregisterFix(HarmonyLib.Harmony harmony)
     {
-        System.Reflection.MethodInfo unreg = HarmonyLib.AccessTools.Method(typeof(ClientEventManager),
-                nameof(ClientEventManager.UnregisterRenderer),
-                [typeof(IRenderer), typeof(EnumRenderStage)])
-            ?? throw new InvalidOperationException("ClientEventManager.UnregisterRenderer not found");
+        var unreg = HarmonyLib.AccessTools.Method(typeof(ClientEventManager),
+                        nameof(ClientEventManager.UnregisterRenderer),
+                        [typeof(IRenderer), typeof(EnumRenderStage)])
+                    ?? throw new InvalidOperationException("ClientEventManager.UnregisterRenderer not found");
 
         harmony.Patch(unreg, prefix: new HarmonyLib.HarmonyMethod(
             typeof(RendererProfiler).GetMethod(nameof(ResolveWrapper))));
@@ -177,10 +182,10 @@ public static class RendererProfiler
         // linear scan of its thousands-long Opaque list.
         if ((int)stage < wrappedByStage.Length && wrappedByStage[(int)stage] == 0) return;
 
-        List<RenderHandler> list = __instance.renderersByStage?[(int)stage];
+        var list = __instance.renderersByStage?[(int)stage];
         if (list == null) return;
 
-        for (int i = 0; i < list.Count; i++)
+        for (var i = 0; i < list.Count; i++)
         {
             if (list[i]?.Renderer is Timed timed && ReferenceEquals(timed.Inner, handler))
             {
@@ -200,20 +205,20 @@ public static class RendererProfiler
         Enabled = false;
         if (manager?.renderersByStage == null) return;
 
-        int kept = 0;
-        for (int stage = 0; stage < manager.renderersByStage.Length; stage++)
+        var kept = 0;
+        for (var stage = 0; stage < manager.renderersByStage.Length; stage++)
         {
-            List<RenderHandler> list = manager.renderersByStage[stage];
+            var list = manager.renderersByStage[stage];
             if (list == null) continue;
             if (keepBeforeAttribution && stage == (int)EnumRenderStage.Before)
             {
                 // the always-on attribution survives a profiler toggle-off; only the full
                 // teardown (world leave) takes these out too
-                for (int i = 0; i < list.Count; i++)
+                for (var i = 0; i < list.Count; i++)
                     if (list[i]?.Renderer is Timed) kept++;
                 continue;
             }
-            for (int i = 0; i < list.Count; i++)
+            for (var i = 0; i < list.Count; i++)
                 if (list[i]?.Renderer is Timed timed) list[i].Renderer = timed.Inner;
             if (stage < wrappedByStage.Length) wrappedByStage[stage] = 0;
         }
@@ -260,7 +265,7 @@ public static class RendererProfiler
                 return;
             }
 
-            long t0 = Stopwatch.GetTimestamp();
+            var t0 = Stopwatch.GetTimestamp();
             Inner.OnRenderFrame(dt, renderStage);
             entry.Ticks += Stopwatch.GetTimestamp() - t0;
         }
@@ -275,7 +280,7 @@ public static class RendererProfiler
     private static Entry Bucket(string name, EnumRenderStage stage)
     {
         name ??= "?";
-        if (!Entries.TryGetValue(name, out Entry e))
+        if (!Entries.TryGetValue(name, out var e))
             Entries[name] = e = new Entry { Stage = stage, EveryFrame = stage == EnumRenderStage.Before };
         return e;
     }
@@ -287,14 +292,14 @@ public static class RendererProfiler
     /// </summary>
     public static void EndFrame()
     {
-        foreach (KeyValuePair<string, Entry> kv in Entries)
+        foreach (var kv in Entries)
         {
-            Entry e = kv.Value;
+            var e = kv.Value;
             // sampled buckets fold only on measured frames (an unmeasured frame has no
             // ticks, and folding its zero in would drag the average towards nothing);
             // every-frame buckets have real ticks every frame and fold every frame
             if (!measuringThisFrame && !e.EveryFrame) continue;
-            double ms = e.Ticks * TicksToMs;
+            var ms = e.Ticks * TicksToMs;
             e.Ms += (ms - e.Ms) * Alpha;
             e.Ticks = 0;
         }
@@ -312,7 +317,7 @@ public static class RendererProfiler
     {
         string bestName = null;
         long bestTicks = 0;
-        foreach (KeyValuePair<string, Entry> kv in Entries)
+        foreach (var kv in Entries)
         {
             if (kv.Value.Ticks > bestTicks)
             {
@@ -339,7 +344,7 @@ public static class RendererProfiler
         get
         {
             double sum = 0;
-            foreach (KeyValuePair<string, Entry> kv in Entries) sum += kv.Value.Ms;
+            foreach (var kv in Entries) sum += kv.Value.Ms;
             return sum;
         }
     }
@@ -348,7 +353,7 @@ public static class RendererProfiler
     public static List<(string name, EnumRenderStage stage, double ms)> Top(int count)
     {
         var all = new List<(string, EnumRenderStage, double)>(Entries.Count);
-        foreach (KeyValuePair<string, Entry> kv in Entries)
+        foreach (var kv in Entries)
             if (kv.Value.Ms > 0.005) all.Add((kv.Key, kv.Value.Stage, kv.Value.Ms));
 
         all.Sort((a, b) => b.Item3.CompareTo(a.Item3));
@@ -358,7 +363,7 @@ public static class RendererProfiler
 
     public static void Write(StringBuilder sb, int count)
     {
-        List<(string name, EnumRenderStage stage, double ms)> top = Top(count);
+        var top = Top(count);
         if (top.Count == 0)
         {
             // An empty section is indistinguishable from a broken one - which is exactly how
@@ -367,15 +372,15 @@ public static class RendererProfiler
             return;
         }
 
-        foreach ((string name, EnumRenderStage stage, double ms) in top)
+        foreach ((var name, var stage, var ms) in top)
         {
-            string label = name.Length > 13 ? name.Substring(0, 13) : name;
+            var label = name.Length > 13 ? name.Substring(0, 13) : name;
             Measure.DebugHud.Row(sb, label, null, Measure.DebugHud.Ms(ms), stage.ToString().ToLowerInvariant());
         }
     }
 
     public static void Reset()
     {
-        foreach (KeyValuePair<string, Entry> kv in Entries) { kv.Value.Ticks = 0; kv.Value.Ms = 0; }
+        foreach (var kv in Entries) { kv.Value.Ticks = 0; kv.Value.Ms = 0; }
     }
 }

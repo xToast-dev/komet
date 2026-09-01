@@ -66,8 +66,8 @@ public static class FastChunkCuller
 
         public void Run(int from, int to)
         {
-            GridSink sink = Template;
-            for (int i = from; i < to; i++) TraceThree(ref sink, Shell[i], FromX, FromY, FromZ, AboveHeightLimit);
+            var sink = Template;
+            for (var i = from; i < to; i++) TraceThree(ref sink, Shell[i], FromX, FromY, FromZ, AboveHeightLimit);
         }
     }
 
@@ -141,7 +141,7 @@ public static class FastChunkCuller
             int gx = cx - MinX, gy = cy - MinY, gz = cz - MinZ;
             if ((uint)gx >= (uint)SizeX || (uint)gy >= (uint)SizeY || (uint)gz >= (uint)SizeZ) return true;
 
-            ClientChunk c = Grid[(gy * SizeZ + gz) * SizeX + gx];
+            var c = Grid[(gy * SizeZ + gz) * SizeX + gx];
             if (c == null) return true;
 
             c.CullVisible[BackBuf] = true;
@@ -166,8 +166,8 @@ public static class FastChunkCuller
 
         public bool Visit(int cx, int cy, int cz, int fromFace, int toFace, bool checkBlocking)
         {
-            long key = ((long)cy * MulZ + cz) * MulX + cx;
-            if (!Chunks.TryGetValue(key, out ClientChunk c) || c == null) return true;
+            var key = ((long)cy * MulZ + cz) * MulX + cx;
+            if (!Chunks.TryGetValue(key, out var c) || c == null) return true;
 
             c.CullVisible[BackBuf] = true;
             if (!checkBlocking) return true;
@@ -182,36 +182,36 @@ public static class FastChunkCuller
     {
         if (!Enabled) return true;
 
-        ClientMain game = GameRef(self);
-        ClientWorldMap map = game?.WorldMap;
+        var game = GameRef(self);
+        var map = game?.WorldMap;
         if (game == null || map == null) return true;
 
-        Dictionary<long, ClientChunk> chunks = ChunksRef(map);
-        object chunksLock = ChunksLockRef(map);
+        var chunks = ChunksRef(map);
+        var chunksLock = ChunksLockRef(map);
         if (chunks == null || chunksLock == null) return true;
 
         // The "occlusion culling is off" path marks everything visible and then does nothing
         // on later calls. It is cheap and rarely taken; leave it to vanilla.
         if (!ClientSettings.Occlusionculling || chunks.Count < 100) return true;
 
-        Vec3i[] shell = ShellRef(self);
+        var shell = ShellRef(self);
         if (shell == null || shell.Length == 0) return true;
 
         // everything below mutates culler state, so bail out before that point if the world
         // is not fully up yet
-        Vec3i centerpos = CenterRef(self);
+        var centerpos = CenterRef(self);
         if (game.player?.Entity == null || centerpos == null || game.chunkPositionsForRegenTrav == null) return true;
 
         NowOffRef(self) = false;
 
-        Vec3d cameraPos = game.player.Entity.CameraPos;
-        bool samePosition = centerpos.Equals((int)cameraPos.X / 32, (int)cameraPos.Y / 32, (int)cameraPos.Z / 32);
+        var cameraPos = game.player.Entity.CameraPos;
+        var samePosition = centerpos.Equals((int)cameraPos.X / 32, (int)cameraPos.Y / 32, (int)cameraPos.Z / 32);
         if (samePosition && Math.Abs(game.chunkPositionsForRegenTrav.Count - QCountRef(self)) < 10)
         {
             return false; // nothing moved enough to be worth redoing
         }
 
-        long startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        var startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
 
         // A teleport-sized jump opens a burst window in which the rate limit below stands
         // down. Right after arriving somewhere unvisited, the world assembles from nothing:
@@ -234,7 +234,7 @@ public static class FastChunkCuller
         // chunks per second that caused the re-runs in the first place.
         if (RateLimitApplies(samePosition, MinIntervalMs, startTicks, burstUntilTicks))
         {
-            double interval = Math.Max(MinIntervalMs, StatLastMs * 5.0);
+            var interval = Math.Max(MinIntervalMs, StatLastMs * 5.0);
             if ((startTicks - lastPassTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency < interval)
             {
                 StatRateLimited++;
@@ -245,29 +245,29 @@ public static class FastChunkCuller
 
         QCountRef(self) = game.chunkPositionsForRegenTrav.Count;
         centerpos.Set((int)(cameraPos.X / 32.0), (int)(cameraPos.Y / 32.0), (int)(cameraPos.Z / 32.0));
-        bool aboveHeightLimit = centerpos.Y >= map.ChunkMapSizeY;
+        var aboveHeightLimit = centerpos.Y >= map.ChunkMapSizeY;
         AboveLimitRef(self) = aboveHeightLimit;
 
-        int backBuf = (ClientChunk.bufIndex + 1) % 2;
-        int mulX = map.index3dMulX;
-        int mulZ = map.index3dMulZ;
+        var backBuf = (ClientChunk.bufIndex + 1) % 2;
+        var mulX = map.index3dMulX;
+        var mulZ = map.index3dMulZ;
 
         // ---- one pass under the lock: clear visibility and snapshot the map ----
         int count;
         lock (chunksLock)
         {
-            int n = chunks.Count;
+            var n = chunks.Count;
             if (snapKeys.Length < n)
             {
-                int cap = n + (n >> 2) + 64;
+                var cap = n + (n >> 2) + 64;
                 snapKeys = new long[cap];
                 snapChunks = new ClientChunk[cap];
             }
 
             count = 0;
-            foreach (KeyValuePair<long, ClientChunk> kv in chunks)
+            foreach (var kv in chunks)
             {
-                ClientChunk c = kv.Value;
+                var c = kv.Value;
                 c.CullVisible[backBuf] = false;
                 snapKeys[count] = kv.Key;
                 snapChunks[count] = c;
@@ -275,12 +275,12 @@ public static class FastChunkCuller
             }
 
             // the player's immediate neighbourhood is always visible
-            for (int i = -1; i <= 1; i++)
-            for (int j = -1; j <= 2; j++)
-            for (int k = -1; k <= 1; k++)
+            for (var i = -1; i <= 1; i++)
+            for (var j = -1; j <= 2; j++)
+            for (var k = -1; k <= 1; k++)
             {
-                long key = map.ChunkIndex3D(i + centerpos.X, j + centerpos.Y, k + centerpos.Z);
-                if (chunks.TryGetValue(key, out ClientChunk c)) c.CullVisible[backBuf] = true;
+                var key = map.ChunkIndex3D(i + centerpos.X, j + centerpos.Y, k + centerpos.Z);
+                if (chunks.TryGetValue(key, out var c)) c.CullVisible[backBuf] = true;
             }
         }
 
@@ -289,14 +289,14 @@ public static class FastChunkCuller
         // ---- build the flat lookup grid, outside the lock ----
         int minX = int.MaxValue, minY = int.MaxValue, minZ = int.MaxValue;
         int maxX = int.MinValue, maxY = int.MinValue, maxZ = int.MinValue;
-        for (int i = 0; i < count; i++)
+        for (var i = 0; i < count; i++)
         {
-            long key = snapKeys[i];
+            var key = snapKeys[i];
             if (key >= ExtraDimensionsStart) continue; // mini dimensions render unconditionally
-            int cx = (int)(key % mulX);
-            long rest = key / mulX;
-            int cz = (int)(rest % mulZ);
-            int cy = (int)(rest / mulZ);
+            var cx = (int)(key % mulX);
+            var rest = key / mulX;
+            var cz = (int)(rest % mulZ);
+            var cy = (int)(rest / mulZ);
             if (cy >= 1024) continue; // dimension-shifted coordinate, not a world chunk
 
             if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
@@ -312,10 +312,10 @@ public static class FastChunkCuller
             return false;
         }
 
-        long sizeX = (long)maxX - minX + 1;
-        long sizeY = (long)maxY - minY + 1;
-        long sizeZ = (long)maxZ - minZ + 1;
-        long cells = sizeX * sizeY * sizeZ;
+        var sizeX = (long)maxX - minX + 1;
+        var sizeY = (long)maxY - minY + 1;
+        var sizeZ = (long)maxZ - minZ + 1;
+        var cells = sizeX * sizeY * sizeZ;
         if (cells > MaxGridCells)
         {
             // Pathological chunk spread - a dense grid would be gigabytes. Handing back to
@@ -333,14 +333,14 @@ public static class FastChunkCuller
         else Array.Clear(grid, 0, (int)cells);
 
         int sx = (int)sizeX, sy = (int)sizeY, sz = (int)sizeZ;
-        for (int i = 0; i < count; i++)
+        for (var i = 0; i < count; i++)
         {
-            long key = snapKeys[i];
+            var key = snapKeys[i];
             if (key >= ExtraDimensionsStart) continue;
-            int cx = (int)(key % mulX);
-            long rest = key / mulX;
-            int cz = (int)(rest % mulZ);
-            int cy = (int)(rest / mulZ);
+            var cx = (int)(key % mulX);
+            var rest = key / mulX;
+            var cz = (int)(rest % mulZ);
+            var cy = (int)(rest / mulZ);
             if (cy >= 1024) continue;
             grid[((long)(cy - minY) * sz + (cz - minZ)) * sx + (cx - minX)] = snapChunks[i];
         }
@@ -363,8 +363,8 @@ public static class FastChunkCuller
 
         if (Workers.ThreadCount < 1 || shell.Length < 256)
         {
-            GridSink sink = template;
-            for (int i = 0; i < shell.Length; i++) TraceThree(ref sink, shell[i], fromX, fromY, fromZ, aboveHeightLimit);
+            var sink = template;
+            for (var i = 0; i < shell.Length; i++) TraceThree(ref sink, shell[i], fromX, fromY, fromZ, aboveHeightLimit);
         }
         else
         {
@@ -390,7 +390,7 @@ public static class FastChunkCuller
 
         Swap();
 
-        double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         StatLastMs = ms;
         if (ms > StatPeakMs) StatPeakMs = ms;
         StatPasses++;
@@ -401,12 +401,12 @@ public static class FastChunkCuller
                                           Vec3i[] shell, Vec3i centerpos, bool aboveHeightLimit)
     {
         fallbackMap.Clear();
-        for (int i = 0; i < count; i++) fallbackMap[snapKeys[i]] = snapChunks[i];
+        for (var i = 0; i < count; i++) fallbackMap[snapKeys[i]] = snapChunks[i];
 
         var sink = new SnapshotDictSink { Chunks = fallbackMap, MulX = mulX, MulZ = mulZ, BackBuf = backBuf, Map = map };
-        for (int i = 0; i < shell.Length; i++)
+        for (var i = 0; i < shell.Length; i++)
         {
-            Vec3i rel = shell[i];
+            var rel = shell[i];
             RayTraversal.Trace(ref sink, centerpos.X, centerpos.Y, centerpos.Z, rel.X, rel.Y, rel.Z, 0.5, 0.25, aboveHeightLimit);
             RayTraversal.Trace(ref sink, centerpos.X, centerpos.Y, centerpos.Z, rel.X, rel.Y, rel.Z, 0.5, 0.75, aboveHeightLimit);
             RayTraversal.Trace(ref sink, centerpos.X, centerpos.Y, centerpos.Z, rel.X, rel.Y, rel.Z, 0.0, 0.75, aboveHeightLimit);
@@ -424,9 +424,9 @@ public static class FastChunkCuller
     internal static bool IsTeleportJump(Vec3i oldCenter, int newX, int newY, int newZ)
     {
         if (oldCenter == null) return true;
-        int dx = Math.Abs(newX - oldCenter.X);
-        int dy = Math.Abs(newY - oldCenter.Y);
-        int dz = Math.Abs(newZ - oldCenter.Z);
+        var dx = Math.Abs(newX - oldCenter.X);
+        var dy = Math.Abs(newY - oldCenter.Y);
+        var dz = Math.Abs(newZ - oldCenter.Z);
         return Math.Max(dx, Math.Max(dy, dz)) >= 8;
     }
 

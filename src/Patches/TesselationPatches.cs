@@ -7,6 +7,11 @@ using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -60,10 +65,10 @@ public static class TesselationPatches
         // when the world starts dying outlives the engine's 200 ms thread-exit window by
         // seconds when thousands of chunks are queued - a guard at the tick boundary alone
         // can never catch it (it did not: the exit NRE came back with an 11k queue).
-        MethodInfo tessChunk = AccessTools.Method(typeof(ChunkTesselatorManager), "TesselateChunk",
-                                   [typeof(int), typeof(int), typeof(int), typeof(bool),
-                                    typeof(bool), typeof(bool).MakeByRefType()])
-                               ?? throw new InvalidOperationException("TesselateChunk not found");
+        var tessChunk = AccessTools.Method(typeof(ChunkTesselatorManager), "TesselateChunk",
+                        [typeof(int), typeof(int), typeof(int), typeof(bool),
+                            typeof(bool), typeof(bool).MakeByRefType()])
+                        ?? throw new InvalidOperationException("TesselateChunk not found");
         harmony.Patch(tessChunk, prefix: new HarmonyMethod(
             AccessTools.Method(typeof(TesselationPatches), nameof(TesselateChunkPrefix)))
             { priority = HarmonyLib.Priority.High });
@@ -74,17 +79,17 @@ public static class TesselationPatches
 
         if (noIdleSleep)
         {
-            MethodInfo interval = AccessTools.Method(typeof(ChunkTesselatorManager),
-                                      nameof(ChunkTesselatorManager.SeperateThreadTickIntervalMs))
-                                  ?? throw new InvalidOperationException("SeperateThreadTickIntervalMs not found");
+            var interval = AccessTools.Method(typeof(ChunkTesselatorManager),
+                               nameof(ChunkTesselatorManager.SeperateThreadTickIntervalMs))
+                           ?? throw new InvalidOperationException("SeperateThreadTickIntervalMs not found");
             harmony.Patch(interval, postfix: new HarmonyMethod(
                 AccessTools.Method(typeof(TesselationPatches), nameof(TickIntervalPostfix))));
         }
 
         if (raisePriority || prefetch)
         {
-            MethodInfo tick = AccessTools.Method(typeof(ChunkTesselatorManager), "OnSeperateThreadGameTick")
-                              ?? throw new InvalidOperationException("OnSeperateThreadGameTick not found");
+            var tick = AccessTools.Method(typeof(ChunkTesselatorManager), "OnSeperateThreadGameTick")
+                       ?? throw new InvalidOperationException("OnSeperateThreadGameTick not found");
             harmony.Patch(tick, prefix: new HarmonyMethod(
                 AccessTools.Method(typeof(TesselationPatches), nameof(TesselationTickPrefix))));
         }
@@ -129,7 +134,7 @@ public static class TesselationPatches
     {
         if (ShuttingDown) return;
         if (__result != 0) return;
-        ClientMain game = ClientQueues.GameOf(__instance);
+        var game = ClientQueues.GameOf(__instance);
         if (game == null) return;
         // racy reads of Count, and that is fine: a stale answer means one 5 ms nap too many
         // or a single extra empty tick, both harmless
@@ -215,18 +220,18 @@ public static class TesselationPatches
             {
                 try
                 {
-                    ClientMain g = game;
+                    var g = game;
                     if (g == null || g.disposed) { Thread.Sleep(50); continue; }
 
-                    int copied = Snapshot(g);
+                    var copied = Snapshot(g);
                     if (copied == 0) { Thread.Sleep(25); continue; }
 
                     // The decompression this thread does off the critical path allocates the
                     // same arrays the tesselator otherwise would - measured here so the
                     // alloc-attribution row can name this thread's share instead of leaving
                     // it in "rest".
-                    long alloc0 = GC.GetAllocatedBytesForCurrentThread();
-                    for (int i = 0; i < copied && !stop; i++) UnpackNeighbourhood(g, ahead[i]);
+                    var alloc0 = GC.GetAllocatedBytesForCurrentThread();
+                    for (var i = 0; i < copied && !stop; i++) UnpackNeighbourhood(g, ahead[i]);
                     Komet.Measure.FrameStats.AddPrefetchAllocBytes(
                         GC.GetAllocatedBytesForCurrentThread() - alloc0);
                     Thread.Sleep(2);
@@ -243,15 +248,15 @@ public static class TesselationPatches
         /// <summary>Copies the first entries of the dirty-chunk queue under its own lock.</summary>
         private static int Snapshot(ClientMain g)
         {
-            UniqueQueue<long> dirty = ClientQueues.Dirty(g);
-            object dirtyLock = ClientQueues.DirtyLock(g);
+            var dirty = ClientQueues.Dirty(g);
+            var dirtyLock = ClientQueues.DirtyLock(g);
             if (dirty == null || dirtyLock == null) return 0;
             if (dirty.Count < 2) return 0; // a queue this short is cheaper to leave alone
 
-            int n = 0;
+            var n = 0;
             lock (dirtyLock)
             {
-                foreach (long key in dirty)
+                foreach (var key in dirty)
                 {
                     ahead[n++] = key;
                     if (n >= LookAhead) break;
@@ -265,10 +270,10 @@ public static class TesselationPatches
             key &= 0x7FFFFFFFFFFFFFFFL; // the queue uses the sign bit as an edge-only flag
             if (key >= ExtraDimensionsStart) return;
 
-            ClientWorldMap map = g.WorldMap;
+            var map = g.WorldMap;
             if (map == null) return;
-            Dictionary<long, ClientChunk> chunks = ChunksRef(map);
-            object chunksLock = ChunksLockRef(map);
+            var chunks = ChunksRef(map);
+            var chunksLock = ChunksLockRef(map);
             if (chunks == null || chunksLock == null) return;
 
             int mulX = map.index3dMulX, mulZ = map.index3dMulZ;
@@ -277,21 +282,21 @@ public static class TesselationPatches
             // One lock acquisition for the whole neighbourhood, exactly like the engine's
             // GetNeighbouringChunks - 27 separate lock round trips per queue entry were a
             // measurable contribution to chunksLock contention while chunks stream in.
-            int found = 0;
+            var found = 0;
             lock (chunksLock)
             {
-                for (int dy = -1; dy <= 1; dy++)
-                for (int dz = -1; dz <= 1; dz++)
-                for (int dx = -1; dx <= 1; dx++)
+                for (var dy = -1; dy <= 1; dy++)
+                for (var dz = -1; dz <= 1; dz++)
+                for (var dx = -1; dx <= 1; dx++)
                 {
-                    long nKey = MapUtil.Index3dL(pos.X + dx, pos.Y + dy, pos.Z + dz, mulX, mulZ);
-                    if (chunks.TryGetValue(nKey, out ClientChunk c) && c != null) hood[found++] = c;
+                    var nKey = MapUtil.Index3dL(pos.X + dx, pos.Y + dy, pos.Z + dz, mulX, mulZ);
+                    if (chunks.TryGetValue(nKey, out var c) && c != null) hood[found++] = c;
                 }
             }
 
-            for (int i = 0; i < found; i++)
+            for (var i = 0; i < found; i++)
             {
-                ClientChunk c = hood[i];
+                var c = hood[i];
                 // IsPacked without the pack lock is a hint, not a truth - Unpack itself takes
                 // the lock and re-checks. All the race costs is a pointless call.
                 if (c.IsPacked())

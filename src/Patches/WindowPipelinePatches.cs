@@ -1,10 +1,13 @@
 using System;
-using System.Reflection;
 using System.Threading;
 using HarmonyLib;
-using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -35,8 +38,8 @@ public static class WindowPipelinePatches
         WindowPrebuilder.ValidateRemaining = Math.Max(0, validateFirstN);
         WindowPrebuilder.Enabled = true;
 
-        MethodInfo build = AccessTools.Method(typeof(ChunkTesselator), "BuildExtendedChunkData")
-                           ?? throw new InvalidOperationException("BuildExtendedChunkData not found");
+        var build = AccessTools.Method(typeof(ChunkTesselator), "BuildExtendedChunkData")
+                    ?? throw new InvalidOperationException("BuildExtendedChunkData not found");
 
         harmony.Patch(build,
             prefix: new HarmonyMethod(AccessTools.Method(typeof(WindowPipelinePatches), nameof(BuildPrefix)))
@@ -44,9 +47,9 @@ public static class WindowPipelinePatches
             postfix: new HarmonyMethod(AccessTools.Method(typeof(WindowPipelinePatches), nameof(BuildPostfix))),
             finalizer: new HarmonyMethod(AccessTools.Method(typeof(WindowPipelinePatches), nameof(BuildFinalizer))));
 
-        MethodInfo relight = AccessTools.Method(typeof(TerrainIlluminator), "SunRelightChunk",
-                                 [typeof(ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)])
-                             ?? throw new InvalidOperationException("SunRelightChunk not found");
+        var relight = AccessTools.Method(typeof(TerrainIlluminator), "SunRelightChunk",
+                          [typeof(ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)])
+                      ?? throw new InvalidOperationException("SunRelightChunk not found");
         harmony.Patch(relight, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(WindowPipelinePatches), nameof(RelightPostfix))));
 
@@ -54,8 +57,8 @@ public static class WindowPipelinePatches
         // chunk dirty, so both marking funnels feed a per-chunk timestamp. Without this the
         // only thing standing between a stale window and a wrongly lit chunk mesh was the
         // element-wise validation - which stops after the first N windows.
-        Type map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
-                   ?? throw new InvalidOperationException("ClientWorldMap not found");
+        var map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
+                  ?? throw new InvalidOperationException("ClientWorldMap not found");
         harmony.Patch(AccessTools.Method(map, "SetChunkDirty"),
             prefix: new HarmonyMethod(AccessTools.Method(typeof(WindowPipelinePatches), nameof(NoteSetDirty))));
         harmony.Patch(AccessTools.Method(map, "MarkChunkDirty"),

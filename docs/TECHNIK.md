@@ -812,6 +812,56 @@ genommen wurde (null Rebuilds). Gegengeprüft, indem die Überhang-Teile versuch
 gesweept wurden: dann meldet er `CullNormal: 2900 triangles vs 3200`, also genau das Bild
 fehlender Chunks.
 
+### Entfernen ohne Rebuild, Einschub trotz offener Appends (01.09.)
+
+Der Einschub in die Mitte ist seit 1.30.0 inkrementell, das **Entfernen** war es nicht: jedes
+`RemoveLocation` setzte `Dirty`, und der nächste Sweep baute den ganzen Pool neu — ein
+Cache-Miss pro `ModelDataPoolLocation` plus einer pro `FrustumCullSphere`, für ein paar
+Teile, die weg sind. Und Entfernen passiert **ständig**: jeder neu tesselierte Chunk, der
+schon Geometrie hatte (Rand-Reparatur, Relight, Blockänderung — bei laufendem Nachladen
+praktisch jeder), nimmt erst seine alten Teile aus vier bis acht Pools und hängt die neuen an;
+ein Schritt über die Chunkgrenze beim Gehen lädt einen Ring aus hunderten Chunks aus und
+trifft damit fast jeden Pool auf einmal. Der Feldreport vom 01.09. zeigte den Rest davon:
+`0,28 ms cache-rebuild (3/frame)` im Mittel, und in Ruckler-Zeilen `davon sweep 11,7`,
+`16,2` — bei einem Sweep-Mittel von 2,3 ms und ohne GC-Pause.
+
+`FastCuller.NoteRemoved` ist das Spiegelbild von `NoteInserted`. Weil `List.Remove` nach
+Referenz arbeitet, ist der Index nur *vor* dem Entfernen bekannt: ein Prefix auf
+`RemoveLocation` merkt ihn sich (`__state`), der Postfix — den Harmony auslässt, wenn das
+Original wirft, also nichts entfernt wurde — schließt den Slot. Im Gitter: die
+zellgeordneten Arrays (sechs Geo-Blöcke, Lod, Orig) rücken ab der Position um eins auf, jede
+Bucket-Grenze dahinter sinkt um eins, den Sentinel eingeschlossen. Im Überhang: der letzte
+Eintrag springt in die Lücke (die Liste ist per Konstruktion ungeordnet). Danach rücken
+Meta/Locs in Originalreihenfolge auf, jeder Index über dem entfernten sinkt um eins — ein
+sequentieller Lauf über flache Ints, kein Location-Objekt wird angefasst — und der
+verwaiste `Locs`-Slot wird genullt, damit die Engine-Referenz nicht am Cache hängen bleibt.
+Pool- und Zellboxen werden **nicht** geschrumpft: eine Box, die die Teile plus ein
+verschwundenes umschließt, ist immer noch eine Schranke, nur eine lockerere; der nächste
+volle Rebuild (den jede Abweichung weiterhin erzwingt) zieht sie wieder fest.
+
+Zweiter Teil derselben Änderung: **beide** inkrementellen Pfade tolerieren jetzt offene
+Appends. Die Uploads landen in der Before-Stage, Einschübe und Entfernungen laufen am
+Anfang der Opaque-Stage, und der erste Sweep, der die Appends einfalten könnte, kommt erst
+danach — beim Streamen war also *immer* ein Append offen, und `NoteInserted` fiel deshalb
+fast immer auf den Rebuild zurück, den es vermeiden sollte. Offene Appends sitzen aber per
+Konstruktion **am Ende** der Liste: ein Einschub oder eine Entfernung davor verschiebt sie um
+genau eins, und `Extend` (das ab `c.Count` liest) findet weiterhin genau die offenen. Die
+Konsistenzregel lautet jetzt „Listenlänge ≥ Cache-Länge ± 1 mit offenen Appends, sonst
+exakt gleich"; alles andere fällt nach wie vor auf den Rebuild.
+
+Verify: der Fuzz-Test (3000 Zufallsschritte gegen einen Pool, der immer neu baut) nimmt beim
+Entfernen jetzt den inkrementellen Pfad und lässt jeden dritten Sweep aus, damit Appends
+über den nächsten Einschub oder das nächste Entfernen hinweg offen bleiben; er verlangt
+≥ 100 inkrementelle Entfernungen (der Nachweis, dass der Pfad überhaupt läuft). Dazu ein
+ausbuchstabierter Test: erstes, letztes, mittleres Teil aus dem Gitter, eines aus dem
+Überhang, eines vor offenen Appends, ein eingeschobenes (Überhang mit Original-Index),
+ein noch nicht eingefaltetes, und der Pool komplett leer — jede Stufe in allen fünf
+Cull-Modi gegen die Referenz. Report-Zeile `inkrementell: N einfuegungen, M entfernungen
+ohne rebuild`, HUD `davon rebuild … N +/M - inkrementell`. Und weil die 11-16-ms-Sweeps
+im Feld nicht attribuiert waren: jede Ruckler-Zeile trägt jetzt `(davon X rebuild, N pools)`,
+wenn der Rebuild-Anteil den Sweep erklärt — der nächste Log sagt, ob diese Spitzen damit
+weg sind oder etwas anderes waren.
+
 ---
 
 ## Zwei Quads für 1,86 ms: die Occlusion-Query der Sonne
@@ -985,6 +1035,49 @@ gemessenen Renderer. Gegen die Stage-Summen gehalten sagt diese Zeile, ob die Li
 überhaupt erklärt. Genau weil sie das vorher nicht tat, wurde die Feuerstelle gefunden.
 
 ---
+
+## AnimatableRenderer: ein Frustum-Gate für animierte Block-Entities (01.09.)
+
+Derselbe Mechanismus wie bei der Feuerstelle, nur bei einem Renderer, der nie ins Profiling
+geraten war: `AnimatableRenderer` (VintagestoryAPI) zeichnet jedes animierte Block-Entity —
+Windmühlenrotoren, Pulverisierer, Blasebälge, Fruchtpressen, Türen und Falltüren während sie
+schwingen, und jeden Mod-Block, der `BlockEntityAnimationUtil` benutzt. Er registriert sich
+in **vier** Stages (Opaque oder OIT, ShadowFar, ShadowNear), deklariert `RenderRange 99`
+(das die Engine nie liest) und macht in `OnRenderFrame` ohne jede Distanz- oder
+Sichtbarkeitsprüfung: Shader wechseln, `GetLightRGBs` aus dem Chunk holen, ~15 Uniforms,
+ein UBO-Update, einen Draw. Eine Windmühle dreitausend Blöcke hinter der Kamera kostet
+genau so viel wie eine davor, dreimal pro Frame. Im Profiler stand das früher als
+`Opaque-animatable 1,6 ms` und als 7-45-ms-Spitzen in Ruckler-Zeilen nahe der Basis.
+
+Das Gate ist **exakt**: übersprungen wird nur, wenn die Bounding-Kugel des Meshes ganz
+außerhalb des Frustums liegt, mit dem die Engine *diese* Stage rendert — Kamerafrustum in
+Opaque/OIT, Lichtbox in den Schattenstages (`SystemRenderShadowMap` ruft vor deren
+Renderern `CalcFrustumEquations` mit der Schattenprojektion; `SphereInFrustum` testet gegen
+dieselben sechs Ebenen). Dort hätte die GPU kein Fragment erzeugt, nichts, das Bildschirm
+oder Schattenkarte erreicht hätte, fällt weg. Und die GL-Zustands-Falle der alten
+generischen Distanz-Gates greift hier nicht: eine **untätige** Instanz (`ShouldRender`
+false — der Normalzustand jeder Tür) kehrt bei vanilla vor dem ersten GL-Aufruf zurück, kein
+nachfolgender Renderer konnte sich also je auf den Zustand dieses Renderers verlassen.
+
+Die Kugel kommt einmal aus dem Mesh, das der Konstruktor bekommt (Postfix), um den Pivot, um
+den die Modellmatrix rotiert und skaliert (`Blockecke + (0.5, 0, 0.5)`), und wird für
+Animationen gepolstert: jeder Keyframe bewegt Elemente durch Rotationen um Joint-Ursprünge
+innerhalb der Shape und durch Offsets, und `|v'−C| ≤ |v−C| + 2|P−C|` schrankt eine Rotation
+um einen beliebigen Punkt P — dreifacher Ruheradius plus zwei Blöcke deckt alles, was eine
+Vanilla-Animation tut, mit viel Luft. Skalierung wird pro Frame gelesen (öffentliche,
+veränderliche Felder); ein `CustomTransform` ist eine beliebige Matrix des Besitzers, solche
+Instanzen werden nie gegated. Kosten pro aktiver Instanz und Stage: ein
+ConditionalWeakTable-Lookup und sechs Ebenen-Skalarprodukte.
+
+Config `CullAnimatableRenderers` (Default an), `.komet toggle animcull`, Safemode schaltet
+es ab, Stress-Phase `animatable-gate aus (vanilla)`, HUD/Report `animatable-gate N von M
+aufrufen uebersprungen` (gedruckt, solange das Gate scharf ist — 0 von 0 ist korrekte Ruhe,
+keine Zeile wäre nicht von einem toten Prefix zu unterscheiden). Verify: die reine Regel
+(sichtbar bleibt, hinter der Kamera fällt, an der Frustumkante mit größerer Skalierung
+oder größerem Radius bleibt, NaN/Null-Skalierung oder -Radius geht an vanilla, Spiegelung
+ist eine Skalierung), die Eigenschaft über 2000 Zufallskugeln („was übersprungen wird,
+nennt vanillas `SphereInFrustum` unsichtbar"), Ruheradius/Polster am Einheitswürfel, und
+dass eine Instanz ohne Bounds nie gegated wird.
 
 ## Wer verbraucht die Zeit? Profiling pro Renderer
 
@@ -1237,6 +1330,14 @@ direkt hinter dem sweep-Wert, zu dem sie gehört. Vorher hing sie am Ende der
 davon-Liste — ein Feldlog las dadurch `upload 0,2 (davon 2,6 warten auf threads)`, ein
 Upload, der länger gewartet hätte als er lief. Die Position ist im Verify gepinnt.
 
+Seit 01.09. (Nacht) trägt die Sweep-Angabe außerdem `(davon X rebuild, N pools)`, sobald der
+Rebuild-Anteil mindestens 1 ms und ein Viertel des Sweeps ausmacht — dieselbe Regel wie
+für die Thread-Wartezeit. Der Feldlog hatte Sweeps von 11-16 ms in Frames ohne GC-Pause
+und ohne Warte-Vermerk; ob das Cache-Rebuilds nach Chunk-Entladungen waren (inzwischen
+inkrementell, siehe „Entfernen ohne Rebuild") oder etwas anderes, sagt jetzt die Zeile.
+`FastCuller` meldet nach jedem Cull-Aufruf die Rebuild-Ticks und -Zahl des Frames an
+`FrameStats.AddCullRebuild`; die Baseline kennt den Aufruf nicht und meldet nichts.
+
 ### Korrektur: Server-GC war die falsche Empfehlung (1.46.0)
 
 Bis 1.45.0 stand hier, Workstation-GC sei „der erste Ruckler-Verdächtige", und das HUD
@@ -1325,6 +1426,48 @@ keine Generics-Fallstricke). Report-Zeile `klon-kompakt` zählt Clones und gespa
 Kapazitätskopien; `.komet toggle tightclone` schaltet live auf vanilla zurück. Verify
 prüft Inhalt, Layout-Felder, den Count-0-Fall und dass der Aus-Zustand exakt vanilla ist;
 die Gegenprobe (Kapazität statt Count) schlägt an.
+
+### Extras-Pool: was nach Klon-Kompakt noch frisch alloziert wurde (01.09.)
+
+Nach Klon-Kompakt blieb `klone 18` von `tess 53 MB/s` (Report 01.09., 235 Chunks/s). Das
+sind die Arrays, die inhaltsgroß, aber trotzdem frisch sind: die Pro-Face-Extras
+(`XyzFaces`, `RenderPassesAndExtraBits`, die zwei Colormap-Id-Arrays) und die `Values` der
+Custom-Parts — der Mesh-Recycler hält nur die Basis-Arrays (xyz, uv, rgba, flags, indices)
+über Tesselationen hinweg, und der Engine-Kommentar über `CloneExtraData` sagt wörtlich,
+diese „können nicht sinnvoll im Recycler bleiben". Also allozierte jeder Chunk-Part sie neu
+und `Dispose` nullte sie direkt nach dem Upload. Für den Collector ist das die
+unangenehmste Sorte Müll: auf dem Tess-Thread geboren, während der Wartezeit in der
+Upload-Queue nach gen1 befördert, auf dem Render-Thread gestorben — genau die
+Überlebenden, die eine gen1-Sammlung teuer machen.
+
+Jetzt kreisen sie durch einen Größenklassen-Pool (Zweierpotenzen ab 16 Elementen, ein
+Lock je Elementtyp, Byte-Budget `ExtrasPoolBudgetMb` = 64): gemietet in `CloneExtraData`,
+wenn das Ziel ein Recycler-Mesh ist (`Recyclable` — d. h. ein Chunk-Part, der einzige
+Aufrufer von `CloneUsingRecycler`), zurückgegeben von einem Postfix auf
+`TesselatedChunkPart.AddToPools`, der einen Stelle, an der die Meshes eines Parts gerade
+hochgeladen und disposed wurden. Der Prefix merkt sich die Array-Referenzen vor dem Upload,
+der Postfix gibt genau die zurück — das Mesh hält sie da nicht mehr (`DisposeExtraData` hat
+die Felder genullt), die Arrays sind also beweisbar unreferenziert. `MeshData.Dispose` selbst
+ist absichtlich **nicht** gepatcht: klein genug, um bei Tier 1 in seine Aufrufer inliniert zu
+werden — die Klasse still toter Patches, die dieses Projekt schon kennt.
+
+Gemietete Arrays sind länger als der Count (Klassengröße). Nirgends in der Engine gilt die
+Länge dieser Arrays als Zähler: die Uploads lesen `Count`/`BaseOffset`, die Wachstumspfade
+vergleichen `Count` gegen `Length` und resizen bei voll, `AddMeshData` läuft nach Count.
+Ein Array, das nach dem Klonen per `Array.Resize` gewachsen ist, hat keine Klassengröße mehr
+und geht einfach an den Collector. Nicht-Recycler-Ziele (`Clone()`, Entity-/Item-Meshes)
+bekommen weiterhin exakte, frische Arrays.
+
+Report-Zeile `extras-pool: X% treffer (N anfragen), M MB vorgehalten, K verworfen` — bleibt
+die Trefferquote bei 0 und die Anfragen steigen, feuert der Rückgabe-Postfix nicht (der
+„idle sieht aus wie kaputt"-Fall, darum wird die Zeile gedruckt, solange der Pool scharf
+ist). `.komet toggle extrapool` schaltet live um (aus = Vorrat frei), Stress-Phase
+`extras-pool aus (frische arrays)`, Config `PoolMeshExtras`. Verify: Klassenrundung,
+Wiederverwendung nach Referenz, Ablehnung von Nicht-Klassengrößen und Winzarrays, Budget,
+Null-Count; dann der ganze Kreis über einen echten `TesselatedChunkPart` (Prefix →
+`DisposeExtraData` → Postfix → zweiter Klon bekommt dasselbe Array), plus: ein
+Nicht-Recycler-Mesh wird nicht erfasst, ein `Clone()` und der Aus-Zustand liefern exakte
+Arrays.
 
 ### Zwei Feldfunde vom ersten fremden Tester (1.51.1 / 1.51.2)
 
@@ -1931,6 +2074,24 @@ weiter, statt zurückzugeben.
   Begründung gilt darin unverändert — über *frustum*-verworfene Teile wird verschmolzen (die
   GPU clippt sie, null Fragmente), über *distanz*-verworfene, versteckte, occlusion-verdeckte
   oder freie Bytes nie.
+
+## IDE-Cleanup gegen Harmony-Namen (01.09.)
+
+Harmony bindet Patch-Parameter **per Namen**: `__instance`, `__result`, `__state`,
+`___feld`, und die Original-Parameternamen der Engine-Methode in genau deren Schreibweise
+(`OnRetesselated`, `Indices`, `index3d`). Ein „Namensregeln anwenden"-Cleanup (ReSharper/
+Rider, Roslyn IDE1006) macht daraus `instance`, `onRetesselated`, `index3D` — und dann wirft
+`Patch()` beim Start („Parameter "instance" not found"), der `Patch()`-Wrapper loggt einen
+Fehler und die Mod läuft an der Stelle **still vanilla**. Am 01.09. hat das ReSharper-Backend
+von VS Code den ganzen Baum auf `var` umgestellt und dabei nebenbei in sieben Patch-Dateien
+genau diese Namen umbenannt (Edge-Koaleszenz, Schatten-Drossel, Schattenbox-Patches,
+Feuerstelle, Fenster-Pipeline, Occlusion, Animation) — verify hat es gefangen, in der
+gespielten Welt hätte es einfach nur weniger Mod gegeben.
+
+Deshalb: `.editorconfig` schaltet die Namens-Inspektionen für das Repo ab, jede Patch-Datei
+trägt `// ReSharper disable InconsistentNaming`, und wer einen neuen Patch schreibt, prüft
+im Zweifel `git diff | grep __instance`. Verify bleibt die letzte Instanz — es wendet jeden
+Patch wirklich an.
 
 ## Messen statt raten
 

@@ -4,6 +4,11 @@ using HarmonyLib;
 using Vintagestory.Client.NoObf;
 using Vintagestory.API.Client;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -56,9 +61,9 @@ public static class SunQueryPatches
 
         if (GameRef == null) throw new InvalidOperationException("ClientSystem.game not found");
 
-        MethodInfo post = AccessTools.Method(typeof(SystemRenderSunMoon), "OnRenderFrame3DPost",
-                              new[] { typeof(float) })
-                          ?? throw new InvalidOperationException("SystemRenderSunMoon.OnRenderFrame3DPost not found");
+        var post = AccessTools.Method(typeof(SystemRenderSunMoon), "OnRenderFrame3DPost",
+                       new[] { typeof(float) })
+                   ?? throw new InvalidOperationException("SystemRenderSunMoon.OnRenderFrame3DPost not found");
 
         harmony.Patch(post, prefix: new HarmonyMethod(
             AccessTools.Method(typeof(SunQueryPatches), nameof(ThrottleQuery))));
@@ -72,7 +77,7 @@ public static class SunQueryPatches
 
         // No platform means no way to leave the stage in the state the OIT pass inherits from
         // this method - then the only safe answer is to not skip at all.
-        ClientPlatformAbstract platform = __instance == null ? null : GameRef(__instance)?.Platform;
+        var platform = __instance == null ? null : GameRef(__instance)?.Platform;
         if (platform == null) return true;
 
         // The end states of the real pass, in its order. Everything the pass sets in between

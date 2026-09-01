@@ -6,6 +6,11 @@ using Vintagestory.API.Client;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -83,8 +88,8 @@ public static class PrioUploadPatches
 
     public static void Apply(Harmony harmony)
     {
-        MethodInfo target = Measure.MeasurementPatches.UploadMethod
-                            ?? throw new InvalidOperationException("measurement patches must be applied first");
+        var target = Measure.MeasurementPatches.UploadMethod
+                     ?? throw new InvalidOperationException("measurement patches must be applied first");
         harmony.Patch(target, prefix: new HarmonyMethod(
             typeof(PrioUploadPatches), nameof(BudgetedPrioDrain)) { priority = Priority.Low });
     }
@@ -110,7 +115,7 @@ public static class PrioUploadPatches
         int verts = 0, processed = 0;
         while (q.Count > 0 && ShouldContinue(verts, processed, capVerts))
         {
-            TesselatedChunk tc = q.Dequeue();
+            var tc = q.Dequeue();
             processed++;
             verts += uploadOne(tc);
         }
@@ -120,19 +125,19 @@ public static class PrioUploadPatches
     public static void BudgetedPrioDrain(ChunkTesselatorManager __instance)
     {
         if (!Enabled) return;
-        ClientMain game = ClientQueues.GameOf(__instance);
+        var game = ClientQueues.GameOf(__instance);
         if (game == null) return;
-        Queue<TesselatedChunk> q = PrioQueue(__instance);
+        var q = PrioQueue(__instance);
         if (q == null) return;
         // Pending work is either vanilla's flag or a remainder this budget left behind last
         // frame (the flag is already false then - the Count is what carries the liveness).
         if (!ProcessPrio(__instance) && q.Count == 0) return;
 
-        ChunkRenderer renderer = ChunkRendererRef(game);
+        var renderer = ChunkRendererRef(game);
         if (renderer == null) return; // pre-world startup; nothing can be queued yet either
 
-        int viewDistSq = game.frustumCuller?.ViewDistanceSq ?? 0;
-        int cap = CapVertices(UploadBudget.Scale(viewDistSq / 48 + 350), MinVertices);
+        var viewDistSq = game.frustumCuller?.ViewDistanceSq ?? 0;
+        var cap = CapVertices(UploadBudget.Scale(viewDistSq / 48 + 350), MinVertices);
         lock (PrioLock(__instance))
         {
             DrainBudgeted(q, cap, tc =>

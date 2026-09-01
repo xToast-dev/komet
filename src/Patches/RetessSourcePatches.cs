@@ -7,6 +7,11 @@ using System.Reflection;
 using System.Text;
 using HarmonyLib;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -67,13 +72,13 @@ public static class RetessSourcePatches
 
     public static void Apply(Harmony harmony)
     {
-        Type map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
-                   ?? throw new InvalidOperationException("ClientWorldMap not found");
+        var map = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientWorldMap")
+                  ?? throw new InvalidOperationException("ClientWorldMap not found");
 
-        MethodInfo set = AccessTools.Method(map, "SetChunkDirty")
-                         ?? throw new InvalidOperationException("SetChunkDirty not found");
-        MethodInfo mark = AccessTools.Method(map, "MarkChunkDirty")
-                          ?? throw new InvalidOperationException("MarkChunkDirty not found");
+        var set = AccessTools.Method(map, "SetChunkDirty")
+                  ?? throw new InvalidOperationException("SetChunkDirty not found");
+        var mark = AccessTools.Method(map, "MarkChunkDirty")
+                   ?? throw new InvalidOperationException("MarkChunkDirty not found");
 
         harmony.Patch(set, prefix: new HarmonyMethod(typeof(RetessSourcePatches), nameof(SetPrefix)));
         harmony.Patch(mark, prefix: new HarmonyMethod(typeof(RetessSourcePatches), nameof(MarkPrefix)));
@@ -102,11 +107,11 @@ public static class RetessSourcePatches
         // MethodBase from a handle - and the answer is almost always two or three frames up,
         // so resolving the whole stack was thirty of those to use one.
         var trace = new StackTrace(2, fNeedFileInfo: false);
-        for (int i = 0; i < trace.FrameCount; i++)
+        for (var i = 0; i < trace.FrameCount; i++)
         {
-            MethodBase m = trace.GetFrame(i)?.GetMethod();
+            var m = trace.GetFrame(i)?.GetMethod();
             if (m == null) continue;
-            string source = Accept(m.DeclaringType?.Name, m.Name);
+            var source = Accept(m.DeclaringType?.Name, m.Name);
             if (source == null) continue;
             Sources.AddOrUpdate(source, 1, (_, c) => c + 1);
             return;
@@ -134,7 +139,7 @@ public static class RetessSourcePatches
     /// </summary>
     internal static bool BucketAllows(long nowTicks)
     {
-        long start = System.Threading.Interlocked.Read(ref bucketStartTicks);
+        var start = System.Threading.Interlocked.Read(ref bucketStartTicks);
         if (nowTicks - start >= Stopwatch.Frequency
             && System.Threading.Interlocked.CompareExchange(ref bucketStartTicks, nowTicks, start) == start)
             System.Threading.Interlocked.Exchange(ref bucketTaken, 0);
@@ -144,9 +149,9 @@ public static class RetessSourcePatches
     /// <summary>The first frame <see cref="Accept"/> takes. Kept for the frame-list tests.</summary>
     internal static string PickSource(IReadOnlyList<(string type, string method)> frames)
     {
-        for (int i = 0; i < frames.Count; i++)
+        for (var i = 0; i < frames.Count; i++)
         {
-            string source = Accept(frames[i].type, frames[i].method);
+            var source = Accept(frames[i].type, frames[i].method);
             if (source != null) return source;
         }
         return null;
@@ -163,9 +168,9 @@ public static class RetessSourcePatches
 
     private static void RollWindow()
     {
-        long now = Stopwatch.GetTimestamp();
+        var now = Stopwatch.GetTimestamp();
         if (windowStart == 0) { windowStart = now; windowMarks = StatMarks; windowEdge = StatEdgeOnly; return; }
-        double elapsed = (now - windowStart) / (double)Stopwatch.Frequency;
+        var elapsed = (now - windowStart) / (double)Stopwatch.Frequency;
         if (elapsed < WindowSeconds) return;
         rateMarks = (StatMarks - windowMarks) / elapsed;
         rateEdge = (StatEdgeOnly - windowEdge) / elapsed;
@@ -182,8 +187,8 @@ public static class RetessSourcePatches
     /// <summary>Marks per second since the last reset, and the sampled source ranking.</summary>
     public static string BuildReport()
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
-        double seconds = countingSince == 0
+        var ci = CultureInfo.CurrentCulture;
+        var seconds = countingSince == 0
             ? 0
             : (Stopwatch.GetTimestamp() - countingSince) / (double)Stopwatch.Frequency;
         if (seconds < 1 || StatMarks == 0)
@@ -205,11 +210,11 @@ public static class RetessSourcePatches
         else
         {
             long total = 0;
-            foreach (KeyValuePair<string, long> kv in top) total += kv.Value;
+            foreach (var kv in top) total += kv.Value;
             sb.AppendFormat(ci, "quellen ({0} samples a 1/{1}, anteile):\n", total, SampleEveryNth);
             top.Sort((a, b) => b.Value.CompareTo(a.Value));
-            int shown = Math.Min(top.Count, 10);
-            for (int i = 0; i < shown; i++)
+            var shown = Math.Min(top.Count, 10);
+            for (var i = 0; i < shown; i++)
                 sb.AppendFormat(ci, "  {0,-44} {1:F0}%\n", top[i].Key, 100.0 * top[i].Value / total);
         }
 

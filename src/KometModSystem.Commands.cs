@@ -63,7 +63,7 @@ public partial class KometModSystem
                         HitchLog.Reset();
                         return TextCommandResult.Success("hitch-log geleert.");
                     }
-                    string report = HitchLog.BuildReport();
+                    var report = HitchLog.BuildReport();
                     Mod.Logger.Notification("hitch report:\n{0}", report);
                     return TextCommandResult.Success(report);
                 })
@@ -72,7 +72,7 @@ public partial class KometModSystem
                 .WithDescription("Alles auf einmal: umgebung, abweichende einstellungen, frame-aufteilung, ruckler-protokoll. Landet als ein Block im client-main.log")
                 .HandleWith(_ =>
                 {
-                    string report = BuildFullReport();
+                    var report = BuildFullReport();
                     // The log, not the chat: this is several hundred characters wide by design
                     // and the chat window wraps it into something nobody can copy back out.
                     Mod.Logger.Notification("full report:\n{0}", report);
@@ -101,7 +101,7 @@ public partial class KometModSystem
                         Patches.RetessSourcePatches.Reset();
                         return TextCommandResult.Success("dirty-mark-zaehler geleert.");
                     }
-                    string report = Patches.RetessSourcePatches.BuildReport();
+                    var report = Patches.RetessSourcePatches.BuildReport();
                     Mod.Logger.Notification("retess report:\n{0}", report);
                     return TextCommandResult.Success(report);
                 })
@@ -126,7 +126,7 @@ public partial class KometModSystem
 
         double sliceSeconds = 2;
         if (arg != null && double.TryParse(arg, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double parsed))
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed))
             sliceSeconds = parsed;
 
         return StressTest.Start(BuildStressPhases(), sliceSeconds, roundCount: 3, report =>
@@ -219,6 +219,12 @@ public partial class KometModSystem
         new StressTest.Phase { Name = "mesh-recycler aus (vanilla-ablage)",
             Enter = () => Patches.MeshRecyclerPatches.SetEnabled(false),
             Exit = () => Patches.MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler) },
+        new StressTest.Phase { Name = "extras-pool aus (frische arrays)",
+            Enter = () => { Patches.TightClonePatches.PoolExtras = false; Patches.TightClonePatches.ClearPools(); },
+            Exit = () => Patches.TightClonePatches.PoolExtras = config.PoolMeshExtras },
+        new StressTest.Phase { Name = "animatable-gate aus (vanilla)",
+            Enter = () => Patches.AnimatableCullPatches.Enabled = false,
+            Exit = () => Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers },
         new StressTest.Phase { Name = "lod3 raus aus schattenpass",
             Enter = () => FastCuller.ShadowSkipRedundantLod = true,
             Exit = () => FastCuller.ShadowSkipRedundantLod = config.ShadowSkipRedundantLod },
@@ -370,6 +376,19 @@ public partial class KometModSystem
                     ? "AN (custom-parts werden inhaltsgross kopiert)"
                     : "AUS (vanilla: kapazitaetsgrosse kopien)");
                 break;
+            case "extrapool":
+                Patches.TightClonePatches.PoolExtras = !Patches.TightClonePatches.PoolExtras;
+                if (!Patches.TightClonePatches.PoolExtras) Patches.TightClonePatches.ClearPools();
+                state = "extras-pool " + (Patches.TightClonePatches.PoolExtras
+                    ? "AN (per-face- und custom-arrays der chunk-teile werden recycelt)"
+                    : "AUS (vanilla: frische arrays je teil, vorrat freigegeben)");
+                break;
+            case "animcull":
+                Patches.AnimatableCullPatches.Enabled = !Patches.AnimatableCullPatches.Enabled;
+                state = "animatable-frustum-gate " + (Patches.AnimatableCullPatches.Enabled
+                    ? "AN (animierte block-entities ausserhalb des frustums werden uebersprungen)"
+                    : "AUS (vanilla: jede instanz zeichnet in jeder stage)");
+                break;
             case "shadowlod":
                 FastCuller.ShadowSkipRedundantLod = !FastCuller.ShadowSkipRedundantLod;
                 state = "lod3-stellvertreter im schattenpass " + (FastCuller.ShadowSkipRedundantLod
@@ -391,8 +410,8 @@ public partial class KometModSystem
                 {
                     // the config pair when it throttles, else the tested 2/4 - so the toggle
                     // works even on a config that has throttling off
-                    int far = Math.Max(2, config.ShadowFarUpdateInterval);
-                    int skip = Math.Max(4, config.ShadowFarMaxSkip);
+                    var far = Math.Max(2, config.ShadowFarUpdateInterval);
+                    var skip = Math.Max(4, config.ShadowFarMaxSkip);
                     Patches.ShadowThrottlePatches.SetIntervals(far, config.ShadowNearUpdateInterval, skip);
                     state = $"schatten-drossel AN (ferne kaskade alle {far}-{skip} frames, bewegung erzwingt sofort)";
                 }
@@ -445,9 +464,9 @@ public partial class KometModSystem
                      + "shadowlod, shadowstab, shadowthrottle";
         }
 
-        string world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
-                     + $"warteschl. {Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation:N0}, "
-                     + $"uptime {uptime.Elapsed.TotalSeconds:F0}s";
+        var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
+                    + $"warteschl. {Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation:N0}, "
+                    + $"uptime {uptime.Elapsed.TotalSeconds:F0}s";
         Mod.Logger.Notification("toggle: {0} | weltzustand: {1}", state, world);
         return state + " | " + world;
     }
@@ -507,6 +526,7 @@ public partial class KometModSystem
         Patches.GlErrorPatches.SkipEnabled = false; // vanilla error detection back on
         Patches.FirepitPatches.Enabled = false;     // draw every firepit again
         Patches.EntityTessPatches.Enabled = false;  // tesselate entity shapes immediately again
+        Patches.AnimatableCullPatches.Enabled = false; // every animated block entity draws in every stage again
         Patches.EdgeCoalescePatches.Enabled = false;
         Patches.EdgeCoalescePatches.FlushAll();     // held edge marks go out, nothing strands
         Patches.EdgeRetessPriorityPatches.Enabled = false; // vanilla queue order again
@@ -529,6 +549,7 @@ public partial class KometModSystem
         Patches.GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck;
         Patches.FirepitPatches.Enabled = true;
         Patches.EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0;
+        Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
         Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0;
         Patches.EdgeRetessPriorityPatches.Enabled =
             config.EdgeRetessPriority && !Patches.EdgeRetessPriorityPatches.HardDisabled;
@@ -563,6 +584,9 @@ public partial class KometModSystem
         FastCuller.Workers.StatContendedInline = 0;
         Patches.MeshRecyclerPatches.ResetStats();
         Patches.TightClonePatches.ResetStats();
+        Patches.AnimatableCullPatches.ResetStats();
+        FastCuller.StatIncInserts = 0;
+        FastCuller.StatIncRemovals = 0;
         Patches.EdgeRetessPriorityPatches.StatPromoted = 0;
         Patches.EdgeRetessPriorityPatches.StatSweeps = 0;
         Patches.EdgeRetessPriorityPatches.StatBusySkips = 0;

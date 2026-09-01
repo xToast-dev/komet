@@ -26,7 +26,7 @@ public partial class KometModSystem
     {
         if (string.IsNullOrEmpty(stored)) return "alt";
         var sb = new System.Text.StringBuilder(16);
-        foreach (char c in stored)
+        foreach (var c in stored)
         {
             if (sb.Length == 16) break;
             if (char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_') sb.Append(c);
@@ -39,7 +39,7 @@ public partial class KometModSystem
         // The config layout version, NOT the mod version: a release that changes no setting
         // must leave everybody's file alone. KometConfig.Current is bumped by hand when a
         // setting is added, removed or gets a new default.
-        string running = KometConfig.Current;
+        var running = KometConfig.Current;
         KometConfig cfg = null;
         try
         {
@@ -57,7 +57,7 @@ public partial class KometModSystem
         // since "regenerate" must never mean "silently discard what you had configured".
         if (cfg != null && ShouldRegenerate(cfg.ConfigVersion, running))
         {
-            string tag = BackupTag(cfg.ConfigVersion);
+            var tag = BackupTag(cfg.ConfigVersion);
             BackupConfig(tag);
             Mod.Logger.Notification(
                 "config layout {0} found, this mod writes {1} - regenerated from current "
@@ -79,7 +79,7 @@ public partial class KometModSystem
     {
         try
         {
-            string path = System.IO.Path.Combine(GamePaths.ModConfig, ConfigFile);
+            var path = System.IO.Path.Combine(GamePaths.ModConfig, ConfigFile);
             if (System.IO.File.Exists(path))
                 System.IO.File.Copy(path, path + "." + tag + ".bak", overwrite: true);
         }

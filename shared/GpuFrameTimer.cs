@@ -54,7 +54,7 @@ public static class GpuFrameTimer
             {
                 if (queries[0] == 0) GL.GenQueries(Ring, queries);
 
-                int slot = (int)(frame % Ring);
+                var slot = (int)(frame % Ring);
                 if (pending[slot]) return; // ring full - a result reader has fallen behind
 
                 GL.BeginQuery(QueryTarget.TimeElapsed, queries[slot]);
@@ -95,14 +95,14 @@ public static class GpuFrameTimer
                 if (sampleAccum < 0.5f || frame < Ring) return;
                 sampleAccum = 0;
 
-                int oldest = (int)((frame - (Ring - 1)) % Ring);
+                var oldest = (int)((frame - (Ring - 1)) % Ring);
                 if (!pending[oldest]) return;
 
                 long nanoseconds = 0;
                 GL.GetQueryObject(queries[oldest], GetQueryObjectParam.QueryResult, out nanoseconds);
                 pending[oldest] = false;
 
-                double ms = nanoseconds / 1_000_000.0;
+                var ms = nanoseconds / 1_000_000.0;
                 if (ms > 0 && ms < 1000)
                     GpuMs = GpuMs <= 0 ? ms : GpuMs + (ms - GpuMs) * 0.4;
             }

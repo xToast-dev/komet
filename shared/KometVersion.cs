@@ -43,11 +43,11 @@ public static class KometVersion
     internal static string StampFrom(string informational)
     {
         if (string.IsNullOrEmpty(informational)) return null;
-        int plus = informational.IndexOf('+');
+        var plus = informational.IndexOf('+');
         if (plus < 0 || plus + 1 >= informational.Length) return null;
 
-        string[] parts = informational.Substring(plus + 1).Split('.');
-        for (int i = 0; i < parts.Length; i++)
+        var parts = informational.Substring(plus + 1).Split('.');
+        for (var i = 0; i < parts.Length; i++)
             if (LooksLikeCommitHash(parts[i])) parts[i] = parts[i].Substring(0, 7);
         return string.Join(".", parts);
     }
@@ -57,7 +57,7 @@ public static class KometVersion
     internal static bool LooksLikeCommitHash(string s)
     {
         if (s == null || s.Length < 8) return false;
-        foreach (char c in s)
+        foreach (var c in s)
             if (!char.IsAsciiHexDigitLower(c) && !char.IsAsciiDigit(c)) return false;
         return true;
     }

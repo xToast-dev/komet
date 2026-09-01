@@ -90,25 +90,25 @@ public static class PoolReclaimer
     {
         if (!Enabled || master == null) return;
 
-        List<MeshDataPool> pools = PoolsRef(master);
+        var pools = PoolsRef(master);
         if (pools == null) return;
 
-        int empty = 0;
-        for (int i = 0; i < pools.Count; i++)
+        var empty = 0;
+        for (var i = 0; i < pools.Count; i++)
         {
-            MeshDataPool pool = pools[i];
+            var pool = pools[i];
             if (pool == null) continue;
 
-            int count = LocationsRef(pool)?.Count ?? 0;
+            var count = LocationsRef(pool)?.Count ?? 0;
             if (count != 0)
             {
-                if (Seen.TryGetValue(pool, out EmptySince used)) used.At = -1;
+                if (Seen.TryGetValue(pool, out var used)) used.At = -1;
                 continue;
             }
 
             if (pool.VerticesPoolSize > 0) empty++;
 
-            EmptySince state = Seen.GetOrCreateValue(pool);
+            var state = Seen.GetOrCreateValue(pool);
             if (!ShouldReclaim(count, pool.VerticesPoolSize, DimensionRef(pool), state.At, now, AfterSeconds))
             {
                 if (state.At < 0) state.At = now;
@@ -123,9 +123,9 @@ public static class PoolReclaimer
 
     private static void Reclaim(ICoreClientAPI capi, MeshDataPool pool)
     {
-        long bytes = EstimateBytes(capi, pool);
+        var bytes = EstimateBytes(capi, pool);
 
-        ref MeshRef mesh = ref MeshRefRef(pool);
+        ref var mesh = ref MeshRefRef(pool);
         if (mesh != null)
         {
             capi.Render.DeleteMesh(mesh);
@@ -194,7 +194,7 @@ public static class PoolReclaimer
             try
             {
                 if (capi.World is not Vintagestory.Client.NoObf.ClientMain game) return;
-                Vintagestory.Client.NoObf.ChunkRenderer renderer = RendererRef(game);
+                var renderer = RendererRef(game);
                 if (renderer == null) return;
                 Run(capi, MasterRef(renderer), game.ElapsedMilliseconds / 1000.0);
             }

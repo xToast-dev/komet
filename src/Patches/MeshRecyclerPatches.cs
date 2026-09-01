@@ -4,6 +4,11 @@ using System.Collections.Generic;
 using HarmonyLib;
 using Vintagestory.API.Client;
 
+
+// Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
+// own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
+// time and the feature silently run vanilla - so naming inspections are suppressed here.
+// ReSharper disable InconsistentNaming
 namespace Komet.Patches;
 
 /// <summary>
@@ -82,7 +87,7 @@ public static class MeshRecyclerPatches
     public static void Apply(Harmony harmony)
     {
         EnsureClasses();
-        Type t = typeof(MeshDataRecycler);
+        var t = typeof(MeshDataRecycler);
         harmony.Patch(AccessTools.Method(t, nameof(MeshDataRecycler.GetOrCreateMesh)),
             prefix: new HarmonyMethod(typeof(MeshRecyclerPatches), nameof(GetPrefix)));
         harmony.Patch(AccessTools.Method(t, nameof(MeshDataRecycler.Recycle)),
@@ -116,12 +121,12 @@ public static class MeshRecyclerPatches
     {
         lock (Gate)
         {
-            while (Incoming.TryDequeue(out MeshData m)) m.DisposeBasicData();
+            while (Incoming.TryDequeue(out var m)) m.DisposeBasicData();
             if (classes != null)
             {
-                foreach (List<MeshData> list in classes)
+                foreach (var list in classes)
                 {
-                    foreach (MeshData m in list) m.DisposeBasicData();
+                    foreach (var m in list) m.DisposeBasicData();
                     list.Clear();
                 }
             }
@@ -164,20 +169,20 @@ public static class MeshRecyclerPatches
     {
         // the engine contract rounds requests to a multiple of 4 (whole faces)
         minimumVertices = (minimumVertices + 3) / 4 * 4;
-        int c = ClassFor(minimumVertices);
+        var c = ClassFor(minimumVertices);
         lock (Gate)
         {
             if (c >= 0)
             {
                 // this class serves the request by construction; the next one up still does,
                 // at more slack - taken only over allocating fresh
-                int last = Math.Min(c + 1, classes.Length - 1);
-                for (int i = c; i <= last; i++)
+                var last = Math.Min(c + 1, classes.Length - 1);
+                for (var i = c; i <= last; i++)
                 {
-                    List<MeshData> list = classes[i];
-                    int n = list.Count;
+                    var list = classes[i];
+                    var n = list.Count;
                     if (n == 0) continue;
-                    MeshData m = list[n - 1];
+                    var m = list[n - 1];
                     list.RemoveAt(n - 1);
                     HeldBytes -= (long)m.VerticesMax * BytesPerVertex;
                     StatHits++;
@@ -192,7 +197,7 @@ public static class MeshRecyclerPatches
                     return m;
                 }
             }
-            int capacity = c >= 0 ? classSizes[c] : minimumVertices;
+            var capacity = c >= 0 ? classSizes[c] : minimumVertices;
             StatMisses++;
             StatMissBytes += (long)capacity * BytesPerVertex;
             return new MeshData(capacity) { Recyclable = true };
@@ -201,10 +206,10 @@ public static class MeshRecyclerPatches
 
     private static void Drain()
     {
-        long now = Clock();
+        var now = Clock();
         lock (Gate)
         {
-            while (Incoming.TryDequeue(out MeshData m)) File(m, now);
+            while (Incoming.TryDequeue(out var m)) File(m, now);
             if (now - lastSweepMs >= 500 || HeldBytes > (long)BudgetMb << 20)
             {
                 lastSweepMs = now;
@@ -218,7 +223,7 @@ public static class MeshRecyclerPatches
     private static void File(MeshData m, long now)
     {
         if (m == null) return;
-        int c = m.xyz == null || m.Uv == null || m.Rgba == null || m.Flags == null || m.Indices == null
+        var c = m.xyz == null || m.Uv == null || m.Rgba == null || m.Flags == null || m.Indices == null
             ? -1
             : FloorClassFor(m.VerticesMax);
         if (c < 0)
@@ -238,22 +243,22 @@ public static class MeshRecyclerPatches
     /// </summary>
     private static void Sweep(long now)
     {
-        for (int c = 0; c < classes.Length; c++)
+        for (var c = 0; c < classes.Length; c++)
         {
-            List<MeshData> list = classes[c];
-            int drop = 0;
+            var list = classes[c];
+            var drop = 0;
             while (drop < list.Count && now - list[drop].RecyclingTime > TtlMs) drop++;
-            for (int i = 0; i < drop; i++) Discard(list[i]);
+            for (var i = 0; i < drop; i++) Discard(list[i]);
             if (drop > 0) list.RemoveRange(0, drop);
         }
-        long budget = (long)BudgetMb << 20;
+        var budget = (long)BudgetMb << 20;
         while (HeldBytes > budget)
         {
-            int oldestClass = -1;
-            long oldestTime = long.MaxValue;
-            for (int c = 0; c < classes.Length; c++)
+            var oldestClass = -1;
+            var oldestTime = long.MaxValue;
+            for (var c = 0; c < classes.Length; c++)
             {
-                List<MeshData> list = classes[c];
+                var list = classes[c];
                 if (list.Count > 0 && list[0].RecyclingTime < oldestTime)
                 {
                     oldestTime = list[0].RecyclingTime;
@@ -282,12 +287,12 @@ public static class MeshRecyclerPatches
     private static void DrainVanilla(MeshDataRecycler vanilla)
     {
         if (vanilla == null) return;
-        long now = Clock();
+        var now = Clock();
         lock (Gate)
         {
-            ConcurrentQueue<MeshData> queue = QueueRef(vanilla);
+            var queue = QueueRef(vanilla);
             if (queue != null)
-                while (queue.TryDequeue(out MeshData m)) File(m, now);
+                while (queue.TryDequeue(out var m)) File(m, now);
             TakeOver(SmallRef(vanilla), now);
             TakeOver(MediumRef(vanilla), now);
             TakeOver(LargeRef(vanilla), now);
@@ -297,7 +302,7 @@ public static class MeshRecyclerPatches
     private static void TakeOver(SortedList<float, MeshData> list, long now)
     {
         if (list == null || list.Count == 0) return;
-        foreach (KeyValuePair<float, MeshData> kv in list) File(kv.Value, now);
+        foreach (var kv in list) File(kv.Value, now);
         list.Clear();
     }
 
@@ -306,8 +311,8 @@ public static class MeshRecyclerPatches
     /// which any top-class request can use - capacity only ever exceeds the class).</summary>
     internal static int ClassFor(int minimumVertices)
     {
-        int[] sizes = classSizes;
-        for (int c = 0; c < sizes.Length; c++)
+        var sizes = classSizes;
+        for (var c = 0; c < sizes.Length; c++)
             if (sizes[c] >= minimumVertices)
                 return c;
         return -1;
@@ -316,9 +321,9 @@ public static class MeshRecyclerPatches
     /// <summary>Largest class whose size the capacity covers, -1 below the smallest class.</summary>
     internal static int FloorClassFor(int verticesMax)
     {
-        int[] sizes = classSizes;
-        int found = -1;
-        for (int c = 0; c < sizes.Length && sizes[c] <= verticesMax; c++) found = c;
+        var sizes = classSizes;
+        var found = -1;
+        for (var c = 0; c < sizes.Length && sizes[c] <= verticesMax; c++) found = c;
         return found;
     }
 
@@ -330,7 +335,7 @@ public static class MeshRecyclerPatches
         // 128 (just under the engine's ~121-vertex recycling floor) growing x1.25, rounded to
         // whole faces, up past the 500k-vertex pool part maximum: ~35 classes.
         var sizes = new List<int>();
-        int size = 128;
+        var size = 128;
         while (size < 550000)
         {
             sizes.Add(size);
@@ -339,6 +344,6 @@ public static class MeshRecyclerPatches
         sizes.Add(size);
         classSizes = sizes.ToArray();
         classes = new List<MeshData>[classSizes.Length];
-        for (int c = 0; c < classes.Length; c++) classes[c] = new List<MeshData>();
+        for (var c = 0; c < classes.Length; c++) classes[c] = new List<MeshData>();
     }
 }

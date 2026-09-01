@@ -237,7 +237,7 @@ public partial class KometModSystem : ModSystem
             // aus -> kompakt (the player view) -> voll (the diagnostic instrument) -> aus.
             // The properties self-invalidate, so the next rendered frame shows exactly the
             // new state - the cycle rule itself lives in DebugHud where verify can pin it.
-            (bool v, bool c) = DebugHud.CycleF7(hud.Visible, hud.Compact);
+            (var v, var c) = DebugHud.CycleF7(hud.Visible, hud.Compact);
             hud.Compact = c;
             hud.Visible = v;
             return true;
@@ -256,7 +256,7 @@ public partial class KometModSystem : ModSystem
         if (config.ShadowMapExtraQuality > 0)
             fbRebuildListenerId = api.Event.RegisterGameTickListener(_ =>
             {
-                bool done = true;
+                var done = true;
                 try
                 {
                     if (capi?.World is Vintagestory.Client.NoObf.ClientMain game
@@ -439,9 +439,20 @@ public partial class KometModSystem : ModSystem
         {
             Patches.TightClonePatches.Apply(harmony);
             Patches.TightClonePatches.Enabled = config.TightCustomClones;
+            Patches.TightClonePatches.PoolExtras = config.PoolMeshExtras;
         }, config.TightCustomClones
             ? "compact custom-part clones (content-sized, not capacity-sized)"
             : "capacity-sized clones (vanilla); '.komet toggle tightclone' enables the compact ones live");
+
+        // Always applied, gated at runtime: a "my windmill vanished" report must be bisectable
+        // with '.komet toggle animcull' while it is on screen, and safemode switches it off.
+        Patch(() =>
+        {
+            Patches.AnimatableCullPatches.Apply(harmony);
+            Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
+        }, config.CullAnimatableRenderers
+            ? "animatable renderer frustum gate (animated block entities outside the stage's frustum are skipped)"
+            : "animatable renderer frustum gate off (vanilla); '.komet toggle animcull' enables it live");
 
         if (config.EntityTesselationBudgetMs > 0)
             Patch(() =>
@@ -528,7 +539,7 @@ public partial class KometModSystem : ModSystem
     /// </summary>
     private void SampleCameraForHitchLog()
     {
-        Vintagestory.API.Common.Entities.EntityPos pos = capi?.World?.Player?.Entity?.Pos;
+        var pos = capi?.World?.Player?.Entity?.Pos;
         if (pos != null) HitchLog.NoteCamera(pos.Yaw, pos.Pitch, pos.X, pos.Y, pos.Z);
     }
 
@@ -588,6 +599,7 @@ public partial class KometModSystem : ModSystem
         Patches.EdgeCoalescePatches.Reset(); // the world map is going away; pending marks with it
         Patches.EdgeRetessPriorityPatches.Reset(); // stats and sweep clock; queues die with the world
         Patches.MeshRecyclerPatches.Clear(); // held buffers must not outlive the world
+        Patches.TightClonePatches.ClearPools(); // same for the pooled extras arrays
         if (cameraSampler != null)
         {
             MeasurementPatches.FrameBoundary -= cameraSampler;

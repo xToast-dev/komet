@@ -1957,6 +1957,7 @@ internal static class Program
             FastCuller.Parallel = false;
             FrustumCulling culler = NewCuller();
             long incInsertsBefore = FastCuller.StatIncInserts;
+            long incRemovalsBefore = FastCuller.StatIncRemovals;
 
             var modes = new[]
             {
@@ -2022,12 +2023,20 @@ internal static class Program
                 }
                 else if (liveLocs.Count > 8)
                 {
-                    // remove - also a rebuild
+                    // remove - incremental too, mirroring the RemoveLocation prefix/postfix pair
                     int at = rnd.Next(liveLocs.Count);
+                    ModelDataPoolLocation gone = liveLocs[at];
+                    int p = FastCuller.IndexBeforeRemoval(live, gone);   // the prefix half
                     liveLocs.RemoveAt(at);
                     refLocs.RemoveAt(at);
-                    FastCuller.Invalidate(live);
+                    if (p == -2) FastCuller.Invalidate(live);           // the postfix half
+                    else FastCuller.NoteRemoved(live, p);
                 }
+
+                // Every third step skips the sweep, so appends stay PENDING across the next
+                // insert or removal - the interplay that used to force a rebuild on every
+                // streaming frame and now has to be folded exactly.
+                if (rnd.Next(3) == 0) continue;
 
                 EnumFrustumCullMode mode = modes[rnd.Next(modes.Length)];
                 live.FrustumCull(culler, mode);
@@ -2050,9 +2059,333 @@ internal static class Program
             long incInserts = FastCuller.StatIncInserts - incInsertsBefore;
             if (incInserts < 100)
                 throw new Exception($"only {incInserts} incremental inserts in 3000 steps - the fast path is not being taken");
+            long incRemovals = FastCuller.StatIncRemovals - incRemovalsBefore;
+            if (incRemovals < 100)
+                throw new Exception($"only {incRemovals} incremental removals in 3000 steps - the fast path is not being taken");
 
             FastCuller.Parallel = true;
             FastCuller.ForgetAllPools();
+        });
+
+        Check("incremental removal closes the exact slot: grid, overflow, pending appends, empty", () =>
+        {
+            // The shapes the fuzz may or may not hit, spelled out: a part in the grid, one in the
+            // overflow, one in front of pending appends (the streaming case), the first, the
+            // last, and everything down to an empty pool - each compared against a pool that
+            // only ever rebuilds, in every cull mode.
+            FastCuller.ForgetAllPools();
+            FastCuller.Parallel = false;
+            FrustumCulling culler = NewCuller();
+            MeshDataPool live = NewPool(), reference = NewPool();
+            var liveLocs = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(live);
+            var refLocs = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(reference);
+            refLocs.Clear();
+            foreach (ModelDataPoolLocation l in liveLocs) refLocs.Add(l);
+
+            var modes = new[]
+            {
+                EnumFrustumCullMode.CullNormal, EnumFrustumCullMode.CullInstantShadowPassNear,
+                EnumFrustumCullMode.CullInstantShadowPassFar, EnumFrustumCullMode.CullInstant, EnumFrustumCullMode.NoCull
+            };
+            int nextIndices = 900000;
+            ModelDataPoolLocation NewLoc(int x, int z)
+            {
+                var loc = new ModelDataPoolLocation
+                {
+                    IndicesStart = nextIndices, IndicesEnd = nextIndices + 300, LodLevel = 1,
+                    FrustumCullSphere = Sphere.BoundingSphereForCube(x, 128, z, 32)
+                };
+                nextIndices += 300;
+                return loc;
+            }
+            void Sync(string what)
+            {
+                foreach (EnumFrustumCullMode mode in modes)
+                {
+                    live.FrustumCull(culler, mode);
+                    FastCuller.Invalidate(reference);
+                    reference.FrustumCull(culler, mode);
+                    if (live.RenderedTriangles != reference.RenderedTriangles)
+                        throw new Exception($"{what} ({mode}): {live.RenderedTriangles} triangles vs {reference.RenderedTriangles}");
+                    List<(int, int)> a = Drawn(live), b = Drawn(reference);
+                    if (a.Count != b.Count) throw new Exception($"{what} ({mode}): {a.Count} ranges vs {b.Count}");
+                    for (int i = 0; i < a.Count; i++)
+                        if (a[i] != b[i]) throw new Exception($"{what} ({mode}): range {i} differs");
+                }
+            }
+            int removals = 0;
+            void Remove(int at, string what)
+            {
+                ModelDataPoolLocation gone = liveLocs[at];
+                int p = FastCuller.IndexBeforeRemoval(live, gone);
+                if (p != at) throw new Exception($"{what}: prefix found index {p}, expected {at}");
+                liveLocs.RemoveAt(at);
+                refLocs.RemoveAt(at);
+                FastCuller.NoteRemoved(live, p);
+                removals++;
+            }
+
+            long before = FastCuller.StatIncRemovals;
+            Sync("initial");                                   // builds the grid
+            Remove(0, "first part (grid)");                     Sync("after first");
+            Remove(liveLocs.Count - 1, "last part (grid)");     Sync("after last");
+            Remove(liveLocs.Count / 2, "middle part (grid)");   Sync("after middle");
+
+            // pending appends: three parts the cache has not folded, then a removal in front
+            for (int i = 0; i < 3; i++) { var l = NewLoc(64, 64 * i); liveLocs.Add(l); refLocs.Add(l); FastCuller.NoteAppended(live); }
+            Remove(5, "in front of pending appends");           Sync("after removal with pending appends");
+
+            // overflow: fold two appends, then take one of them out again
+            for (int i = 0; i < 2; i++) { var l = NewLoc(-96, 32 * i); liveLocs.Add(l); refLocs.Add(l); FastCuller.NoteAppended(live); }
+            Sync("appends folded into the overflow");
+            Remove(liveLocs.Count - 1, "overflow part");        Sync("after overflow removal");
+
+            // a mid-list insert rides in the overflow with its true index; removing it must find it there
+            { var l = NewLoc(160, -160); liveLocs.Insert(7, l); refLocs.Insert(7, l); FastCuller.NoteInserted(live, l); }
+            Sync("after mid-list insert");
+            Remove(7, "inserted part (overflow, mid-list index)"); Sync("after removing the inserted part");
+
+            // and a removal while an insert is still pending as an append, and vice versa
+            { var l = NewLoc(0, 200); liveLocs.Add(l); refLocs.Add(l); FastCuller.NoteAppended(live); }
+            Remove(liveLocs.Count - 1, "the pending append itself");   // p >= Count: nothing in the cache
+            Sync("after removing a pending append");
+
+            // all the way down
+            int step = 0;
+            while (liveLocs.Count > 0)
+            {
+                Remove(liveLocs.Count > 1 ? (step * 7) % liveLocs.Count : 0, "drain");
+                if (++step % 5 == 0 || liveLocs.Count == 0) Sync("drain " + liveLocs.Count);
+            }
+            if (live.indicesGroupsCount != 0) throw new Exception("empty pool still emits ranges");
+
+            long incremental = FastCuller.StatIncRemovals - before;
+            // the one removal of a never-folded pending append legitimately touches nothing
+            if (incremental < removals - 1)
+                throw new Exception($"only {incremental} of {removals} removals took the incremental path");
+
+            // switched off: the prefix says -2, the postfix must invalidate instead
+            FastCuller.IncrementalRemoval = false;
+            { var l = NewLoc(1, 1); liveLocs.Add(l); refLocs.Add(l); FastCuller.NoteAppended(live); }
+            Sync("refill");
+            if (FastCuller.IndexBeforeRemoval(live, liveLocs[0]) != -2) throw new Exception("switched off, the prefix still looked up an index");
+            FastCuller.IncrementalRemoval = true;
+
+            FastCuller.Parallel = true;
+            FastCuller.ForgetAllPools();
+        });
+
+        Check("chunk part extras cycle through the pool and come back sized by class", () =>
+        {
+            var pool = new ArrayPoolByClass<byte>(1);
+            int savedBudget = TightClonePatches.ExtrasPoolBudgetMb;
+            try
+            {
+                TightClonePatches.ExtrasPoolBudgetMb = 64;
+                var src = new byte[100];
+                for (int i = 0; i < src.Length; i++) src[i] = (byte)i;
+
+                byte[] a = pool.Rent(70, src);
+                if (a.Length != 128) throw new Exception($"70 elements landed in a {a.Length} array, expected the 128 class");
+                for (int i = 0; i < 70; i++) if (a[i] != i) throw new Exception("content not copied");
+                if (pool.StatMisses != 1) throw new Exception("first rent must be a miss");
+
+                pool.Return(a);
+                if (pool.HeldBytes != 128) throw new Exception("returned array not held");
+                byte[] b = pool.Rent(65, src);
+                if (!ReferenceEquals(a, b)) throw new Exception("the held array was not reused");
+                if (pool.StatHits != 1 || pool.HeldBytes != 0) throw new Exception("hit not booked");
+
+                // an array that grew via Array.Resize is not a class size and is left alone
+                pool.Return(new byte[100]);
+                if (pool.HeldBytes != 0) throw new Exception("a non-class array was pooled");
+                // too small to be worth it either
+                pool.Return(new byte[8]);
+                if (pool.HeldBytes != 0) throw new Exception("a tiny array was pooled");
+
+                // the budget refuses, and says so
+                TightClonePatches.ExtrasPoolBudgetMb = 0;
+                pool.Return(b);
+                if (pool.StatDropped != 1 || pool.HeldBytes != 0) throw new Exception("budget not enforced");
+                TightClonePatches.ExtrasPoolBudgetMb = 64;
+
+                // zero-count requests never touch the pool, and the empty array is never held
+                if (pool.Rent(0, src).Length != 0) throw new Exception("zero-count rent allocated");
+                pool.Return(Array.Empty<byte>());
+                if (pool.HeldBytes != 0) throw new Exception("the empty array was pooled");
+
+                // exact class boundaries: 16 -> 16, 17 -> 32
+                if (pool.Rent(16, src).Length != 16 || pool.Rent(17, src).Length != 32)
+                    throw new Exception("class rounding off by one");
+                pool.Clear();
+            }
+            finally { TightClonePatches.ExtrasPoolBudgetMb = savedBudget; }
+        });
+
+        Check("a recycler mesh clone rents its extras from the pool, a plain clone does not", () =>
+        {
+            // TightClonePatches.Apply ran in the clone test above; this exercises the two new
+            // halves: renting in CloneExtraData for a Recyclable destination, and the
+            // AddToPools prefix/postfix pair that returns exactly what the part's meshes held.
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "AddToPools"));
+            bool savedPool = TightClonePatches.PoolExtras;
+            try
+            {
+                TightClonePatches.Enabled = true;
+                TightClonePatches.PoolExtras = true;
+                TightClonePatches.ClearPools();
+                TightClonePatches.ResetStats();
+
+                var src = new MeshData(initialiseArrays: false);
+                src.SetVerticesCount(4);
+                src.xyz = new float[12]; src.Uv = new float[8]; src.Rgba = new byte[16]; src.Flags = new int[4];
+                src.Indices = new int[6]; src.SetIndicesCount(6);
+                src.XyzFaces = new byte[500]; src.XyzFaces[0] = 42; src.XyzFaces[2] = 7; src.XyzFacesCount = 3;
+                src.RenderPassesAndExtraBits = new short[500]; src.RenderPassesAndExtraBits[1] = 99; src.RenderPassCount = 3;
+                src.ClimateColorMapIds = new byte[500]; src.SeasonColorMapIds = new byte[500]; src.ColorMapIdsCount = 3;
+                src.CustomInts = new CustomMeshDataPartInt(2048) { InterleaveSizes = new[] { 1 }, InterleaveOffsets = new[] { 0 }, InterleaveStride = 4 };
+                for (int i = 0; i < 5; i++) src.CustomInts.Add(100 + i);
+                src.CustomFloats = new CustomMeshDataPartFloat(1000) { InterleaveSizes = new[] { 2 }, InterleaveOffsets = new[] { 0 }, InterleaveStride = 8 };
+                for (int i = 0; i < 10; i++) src.CustomFloats.Add(1.5f + i);
+
+                MethodInfo cloneExtra = AccessTools.Method(typeof(MeshData), "CloneExtraData");
+                var dest = new MeshData(initialiseArrays: false) { Recyclable = true };
+                cloneExtra.Invoke(src, new object[] { dest });
+
+                if (dest.XyzFaces.Length != 16 || dest.XyzFacesCount != 3 || dest.XyzFaces[0] != 42 || dest.XyzFaces[2] != 7)
+                    throw new Exception($"faces: length {dest.XyzFaces.Length}, count {dest.XyzFacesCount}");
+                if (dest.RenderPassesAndExtraBits.Length != 16 || dest.RenderPassCount != 3 || dest.RenderPassesAndExtraBits[1] != 99)
+                    throw new Exception("render passes not rented/copied");
+                if (dest.CustomInts.Values.Length != 16 || dest.CustomInts.Count != 5 || dest.CustomInts.Values[4] != 104)
+                    throw new Exception($"custom ints: length {dest.CustomInts.Values.Length}, count {dest.CustomInts.Count}");
+                if (dest.CustomFloats.Values.Length != 16 || dest.CustomFloats.Count != 10 || Math.Abs(dest.CustomFloats.Values[9] - 10.5f) > 1e-6)
+                    throw new Exception("custom floats not rented/copied");
+                if (TightClonePatches.StatExtrasMisses != 6)
+                    throw new Exception($"{TightClonePatches.StatExtrasMisses} rents booked, expected 6 (faces, 2 colour maps, passes, ints, floats)");
+
+                // the return half: a part holding this mesh goes through AddToPools' prefix,
+                // the upload disposes the mesh (extras nulled), the postfix returns the arrays
+                var part = (Vintagestory.Client.NoObf.TesselatedChunkPart)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart));
+                AccessTools.Field(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "modelDataLod0").SetValue(part, dest);
+                byte[] rentedFaces = dest.XyzFaces, rentedClimate = dest.ClimateColorMapIds, rentedSeason = dest.SeasonColorMapIds;
+                TightClonePatches.AddToPoolsPrefix(part, out TightClonePatches.Captured captured);
+                AccessTools.Method(typeof(MeshData), "DisposeExtraData").Invoke(dest, null);
+                if (dest.XyzFaces != null) throw new Exception("the engine's DisposeExtraData no longer nulls the extras - the return path's premise is gone");
+                TightClonePatches.AddToPoolsPostfix(captured);
+                if (TightClonePatches.PooledBytes == 0) throw new Exception("nothing came back to the pool");
+
+                var dest2 = new MeshData(initialiseArrays: false) { Recyclable = true };
+                cloneExtra.Invoke(src, new object[] { dest2 });
+                // the three byte arrays share one class; the pool is a stack, so any of them may
+                // come back first - what matters is that a RETURNED array is what came back
+                if (!ReferenceEquals(dest2.XyzFaces, rentedFaces) && !ReferenceEquals(dest2.XyzFaces, rentedClimate)
+                    && !ReferenceEquals(dest2.XyzFaces, rentedSeason))
+                    throw new Exception("the returned byte arrays were not reused");
+                if (TightClonePatches.StatExtrasHits != 6) throw new Exception($"{TightClonePatches.StatExtrasHits} hits, expected all 6 arrays reused");
+
+                // a part whose mesh is NOT a recycler mesh captures nothing (its arrays are vanilla's)
+                var plainPart = (Vintagestory.Client.NoObf.TesselatedChunkPart)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart));
+                AccessTools.Field(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "modelDataLod0").SetValue(plainPart, src.Clone());
+                TightClonePatches.AddToPoolsPrefix(plainPart, out TightClonePatches.Captured nothing);
+                if (nothing.Any) throw new Exception("a non-recyclable mesh's arrays were captured for pooling");
+
+                // plain clones and a switched-off pool keep exact, fresh arrays
+                MeshData plain = src.Clone();
+                if (plain.XyzFaces.Length != 3 || plain.CustomInts.Values.Length != 5) throw new Exception("a plain clone was pooled");
+                TightClonePatches.PoolExtras = false;
+                var dest3 = new MeshData(initialiseArrays: false) { Recyclable = true };
+                cloneExtra.Invoke(src, new object[] { dest3 });
+                if (dest3.XyzFaces.Length != 3 || dest3.CustomInts.Values.Length != 5) throw new Exception("switched off, the clone still rented");
+                TightClonePatches.AddToPoolsPrefix(part, out TightClonePatches.Captured off);
+                if (off.Any) throw new Exception("switched off, the prefix still captured");
+            }
+            finally
+            {
+                TightClonePatches.PoolExtras = savedPool;
+                TightClonePatches.ClearPools();
+                TightClonePatches.ResetStats();
+            }
+        });
+
+        Check("animatable renderer gate skips only spheres fully outside the stage frustum", () =>
+        {
+            AnimatableCullPatches.Apply(harmony);
+            ForceJit(AccessTools.Method(typeof(AnimatableRenderer), nameof(AnimatableRenderer.OnRenderFrame),
+                                        new[] { typeof(float), typeof(EnumRenderStage) }));
+            FrustumCulling culler = NewCuller(); // eye at (0,140,0) looking down +x
+
+            if (AnimatableCullPatches.ShouldSkip(culler, 200, 130, 0, 8f, 1, 1, 1))
+                throw new Exception("an instance in plain view was skipped");
+            if (!AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, 8f, 1, 1, 1))
+                throw new Exception("an instance behind the camera was not skipped");
+
+            // the edge: find the first z beside the view at x=100 where a 1-block sphere is
+            // out, then the same spot with a bigger scale reaches back in and must stay
+            double zEdge = -1;
+            for (double z = 0; z < 2000; z += 1)
+                if (AnimatableCullPatches.ShouldSkip(culler, 100, 130, z, 1f, 1, 1, 1)) { zEdge = z; break; }
+            if (zEdge < 50) throw new Exception($"no frustum edge found (z {zEdge})");
+            if (AnimatableCullPatches.ShouldSkip(culler, 100, 130, zEdge, 1f, 8, 8, 8))
+                throw new Exception("a scaled-up sphere reaching into the frustum was skipped");
+            if (AnimatableCullPatches.ShouldSkip(culler, 100, 130, zEdge, 8f, 1, 1, 1))
+                throw new Exception("a larger sphere reaching into the frustum was skipped");
+
+            // anything degenerate is not "certainly outside" and hands the call to vanilla
+            if (AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, 8f, float.NaN, 1, 1)) throw new Exception("NaN scale skipped");
+            if (AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, 8f, 0, 0, 0)) throw new Exception("zero scale skipped");
+            if (AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, float.NaN, 1, 1, 1)) throw new Exception("NaN radius skipped");
+            if (AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, 0f, 1, 1, 1)) throw new Exception("zero radius skipped");
+            // mirroring (negative scale) is a scale like any other
+            if (!AnimatableCullPatches.ShouldSkip(culler, -200, 130, 0, 8f, -1, 1, 1)) throw new Exception("negative scale not handled");
+
+            // the property, not the formula: whatever is skipped is outside vanilla's own test
+            var rnd = new Random(77);
+            int skipped = 0;
+            for (int i = 0; i < 2000; i++)
+            {
+                double x = rnd.Next(-600, 600), y = 100 + rnd.Next(80), z = rnd.Next(-600, 600);
+                float r = 1 + (float)rnd.NextDouble() * 20, s = 0.5f + (float)rnd.NextDouble() * 3;
+                bool skip = AnimatableCullPatches.ShouldSkip(culler, x, y, z, r, s, s, s);
+                if (skip && culler.SphereInFrustum(x + 0.5, y, z + 0.5, r * s)) throw new Exception("skipped a sphere vanilla's test calls visible");
+                if (skip) skipped++;
+            }
+            if (skipped < 200) throw new Exception($"only {skipped} of 2000 random spheres skipped - the gate is not doing anything");
+
+            // bounds from a mesh: a unit cube's far corner from the pivot (0.5, 0, 0.5)
+            var cube = new MeshData(initialiseArrays: false) { xyz = new float[] { 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0 } };
+            cube.SetVerticesCount(4);
+            float rest = AnimatableCullPatches.RestRadius(cube);
+            if (Math.Abs(rest - Math.Sqrt(1.5)) > 1e-5) throw new Exception($"rest radius {rest}");
+            float gate = AnimatableCullPatches.GateRadius(rest);
+            if (gate < rest * AnimatableCullPatches.RadiusFactor + AnimatableCullPatches.RadiusMargin - 1e-5f) throw new Exception("gate radius lost its margin");
+            if (!float.IsNaN(AnimatableCullPatches.RestRadius(new MeshData(initialiseArrays: false)))) throw new Exception("no geometry must give no bounds");
+            if (!float.IsNaN(AnimatableCullPatches.RestRadius(null))) throw new Exception("null mesh must give no bounds");
+
+            // an instance the constructor patch never saw has no bounds and is never gated
+            var bare = (AnimatableRenderer)RuntimeHelpers.GetUninitializedObject(typeof(AnimatableRenderer));
+            bare.ShouldRender = true;
+            AnimatableCullPatches.Enabled = true;
+            if (!AnimatableCullPatches.RenderPrefix(bare, EnumRenderStage.Opaque)) throw new Exception("an instance without bounds was gated");
+            AnimatableCullPatches.ResetStats();
+        });
+
+        Check("a hitch line names the rebuild share of a rebuild-dominated sweep", () =>
+        {
+            HitchLog.Reset();
+            var buckets = new double[HitchLog.BucketCount];
+            buckets[HitchLog.Opaque] = 45;
+            HitchLog.OnFrame(50, 10, 0, buckets, null, 12.0, 0, 0, 0, 0, 9.4, 412);
+            HitchLog.OnFrame(10, 10, 0, new double[HitchLog.BucketCount]); // commits it
+            string line = HitchLog.BuildReport();
+            if (!line.Contains("(davon 9,4 rebuild, 412 pools)") && !line.Contains("(davon 9.4 rebuild, 412 pools)"))
+                throw new Exception("rebuild share missing from the hitch line:\n" + line);
+
+            // a rebuild share that does not explain the sweep stays out of the line
+            HitchLog.Reset();
+            HitchLog.OnFrame(50, 10, 0, buckets, null, 12.0, 0, 0, 0, 0, 0.8, 3);
+            HitchLog.OnFrame(10, 10, 0, new double[HitchLog.BucketCount]);
+            if (HitchLog.BuildReport().Contains("rebuild,")) throw new Exception("a sub-share rebuild was printed");
+            HitchLog.Reset();
         });
 
         Check("TryAdd / RemoveLocation invalidate the cache", () =>

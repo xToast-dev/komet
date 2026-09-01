@@ -22,7 +22,7 @@ public partial class KometModSystem
     /// </summary>
     private string BuildFullReport()
     {
-        CultureInfo ci = CultureInfo.CurrentCulture;
+        var ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(6144);
 
         sb.Append("==================== Komet report ").Append(KometVersion.Display(Mod.Info.Version))
@@ -32,8 +32,8 @@ public partial class KometModSystem
         // The GC pair is deliberately both halves: what was asked for and what the runtime
         // actually does. A DOTNET_gcServer that never reached the process looks exactly like
         // one that was never set, and that difference has already cost one wrong conclusion.
-        string asked = Environment.GetEnvironmentVariable("DOTNET_gcServer")
-                       ?? Environment.GetEnvironmentVariable("COMPlus_gcServer");
+        var asked = Environment.GetEnvironmentVariable("DOTNET_gcServer")
+                    ?? Environment.GetEnvironmentVariable("COMPlus_gcServer");
         sb.AppendFormat(ci, "umgebung: {0} logische kerne, .net {1}, {2}\n",
             Environment.ProcessorCount, Environment.Version, Environment.OSVersion.VersionString);
         sb.AppendFormat(ci, "gc: modus {0}, angefordert {1}, latenz {2} | laufzeit {3:F0} min\n",
@@ -53,11 +53,11 @@ public partial class KometModSystem
         {
             var platform = Vintagestory.Client.ScreenManager.Platform
                 as Vintagestory.Client.NoObf.ClientPlatformWindows;
-            string refresh = "?";
+            var refresh = "?";
             if (platform?.window != null)
                 refresh = OpenTK.Windowing.Desktop.Monitors.GetMonitorFromWindow(platform.window)
                     .CurrentVideoMode.RefreshRate.ToString(ci);
-            int vsync = Vintagestory.Client.NoObf.ClientSettings.VsyncMode;
+            var vsync = Vintagestory.Client.NoObf.ClientSettings.VsyncMode;
             sb.AppendFormat(ci, "anzeige: vsync {0}, fps-limit {1:F0}, monitor {2} Hz\n",
                 vsync == 1 ? "an" : vsync == 0 ? "aus" : "modus " + vsync,
                 Vintagestory.Client.ScreenManager.Platform?.MaxFps ?? 0, refresh);
@@ -67,7 +67,7 @@ public partial class KometModSystem
             sb.Append("anzeige: nicht abfragbar (").Append(e.GetType().Name).Append(")\n");
         }
 
-        string delta = ConfigDelta(config);
+        var delta = ConfigDelta(config);
         sb.Append("konfig: ").Append(ConfigFile).Append(" layout ").Append(KometConfig.Current)
           .Append(", abweichend vom standard: ").Append(delta ?? "keine").Append('\n');
 
@@ -95,7 +95,7 @@ public partial class KometModSystem
     {
         var defaults = new KometConfig();
         var parts = new System.Collections.Generic.List<string>(8);
-        foreach (System.Reflection.PropertyInfo p in typeof(KometConfig).GetProperties())
+        foreach (var p in typeof(KometConfig).GetProperties())
         {
             if (!p.CanRead || !p.CanWrite) continue;
             // Bookkeeping, not a setting: it carries the config layout version and is stamped
@@ -133,7 +133,9 @@ public partial class KometModSystem
         DebugHud.Row(sb, "teile getest.", DebugHud.N(partsPerFrame?.PerFrame ?? 0), null,
             DebugHud.N(cellsSkippedPerFrame?.PerFrame ?? 0) + " zellen weg");
         DebugHud.Row(sb, "davon rebuild", DebugHud.N(rebuildsPerFrame?.PerFrame ?? 0), DebugHud.Ms(RebuildMsPerFrame()),
-            FastCuller.StatIncInserts > 0 ? DebugHud.N(FastCuller.StatIncInserts) + " inkrementell" : null);
+            FastCuller.StatIncInserts + FastCuller.StatIncRemovals > 0
+                ? DebugHud.N(FastCuller.StatIncInserts) + " +/" + DebugHud.N(FastCuller.StatIncRemovals) + " - inkrementell"
+                : null);
         // raw running totals: if these stay at zero the patch is not firing at all, which is a
         // different problem from the smoothed per-frame figures reading zero
         DebugHud.Row(sb, "sweeps/frame", DebugHud.N(sweepsPerFrame?.PerFrame ?? 0), null,
@@ -143,14 +145,14 @@ public partial class KometModSystem
                 CullVerifier.StatMismatches > 0
                     ? "!! " + DebugHud.N(CullVerifier.StatMismatches) + " ABWEICHUNGEN (log)"
                     : "alle gleich vanilla");
-        double raw = rawRangesPerFrame?.PerFrame ?? 0;
-        double emitted = rangesPerFrame?.PerFrame ?? 0;
+        var raw = rawRangesPerFrame?.PerFrame ?? 0;
+        var emitted = rangesPerFrame?.PerFrame ?? 0;
         DebugHud.Row(sb, "draw ranges", DebugHud.N(emitted), null,
             "von " + DebugHud.N(raw) + " (" + (emitted > 0 ? raw / emitted : 1).ToString("F1", CultureInfo.CurrentCulture) + "x)");
         DebugHud.Row(sb, "occlusion", null, DebugHud.Ms(FastChunkCuller.StatLastMs), "worker-thread");
 
         // -- shadows --
-        long shadowFrames = Patches.ShadowThrottlePatches.FarRendered + Patches.ShadowThrottlePatches.FarSkipped;
+        var shadowFrames = Patches.ShadowThrottlePatches.FarRendered + Patches.ShadowThrottlePatches.FarSkipped;
         if (shadowFrames > 0)
             // "schatten-takt", not "schatten fern": the frame-aufteilung block above already
             // has a row named schatten fern that means milliseconds - one name, one meaning
@@ -190,10 +192,10 @@ public partial class KometModSystem
         if (Patches.TesselationPatches.StatPrefetchedUnpacks > 0)
             DebugHud.Row(sb, "prefetch", DebugHud.N(Patches.TesselationPatches.StatPrefetchedUnpacks), null,
                 "chunks vorentpackt");
-        long pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
+        var pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
         if (pipeTotal > 0)
         {
-            string tail = DebugHud.N(WindowPrebuilder.StatHits) + "/" + DebugHud.N(pipeTotal) + " fenster";
+            var tail = DebugHud.N(WindowPrebuilder.StatHits) + "/" + DebugHud.N(pipeTotal) + " fenster";
             if (WindowPrebuilder.StatStale > 0) tail += ", " + DebugHud.N(WindowPrebuilder.StatStale) + " stale";
             if (WindowPrebuilder.ValidateRemaining > 0)
                 tail += " (validiert " + DebugHud.N(WindowPrebuilder.StatValidated) + ")";
@@ -212,6 +214,11 @@ public partial class KometModSystem
                     ? ", " + DebugHud.N(Patches.EdgeRetessPriorityPatches.StatBusySkips) + "x prio-voll"
                     : "")
                 + (Patches.EdgeRetessPriorityPatches.Enabled ? "" : " (AUS)"));
+        // Shown while the gate is armed even at 0 - idle must not look like broken.
+        if (Patches.AnimatableCullPatches.Enabled || Patches.AnimatableCullPatches.StatCalls > 0)
+            DebugHud.Row(sb, "animatable-gate", DebugHud.N(Patches.AnimatableCullPatches.StatSkipped), null,
+                "von " + DebugHud.N(Patches.AnimatableCullPatches.StatCalls) + " aufrufen uebersprungen"
+                + (Patches.AnimatableCullPatches.Enabled ? "" : " (AUS)"));
         if (Patches.EdgeCoalescePatches.StatAbsorbed + Patches.EdgeCoalescePatches.StatFlushed > 0)
             DebugHud.Row(sb, "edge-koalesz", DebugHud.N(Patches.EdgeCoalescePatches.StatAbsorbed), null,
                 "gespart, " + DebugHud.N(Patches.EdgeCoalescePatches.StatFlushed) + " ausgegeben, "
@@ -256,17 +263,17 @@ public partial class KometModSystem
     {
         if (safeMode) DebugHud.Row(sb, "!! SAFEMODE", "AN", null, "alles vanilla, '.komet safemode'");
         if (StressTest.StatusLine != null) DebugHud.Row(sb, "!! STRESSTEST", null, null, StressTest.StatusLine);
-        string diag = ActiveDiagnostics();
+        var diag = ActiveDiagnostics();
         if (diag != null) DebugHud.Row(sb, "!! DIAGNOSE", null, null, diag);
     }
 
     /// <summary>Which of the two bit-identical sweep kernels is running, and on how many threads.</summary>
     private static string CullKernel()
     {
-        string kernel = !FastCuller.VectorAvailable ? "skalar (keine AVX-CPU)"
+        var kernel = !FastCuller.VectorAvailable ? "skalar (keine AVX-CPU)"
                       : FastCuller.VectorCulling ? "avx2 (4 teile je befehl)"
                       : "skalar (vektorkernel aus)";
-        int helpers = FastCuller.Workers.ThreadCount;
+        var helpers = FastCuller.Workers.ThreadCount;
         return helpers == 0
             ? kernel + ", 1 thread"
             : kernel + ", " + (helpers + 1) + " threads (eigene, nicht der threadpool)";
@@ -276,8 +283,8 @@ public partial class KometModSystem
     /// whole overlay and stretched every other row's whitespace with it.</summary>
     private static string CullKernelShort()
     {
-        string kernel = FastCuller.VectorAvailable && FastCuller.VectorCulling ? "avx2" : "skalar";
-        int threads = FastCuller.Workers.ThreadCount + 1;
+        var kernel = FastCuller.VectorAvailable && FastCuller.VectorCulling ? "avx2" : "skalar";
+        var threads = FastCuller.Workers.ThreadCount + 1;
         return kernel + " · " + (threads == 1 ? "1 thread" : threads + " threads");
     }
 
@@ -316,10 +323,10 @@ public partial class KometModSystem
     {
         // ShadowBoxSpan is captured right after the far cascade renders, so it is the real
         // number within a frame of world join; the estimate below only covers those frames.
-        double span = Patches.ShadowPatches.ShadowBoxSpan;
+        var span = Patches.ShadowPatches.ShadowBoxSpan;
         if (span <= 0)
         {
-            double distance = Patches.ShadowPatches.ShadowDistance;
+            var distance = Patches.ShadowPatches.ShadowDistance;
             if (distance <= 0) return 0;
             span = Patches.ShadowPatches.SymmetricBox
                 ? 2.0 * Patches.ShadowPatches.BoxRadiusFactor * distance
@@ -343,7 +350,7 @@ public partial class KometModSystem
     /// </summary>
     private string LoggedStats()
     {
-        string stats = BuildStats();
+        var stats = BuildStats();
         Mod.Logger.Notification("stats requested:\n{0}", stats);
         return stats;
     }
@@ -359,9 +366,9 @@ public partial class KometModSystem
         if (FastCuller.StatSweeps == 0) return "komet: no cull sweeps recorded yet - join a world first";
         if (!FrameStats.HasData) return "komet: sammelt noch - die Zaehler brauchen ein paar hundert gerenderte Frames";
 
-        CultureInfo ci = CultureInfo.CurrentCulture;
-        double frame = FrameStats.AvgFrameMs;
-        double fps = frame > 0 ? 1000.0 / frame : 0;
+        var ci = CultureInfo.CurrentCulture;
+        var frame = FrameStats.AvgFrameMs;
+        var fps = frame > 0 ? 1000.0 / frame : 0;
         double Pct(double ms) => frame > 0 ? 100.0 * ms / frame : 0;
 
         var sb = new StringBuilder(1024);
@@ -370,7 +377,7 @@ public partial class KometModSystem
 
         sb.AppendFormat(ci, "frame {0:F2} ms = {1:F0} fps, schlechtester {2:F1} ms",
             frame, fps, FrameStats.MaxFrameMs);
-        string worst = DebugHud.WorstFrameTail();
+        var worst = DebugHud.WorstFrameTail();
         if (worst != null) sb.Append(" (davon ").Append(worst).Append(')');
         sb.AppendFormat(ci, " | game tick {0:F2} ms | gpu {1:F2} ms | gc {2:F1} ms/s pausen, "
             + "{3:F0} MB/s alloc, gen0 {4:F0}/s, gen2 {5:F1}/s, modus {6}\n",
@@ -399,7 +406,7 @@ public partial class KometModSystem
             FrameStats.CpuCoresBusy, Environment.ProcessorCount,
             100.0 * FrameStats.CpuCoresBusy / Environment.ProcessorCount);
 
-        double shadows = FrameStats.ShadowMs;
+        var shadows = FrameStats.ShadowMs;
         sb.AppendFormat(ci, "stages: opaque {0:F2} | schatten {1:F2} ({2:F0}%) | oit {3:F2} | "
             + "ortho {4:F2} | done {5:F2}\n",
             FrameStats.StageMs[(int)EnumRenderStage.Opaque], shadows, Pct(shadows),
@@ -417,6 +424,8 @@ public partial class KometModSystem
             + "ueber {3:N0} pools, kernel {4}\n",
             RebuildMsPerFrame(), rebuildsPerFrame?.PerFrame ?? 0,
             sweepsPerFrame?.PerFrame ?? 0, hud?.PoolCount ?? 0, CullKernel());
+        sb.AppendFormat(ci, "  inkrementell: {0:N0} einfuegungen, {1:N0} entfernungen ohne rebuild\n",
+            FastCuller.StatIncInserts, FastCuller.StatIncRemovals);
 
         // The share of the sweep that was waiting rather than culling. Near zero is the healthy
         // state and the reason this line exists: it used to be most of the sweep, invisibly,
@@ -431,7 +440,7 @@ public partial class KometModSystem
                 FastCuller.StatPartsHeld / (double)FastCuller.StatPoolsLive,
                 FastCuller.PartsPerCellTarget);
 
-        long batches = FastCuller.Workers.StatRuns;
+        var batches = FastCuller.Workers.StatRuns;
         if (batches > 0)
             sb.AppendFormat(ci, "  cull-threads: {0:F3} ms warten je batch ueber {1:N0} batches"
                 + "{3}, occlusion auf {2} threads\n",
@@ -449,16 +458,16 @@ public partial class KometModSystem
                     ? " (" + FastCuller.Workers.StatContendedInline.ToString("N0", ci) + "x inline wegen kontention)"
                     : "");
 
-        string diag = ActiveDiagnostics();
+        var diag = ActiveDiagnostics();
         if (diag != null)
             sb.AppendFormat(ci, "  DIAGNOSE LAEUFT MIT: {0} - kostet frame-zeit, safemode schaltet das nicht ab\n", diag);
         if (CullVerifier.SampleEvery > 0 || CullVerifier.StatMismatches > 0)
             sb.AppendFormat(ci, "  sweep-check: {0:N0} sweeps gegen vanilla geprueft, {1:N0} abweichungen\n",
                 CullVerifier.StatChecked, CullVerifier.StatMismatches);
 
-        double raw = rawRangesPerFrame?.PerFrame ?? 0;
-        double emitted = rangesPerFrame?.PerFrame ?? 0;
-        double bridged = bridgedPerFrame?.PerFrame ?? 0;
+        var raw = rawRangesPerFrame?.PerFrame ?? 0;
+        var emitted = rangesPerFrame?.PerFrame ?? 0;
+        var bridged = bridgedPerFrame?.PerFrame ?? 0;
         sb.AppendFormat(ci, "draw ranges {0:N0} von {1:N0} ({2:F1}x), draw calls {3:N0}/frame, "
             + "{4:N0} dreiecke\n",
             emitted, raw, emitted > 0 ? raw / emitted : 1.0,
@@ -490,7 +499,7 @@ public partial class KometModSystem
             Patches.PrioUploadPatches.StatUploadedChunks, Patches.PrioUploadPatches.StatDeferrals,
             FastChunkCuller.StatLastMs, FastChunkCuller.StatChunksSnapshotted);
 
-        long pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
+        var pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
         sb.AppendFormat(ci, "laden: {0:F0} chunks/s empfangen, {1:F0}/s tesseliert a {2:F2} ms "
             + "({3:F1} nachbarn, {4:F1} licht, {5:F0}% rand, {6:F0} MB/s: nachbarn {7:F0}, "
             + "licht {8:F0}, klone {9:F0}, shapes {10:F0}, rest {11:F0}), warteschl. {12:N0}, "
@@ -519,7 +528,7 @@ public partial class KometModSystem
         // to the GC despite the pool - the number the whole patch exists to shrink; if it
         // stays high with the pool on, the loading allocation lives somewhere else and this
         // row is the disproof.
-        long recyclerAsked = Patches.MeshRecyclerPatches.StatHits + Patches.MeshRecyclerPatches.StatMisses;
+        var recyclerAsked = Patches.MeshRecyclerPatches.StatHits + Patches.MeshRecyclerPatches.StatMisses;
         if (Patches.MeshRecyclerPatches.Enabled && recyclerAsked > 0)
             sb.AppendFormat(ci, "  mesh-recycler: {0:F0}% treffer ({1:N0} anfragen), {2:N0} MB vorgehalten, "
                 + "{3:N0} MB frisch alloziert, {4:N0} verdraengt\n",
@@ -532,6 +541,23 @@ public partial class KometModSystem
             sb.AppendFormat(ci, "  klon-kompakt: {0:N0} clones, {1:N0} MB kapazitaets-kopien gespart\n",
                 Patches.TightClonePatches.StatClones,
                 Patches.TightClonePatches.StatBytesSaved / 1048576.0);
+        // Printed whenever the pool is armed: hits at 0 with misses climbing means the return
+        // path is not firing (the AddToPools postfix), which must not look like "no data yet".
+        if (Patches.TightClonePatches.Enabled || Patches.TightClonePatches.StatClones > 0)
+        {
+            var hits = Patches.TightClonePatches.StatClones;
+            var misses = Patches.TightClonePatches.StatExtrasMisses;
+            var total = hits + misses;
+            sb.AppendFormat(ci, "  extras-pool: {0:F0}% treffer ({1:N0} anfragen), {2:N0} MB vorgehalten, {3:N0} verworfen{4}\n",
+                total > 0 ? 100.0 * hits / total : 0, total,
+                Patches.TightClonePatches.PooledBytes / 1048576.0,
+                Patches.TightClonePatches.StatExtrasDropped,
+                Patches.TightClonePatches.Enabled ? "" : " (AUS)");
+        }
+        if (Patches.AnimatableCullPatches.Enabled || Patches.AnimatableCullPatches.StatCalls > 0)
+            sb.AppendFormat(ci, "animatable-gate: {0:N0} von {1:N0} aufrufen uebersprungen{2}\n",
+                Patches.AnimatableCullPatches.StatSkipped, Patches.AnimatableCullPatches.StatCalls,
+                Patches.AnimatableCullPatches.Enabled ? "" : " (AUS)");
 
         sb.AppendFormat(ci, "vram: {0:N0} MB aus {1:N0} leeren pools zurueckgegeben, {2:N0} noch leer\n",
             PoolReclaimer.StatBytesReclaimed / 1048576.0, PoolReclaimer.StatPoolsReclaimed,
@@ -550,7 +576,7 @@ public partial class KometModSystem
     /// <summary>Which GL path chunk uploads take, and whether the bulk-copy patch matters on it.</summary>
     private static string UploadPathDescription()
     {
-        long bulkCalls = Patches.MeshUploadPatches.StatBulkCalls;
+        var bulkCalls = Patches.MeshUploadPatches.StatBulkCalls;
         if (bulkCalls > 0) return $"persistent mapping, {bulkCalls:N0} bulk copies";
         if (Patches.MeshUploadPatches.StatFallbackCalls > 0) return "glBufferSubData, bulk-copy-patch wirkungslos";
         return "glBufferSubData; treiber "
