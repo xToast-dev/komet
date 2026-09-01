@@ -1557,7 +1557,20 @@ cd komet
 
 Deinstallieren: `rm ~/.config/VintagestoryData/Mods/Komet.dll`
 
-## Vergleichen: die Baseline-Mod
+### Das F7-HUD (Layout seit 01.09.)
+
+Vier Blöcke statt einer flachen Liste: **Kopf** (fps, gpu-frame, schlechtester Frame mit
+Aufteilung, Ruckler), **frame-aufteilung** (jeder Bucket des Frames in der Reihenfolge und
+mit dem Vokabular des Hitch-Logs — inklusive game tick und `ausserhalb` summiert der Block
+auf 100 %), **gc** (Pausen, Alloc-Quellen, Modus) und **welt & laden** (Draw Calls,
+Chunks, Tesselation, VRAM, Upload). Neben jedem Frame-Bucket steht ein Balken: zehn Zellen
+sind der ganze Frame, Achtel-Zellen über die Unicode-Blockelemente. Ob die Blockglyphen in
+der Monospace-Zelle des Systems wirklich eine Zelle breit sind, wird einmal beim
+Metrik-Probing gemessen; weicht der Font ab, degradieren die Balken zu `#`, statt aus der
+Box zu laufen (die Rasterbreite rechnet in Zeichenzellen). Die Schatten-Zeilen der
+Aufteilung enthalten jetzt auch die Done-Hälften der Kaskaden, damit zwischen den Zeilen
+nichts mehr versteckt ist; die Drossel-Zeile der Komet-Sektion heißt `schatten-takt`,
+damit kein Name zwei Bedeutungen hat.
 
 Neben `Komet.dll` wird `KometBaseline.dll` mit installiert. Die enthält **nur die Messung**
 und **keine einzige Optimierung** — dasselbe HUD, aus buchstäblich denselben Quelldateien
