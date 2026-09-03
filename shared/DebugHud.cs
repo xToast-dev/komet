@@ -399,9 +399,9 @@ public class DebugHud : IRenderer
 
                 if (game.WorldMap != null) loadedChunks = ChunksRef(game.WorldMap)?.Count ?? 0;
             }
-
-            TesselationStats.Sample();
-            FrameStats.SampleGc();
+            // The per-second rates (GC, allocation, CPU, tesselation) fold at the frame
+            // boundary now - see FrameStats.SampleIntervalSeconds - so the overlay only reads
+            // them. Folding them here meant a report with the overlay off printed zeros.
         }
         catch
         {
@@ -674,7 +674,9 @@ public class DebugHud : IRenderer
         Row(sb, "fps", fps.ToString("F0", ci), Ms(frame));
         if (GpuFrameTimer.GpuMs > 0)
             Row(sb, "gpu-frame", Pct(GpuFrameTimer.GpuMs, frame), Ms(GpuFrameTimer.GpuMs),
-                GpuFrameTimer.GpuMs >= frame * 0.95 ? "GPU-LIMITIERT" : null);
+                GpuBusy.IsLimited(GpuFrameTimer.GpuMs, frame) ? "GPU-LIMITIERT" : null);
+        if (GpuBusy.Available)
+            Row(sb, "gpu-last", GpuBusy.Percent.ToString(ci) + " %", null, GpuBusy.Source);
         if (HitchLog.TotalHitches > 0)
         {
             Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
@@ -727,7 +729,25 @@ public class DebugHud : IRenderer
             // The one comparison that settles CPU-bound vs GPU-bound: gpu >= cpu frame time
             // means the GPU is the wall and CPU work cannot move the framerate.
             var gpu = GpuFrameTimer.GpuMs;
-            Row(sb, "gpu-frame", Pct(gpu, frame), Ms(gpu), gpu >= frame * 0.95 ? "GPU-LIMITIERT" : null);
+            Row(sb, "gpu-frame", Pct(gpu, frame), Ms(gpu), GpuBusy.IsLimited(gpu, frame) ? "GPU-LIMITIERT" : null);
+        }
+        // The span above includes the GPU's idle gaps between submissions; this is what the
+        // driver counted as busy. The two differ exactly when the CPU is the wall.
+        if (GpuBusy.Available)
+            Row(sb, "gpu-last", GpuBusy.Percent.ToString(ci) + " %", null, "auslastung (" + GpuBusy.Source + ")");
+        if (GpuFrameTimer.StageSamples > 0)
+        {
+            // the GPU's own split, next to the CPU-side stage rows further down
+            var shadowGpu = GpuFrameTimer.StageSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone,
+                EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone);
+            var postGpu = GpuFrameTimer.StageSum(EnumRenderStage.AfterOIT, EnumRenderStage.AfterPostProcessing,
+                EnumRenderStage.AfterFinalComposition, EnumRenderStage.AfterBlit);
+            Row(sb, "gpu-stages", null, null,
+                "schatten " + shadowGpu.ToString("F1", ci)
+                + " · opaque " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Opaque].ToString("F1", ci)
+                + " · oit " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.OIT].ToString("F1", ci)
+                + " · post " + postGpu.ToString("F1", ci)
+                + " · ortho " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Ortho].ToString("F1", ci) + " ms");
         }
         Row(sb, "schlechtester", null, Ms(FrameStats.MaxFrameMs));
         // where the worst frame actually went - a hitch's cause is invisible in the smoothed

@@ -41,9 +41,21 @@ public partial class KometModSystem
             asked ?? "(nichts gesetzt)",
             System.Runtime.GCSettings.LatencyMode,
             uptime.Elapsed.TotalMinutes);
+        // Physical cores decide every thread budget in the mod (cull, occlusion, worldgen);
+        // the source says whether the OS answered or the rule of thumb did - a laptop's
+        // 2c/4t reported as four cores was the whole thread oversubscription story of 02.09.
+        sb.AppendFormat(ci, "kerne: {0} physisch von {1} logischen ({2})\n",
+            CpuTopology.PhysicalCores, CpuTopology.LogicalCores, CpuTopology.Source);
         sb.AppendFormat(ci, "cull-threads {0}, occlusion-threads {1}, safemode {2}\n",
             FastCuller.Workers.ThreadCount + 1, FastChunkCuller.Workers.ThreadCount + 1,
             safeMode ? "AN - die messung sagt nichts ueber die mod aus!" : "aus");
+        if (MeasurementPatches.SkippedBrackets.Count > 0)
+            sb.AppendFormat(ci, "messung ohne: {0} (engine-build weicht ab, diese zeilen bleiben leer)\n",
+                string.Join(", ", MeasurementPatches.SkippedBrackets));
+        // Is anybody else on komet's methods, and is this the engine komet was verified
+        // against - the two questions a field report from a modified client has to answer
+        // before any of its numbers mean anything.
+        sb.Append(PatchGuard.ReportLines());
 
         // Display pacing, because a field report showed 36 fps at 7% CPU with the GPU just
         // over the refresh budget - vsync quantising into half-rate frames looks exactly like
@@ -243,6 +255,50 @@ public partial class KometModSystem
                           ? " (" + Patches.EntityTessPatches.StatWorstName + ")" : "")
                     : "")
                 + (Patches.EntityTessPatches.Enabled ? "" : " (AUS)"));
+        // Shown while armed even at 0 - a join flood is the only time it has work, and
+        // "0 geladen" then has to read as correct idleness, not as a prefix that never ran.
+        if (Patches.EntityLoadPatches.Enabled || Patches.EntityLoadPatches.StatLoaded > 0)
+            DebugHud.Row(sb, "entity-laden", DebugHud.N(Patches.EntityLoadPatches.StatLoaded), null,
+                DebugHud.N(Patches.EntityLoadPatches.PendingCount) + " offen, "
+                + DebugHud.N(Patches.EntityLoadPatches.StatDeferredFrames) + " frames verteilt"
+                + (Patches.EntityLoadPatches.StatWorstMs >= 5
+                    ? " · langsamste " + Patches.EntityLoadPatches.StatWorstMs.ToString("F0", CultureInfo.CurrentCulture)
+                      + " ms" + (Patches.EntityLoadPatches.StatWorstCode != null
+                          ? " (" + Patches.EntityLoadPatches.StatWorstCode + ")" : "")
+                    : "")
+                + (Patches.EntityLoadPatches.Enabled ? "" : " (AUS)"));
+        if (Patches.MinimapPatches.Enabled || Patches.MinimapPatches.StatTicks > 0)
+            DebugHud.Row(sb, "minimap", Patches.MinimapPatches.Cap + "/tick", DebugHud.Ms(Patches.MinimapPatches.AvgTickMs),
+                DebugHud.N(Patches.MinimapPatches.StatTicks) + " upload-ticks"
+                + (Patches.MinimapPatches.DirectUpload ? ", direkt " + DebugHud.N(Patches.MinimapPatches.StatDirectPieces) + " kacheln" : ", FBO-pfad")
+                + (Patches.MinimapPatches.Enabled ? "" : " (AUS)"));
+        if (Patches.MainThreadTaskPatches.Enabled)
+        {
+            var topTasks = Patches.MainThreadTaskPatches.Top(1);
+            DebugHud.Row(sb, "mt-tasks", null, DebugHud.Ms(FrameStats.AvgMainTaskMs),
+                (topTasks.Count > 0
+                    ? "meist " + topTasks[0].code + " " + topTasks[0].ms.ToString("F2", CultureInfo.CurrentCulture) + " ms"
+                    : "keine tasks")
+                + (Patches.MainThreadTaskPatches.StatBudgetCuts > 0
+                    ? " · " + DebugHud.N(Patches.MainThreadTaskPatches.StatBudgetCuts) + " frames gekappt" : ""));
+        }
+        // Shown while armed even at 0 animated - an empty scene has nothing to animate,
+        // and that has to read as idleness, not as a loop that never ran.
+        if (Patches.EntityAnimPatches.Enabled || Patches.EntityAnimPatches.StatAnimated > 0)
+            DebugHud.Row(sb, "entity-anim", DebugHud.N((long)Math.Round(Patches.EntityAnimPatches.AvgAnimated)) + "/frame",
+                DebugHud.Ms(Patches.EntityAnimPatches.AvgAnimMs),
+                "vor-render " + Patches.EntityAnimPatches.AvgBeforeMs.ToString("F2", CultureInfo.CurrentCulture) + " ms, "
+                + DebugHud.N(Patches.EntityAnimPatches.StatSkipped) + " anim-frames gespart"
+                + (Patches.EntityAnimPatches.LodEnabled ? "" : " (lod AUS)")
+                + (Patches.EntityAnimPatches.Enabled ? "" : " (AUS)"));
+        if (Patches.TickProfiler.Enabled && Patches.TickProfiler.StatWrapped > 0)
+        {
+            var topTick = Patches.TickProfiler.Top(1);
+            DebugHud.Row(sb, "tick-listener", DebugHud.N(Patches.TickProfiler.StatWrapped), DebugHud.Ms(Patches.TickProfiler.TotalMs),
+                topTick.Count > 0
+                    ? "meist " + topTick[0].name + " " + topTick[0].ms.ToString("F2", CultureInfo.CurrentCulture) + " ms"
+                    : "");
+        }
         if (Patches.FirepitPatches.StatSkipped > 0 || Patches.FirepitPatches.StatFastPath > 0
             || Patches.FirepitPatches.StatNearVanilla > 0)
             DebugHud.Row(sb, "firepit-gate", DebugHud.N(Patches.FirepitPatches.StatSkipped), null,
@@ -379,32 +435,98 @@ public partial class KometModSystem
             frame, fps, FrameStats.MaxFrameMs);
         var worst = DebugHud.WorstFrameTail();
         if (worst != null) sb.Append(" (davon ").Append(worst).Append(')');
-        sb.AppendFormat(ci, " | game tick {0:F2} ms | gpu {1:F2} ms | gc {2:F1} ms/s pausen, "
+        // The gpu figure carries its sample count: a frozen value and a live one look the
+        // same, and a frozen one (the ring stall of 02.09.) was read as "GPU-bound" twice.
+        // The span is not the load: GL_TIME_ELAPSED counts the GPU's idle gaps too, so the
+        // driver's busy figure (sysfs, amdgpu) prints next to it where it exists.
+        sb.AppendFormat(ci, " | game tick {0:F2} ms | gpu {1:F2} ms ({7} proben{8}) | gc {2:F1} ms/s pausen, "
             + "{3:F0} MB/s alloc, gen0 {4:F0}/s, gen2 {5:F1}/s, modus {6}\n",
             FrameStats.GameTickMs, GpuFrameTimer.GpuMs, FrameStats.GcPauseMsPerSecond,
             FrameStats.AllocMbPerSecond, FrameStats.Gen0PerSecond, FrameStats.Gen2PerSecond,
-            System.Runtime.GCSettings.IsServerGC ? "server" : "workstation");
+            System.Runtime.GCSettings.IsServerGC ? "server" : "workstation", GpuFrameTimer.StatSamples,
+            GpuBusy.Available ? string.Format(ci, ", auslastung {0} % laut {1}", GpuBusy.Percent, GpuBusy.Source) : "");
+        // Where the GPU's milliseconds go, stage by stage: the figure that decides whether the
+        // shadow map step, the far cascade's LOD or a post-processing mod is the lever.
+        if (GpuFrameTimer.StageSamples > 0)
+            sb.AppendFormat(ci, "  gpu je stage: before {0:F1} | schatten {1:F1} (fern {2:F1}, nah {3:F1}) | opaque {4:F1} | "
+                + "oit {5:F1} | post {6:F1} | ortho {7:F1} | done {8:F1} ms ({9} proben, GPU-spanne je stage)\n",
+                GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Before],
+                GpuFrameTimer.StageSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone, EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone),
+                GpuFrameTimer.StageSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone),
+                GpuFrameTimer.StageSum(EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone),
+                GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Opaque],
+                GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.OIT],
+                GpuFrameTimer.StageSum(EnumRenderStage.AfterOIT, EnumRenderStage.AfterPostProcessing, EnumRenderStage.AfterFinalComposition, EnumRenderStage.AfterBlit),
+                GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Ortho],
+                GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Done],
+                GpuFrameTimer.StageSamples);
         // The per-thread allocation split lived only in the F7 overlay until 01.09. - the
         // one field report that was supposed to decide the network-decompression question
         // arrived without it, because reports come from '.komet report', not screenshots.
         // Whatever nobody measures stays visible as "rest" instead of vanishing.
+        // "rest" is what no measured thread accounts for. Until 02.09. that was almost
+        // entirely the integrated server (worldgen, serialization, compression) sharing this
+        // process - 193 of 279 MB/s in the join-flood reports, behind 35 gen0 collections a
+        // second. The server's own attribution (per thread, per suspect) now prints on the
+        // next line, and its thread-level sum leaves the rest column.
+        // Survivors, not just allocation: the pause is paid for what the collector keeps.
+        // "befoerdert" is gen0 and gen1 promotion together, so an object promoted twice counts
+        // twice - read the share as an upper bound. Close to the allocation rate = streamed
+        // world data that has to live, and only loading less per second helps; far below it
+        // = garbage, and the alloc-quellen lines say whose.
+        if (FrameStats.GcInfosSeen > 0)
+            sb.AppendFormat(ci, "  gc-details: gen1 {0:F1}/s, befoerdert {1:F0} MB/s = {2:F1} MB je sammlung "
+                + "(bis zu {3:F0} % der allokation ueberlebt), letzte {4} {5:F1} ms pause, heap {6:F0} MB\n",
+                FrameStats.Gen1PerSecond, FrameStats.PromotedMbPerSecond, FrameStats.PromotedMbPerGc,
+                FrameStats.AllocMbPerSecond > 0 ? Math.Min(100.0, 100.0 * FrameStats.PromotedMbPerSecond / FrameStats.AllocMbPerSecond) : 0,
+                FrameStats.LastGcGeneration >= 0 ? "gen" + FrameStats.LastGcGeneration : "-",
+                FrameStats.LastGcPauseMs, FrameStats.GcHeapMb);
+        var serverMb = Patches.ServerAllocPatches.ThreadMbPerSecond;
+        var clientMb = Patches.ClientAllocPatches.ThreadMbPerSecond;
+        var poolMb = Patches.ClientAllocPatches.PoolMbPerSecond;
+        var clientOn = Patches.ClientAllocPatches.Enabled && Patches.ClientAllocPatches.Entries.Count > 0;
         if (FrameStats.AllocMbPerSecond >= 8)
-            // "rest" is what no measured thread accounts for. In singleplayer that is almost
-            // entirely the integrated server (worldgen, serialization, compression) sharing
-            // this process - the 01.09. report measured rest 243 of 317 MB/s while streaming,
-            // with the once-suspected network thread at just 16. Saying so in the line keeps
-            // the number from being re-attributed to the next plausible suspect.
-            sb.AppendFormat(ci, "  alloc-quellen: netz {0:F0}, main {1:F0}, prefetch {2:F0}, "
-                + "tess {3:F0}, rest {4:F0} MB/s (rest = ungemessen, v.a. integrierter server)\n",
-                FrameStats.NetAllocMbPerSecond, FrameStats.MainAllocMbPerSecond,
-                FrameStats.PrefetchAllocMbPerSecond, TesselationStats.AllocMbPerSecond,
-                Math.Max(0.0, FrameStats.AllocMbPerSecond - FrameStats.NetAllocMbPerSecond
-                    - FrameStats.MainAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond
-                    - TesselationStats.AllocMbPerSecond));
+        {
+            // With the client worker threads measured at thread level, "tess" and "netz" are
+            // contained in client-threads (the meshing bracket still prints in the laden: line);
+            // without it the older split stands.
+            if (clientOn)
+                sb.AppendFormat(ci, "  alloc-quellen: main {0:F0}, client-threads {1:F0}, threadpool {2:F0}, "
+                    + "prefetch {3:F0}, server {4:F0}, rest {5:F0} MB/s (rest = ungemessen)\n",
+                    FrameStats.MainAllocMbPerSecond, clientMb, poolMb,
+                    FrameStats.PrefetchAllocMbPerSecond, serverMb,
+                    Math.Max(0.0, FrameStats.AllocMbPerSecond - FrameStats.MainAllocMbPerSecond
+                        - clientMb - poolMb - FrameStats.PrefetchAllocMbPerSecond - serverMb));
+            else
+                sb.AppendFormat(ci, "  alloc-quellen: netz {0:F0}, main {1:F0}, prefetch {2:F0}, "
+                    + "tess {3:F0}, server {4:F0}, rest {5:F0} MB/s (rest = ungemessen)\n",
+                    FrameStats.NetAllocMbPerSecond, FrameStats.MainAllocMbPerSecond,
+                    FrameStats.PrefetchAllocMbPerSecond, TesselationStats.AllocMbPerSecond, serverMb,
+                    Math.Max(0.0, FrameStats.AllocMbPerSecond - FrameStats.NetAllocMbPerSecond
+                        - FrameStats.MainAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond
+                        - TesselationStats.AllocMbPerSecond - serverMb));
+        }
+        if (clientOn && clientMb + poolMb >= 1) Patches.ClientAllocPatches.Write(sb, ci);
+        // The sample-based view over EVERY thread, brackets or not: the line that names what
+        // "rest" is. Printed whenever it has data; its absence with a reason is data too.
+        if (AllocSampler.Enabled && AllocSampler.Samples > 0) AllocSampler.Write(sb, ci);
+        else if (AllocSampler.Failure != null)
+            sb.Append("  alloc-stichprobe: nicht verfuegbar (").Append(AllocSampler.Failure).Append(")\n");
+        if (serverMb >= 1 || (capi != null && capi.IsSinglePlayer && Patches.ServerAllocPatches.Entries.Count > 0))
+            Patches.ServerAllocPatches.Write(sb, ci);
+        // Single-block packets and who on the server sends them (03.09.: 7.000 ExchangeBlock
+        // a second while streaming, a third of all dirty marks).
+        if (capi != null && capi.IsSinglePlayer && Patches.PacketSourcePatches.StatExchange + Patches.PacketSourcePatches.StatSet > 0)
+            Patches.PacketSourcePatches.Write(sb, ci);
         sb.AppendFormat(ci, "ruckler: {0} ('.komet hitch' fuer details)\n", HitchLog.SummaryLine());
         sb.AppendFormat(ci, "cpu: {0:F1} von {1} kernen beschaeftigt ({2:F0} %)\n",
             FrameStats.CpuCoresBusy, Environment.ProcessorCount,
             100.0 * FrameStats.CpuCoresBusy / Environment.ProcessorCount);
+        // The two attributions for the buckets that used to have no owner: "draussen" (the
+        // main-thread task drain) and "tick" (its listeners). Printed whenever armed.
+        if (Patches.MainThreadTaskPatches.Enabled) Patches.MainThreadTaskPatches.Write(sb, 5, ci);
+        if (Patches.TickProfiler.Enabled) Patches.TickProfiler.Write(sb, 6, ci, FrameStats.GameTickMs);
+        if (Patches.EntityAnimPatches.Enabled || Patches.EntityAnimPatches.StatAnimated > 0) Patches.EntityAnimPatches.Write(sb, ci);
 
         var shadows = FrameStats.ShadowMs;
         sb.AppendFormat(ci, "stages: opaque {0:F2} | schatten {1:F2} ({2:F0}%) | oit {3:F2} | "
@@ -498,6 +620,10 @@ public partial class KometModSystem
             Patches.PrioUploadPatches.Enabled ? "an" : "AUS",
             Patches.PrioUploadPatches.StatUploadedChunks, Patches.PrioUploadPatches.StatDeferrals,
             FastChunkCuller.StatLastMs, FastChunkCuller.StatChunksSnapshotted);
+        if (FrameStats.StatPoolAllocs > 0)
+            sb.AppendFormat(ci, "  mesh-pools angelegt: {0:N0} seit reset, {1:F1} ms gesamt, laengste {2:F1} ms "
+                + "(GL-puffer im upload-bucket des jeweiligen frames)\n",
+                FrameStats.StatPoolAllocs, FrameStats.StatPoolAllocMs, FrameStats.MaxPoolAllocMs);
 
         var pipeTotal = WindowPrebuilder.StatHits + WindowPrebuilder.StatMisses;
         sb.AppendFormat(ci, "laden: {0:F0} chunks/s empfangen, {1:F0}/s tesseliert a {2:F2} ms "
@@ -558,6 +684,41 @@ public partial class KometModSystem
             sb.AppendFormat(ci, "animatable-gate: {0:N0} von {1:N0} aufrufen uebersprungen{2}\n",
                 Patches.AnimatableCullPatches.StatSkipped, Patches.AnimatableCullPatches.StatCalls,
                 Patches.AnimatableCullPatches.Enabled ? "" : " (AUS)");
+        if (Patches.MinimapPatches.Enabled || Patches.MinimapPatches.StatTicks > 0)
+            sb.AppendFormat(ci, "minimap: kappe {0} kacheln/tick, {1:F2} ms je upload-tick ueber {2:N0} ticks, {3}{4}\n",
+                Patches.MinimapPatches.Cap, Patches.MinimapPatches.AvgTickMs, Patches.MinimapPatches.StatTicks,
+                Patches.MinimapPatches.DirectUpload
+                    ? string.Format(ci, "direkt-upload ({0:N0} kacheln in {1:N0} komponenten)",
+                        Patches.MinimapPatches.StatDirectPieces, Patches.MinimapPatches.StatDirectComponents)
+                    : "FBO-pfad (vanilla)",
+                Patches.MinimapPatches.Enabled ? "" : " (AUS)");
+        // Printed whenever armed: "0 geladen, 0 offen" is correct idleness in a settled
+        // scene, and must not be confused with a prefix that never ran.
+        if (Patches.EntityLoadPatches.Enabled || Patches.EntityLoadPatches.StatLoaded > 0)
+            sb.AppendFormat(ci, "entity-laden: {0:N0} geladen ({1:N0} vorgezogen, {2:N0} verworfen, {3:N0} updates auf gehaltene), "
+                + "{4:N0} offen, {5:N0} frames verteilt, langsamste {6:F1} ms{7}{8}\n",
+                Patches.EntityLoadPatches.StatLoaded, Patches.EntityLoadPatches.StatPromoted,
+                Patches.EntityLoadPatches.StatDropped, Patches.EntityLoadPatches.StatUpdatedPending,
+                Patches.EntityLoadPatches.PendingCount, Patches.EntityLoadPatches.StatDeferredFrames,
+                Patches.EntityLoadPatches.StatWorstMs,
+                Patches.EntityLoadPatches.StatWorstCode != null ? " (" + Patches.EntityLoadPatches.StatWorstCode + ")" : "",
+                Patches.EntityLoadPatches.Enabled ? "" : " (AUS)");
+        // Server half - in singleplayer the statics are shared with the integrated server, so
+        // the counters are live here; on a remote server they stay at zero and say so.
+        var posTotal = Patches.EntitySyncPatches.StatPositionsSent + Patches.EntitySyncPatches.StatPositionsSkipped;
+        var attrTotal = Patches.EntitySyncPatches.StatAttrPathsSent + Patches.EntitySyncPatches.StatAttrPathsSkipped;
+        if (capi != null && capi.IsSinglePlayer || posTotal + attrTotal > 0)
+            sb.AppendFormat(ci, "entity-sync (server): positionen {0:N0} gesendet, {1:N0} gespart ({2:F0} %), "
+                + "{3:N0} hysterese-halte, {4:N0}x cap-sortiert | attribute {5:N0} pfade gesendet, {6:N0} gespart ({7:F0} %), "
+                + "{8:N0} pakete unterdrueckt{9}{10}\n",
+                Patches.EntitySyncPatches.StatPositionsSent, Patches.EntitySyncPatches.StatPositionsSkipped,
+                posTotal > 0 ? 100.0 * Patches.EntitySyncPatches.StatPositionsSkipped / posTotal : 0,
+                Patches.EntitySyncPatches.StatHysteresisHolds, Patches.EntitySyncPatches.StatCapOrderings,
+                Patches.EntitySyncPatches.StatAttrPathsSent, Patches.EntitySyncPatches.StatAttrPathsSkipped,
+                attrTotal > 0 ? 100.0 * Patches.EntitySyncPatches.StatAttrPathsSkipped / attrTotal : 0,
+                Patches.EntitySyncPatches.StatAttrPacketsSuppressed,
+                Patches.EntitySyncPatches.DistanceSendRate ? "" : " (sync-tuning AUS)",
+                Patches.EntitySyncPatches.AttributeNoOpSkip ? "" : " (attr-skip AUS)");
 
         sb.AppendFormat(ci, "vram: {0:N0} MB aus {1:N0} leeren pools zurueckgegeben, {2:N0} noch leer\n",
             PoolReclaimer.StatBytesReclaimed / 1048576.0, PoolReclaimer.StatPoolsReclaimed,

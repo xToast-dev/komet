@@ -351,12 +351,17 @@ public sealed class WorkerSet
     /// thread plus the game's tesselation threads is an oversubscribed machine, which is also
     /// the worst possible state for a GC to start in: every one of its heaps needs a core.
     /// </summary>
-    public static int AutoThreads(int share)
-    {
-        var cores = Environment.ProcessorCount;
-        // SMT is not detectable portably; assuming two-way on anything above four hardware
-        // threads costs nothing when wrong (a few more threads than needed, all parked).
-        var physical = cores > 4 ? cores / 2 : cores;
-        return Math.Clamp(physical - share, 1, 8);
-    }
+    public static int AutoThreads(int share) => AutoThreads(share, CpuTopology.PhysicalCores);
+
+    /// <summary>
+    /// Helpers for a caller that keeps <paramref name="share"/> physical cores for itself and
+    /// the threads it competes with. Zero helpers is a legitimate answer - on a two-core part
+    /// the occlusion walk runs inline on its own thread rather than adding a third busy
+    /// thread - and <see cref="Start"/> treats it as "everything inline". The old floor of one
+    /// helper per set put two extra threads on the tester's dual core for no gain: a helper
+    /// that is scheduled behind the render thread only lengthens the wait it was meant to
+    /// shorten. Capped at 8, where the memory-bound sweep stops scaling.
+    /// </summary>
+    internal static int AutoThreads(int share, int physicalCores)
+        => Math.Clamp(physicalCores - share, 0, 8);
 }

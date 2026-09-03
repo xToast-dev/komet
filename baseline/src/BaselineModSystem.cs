@@ -48,6 +48,7 @@ public class BaselineModSystem : ModSystem
         harmony = new Harmony(Mod.Info.ModID);
         try
         {
+            MeasurementPatches.Warn = msg => Mod.Logger.Warning(msg);
             MeasurementPatches.Apply(harmony);
             Mod.Logger.Notification("Messung aktiv (nur Zeitmessung, keine Optimierung)");
         }
@@ -77,6 +78,7 @@ public class BaselineModSystem : ModSystem
         gpuEnd = new GpuFrameTimer.EndRenderer();
         api.Event.RegisterRenderer(gpuBegin, EnumRenderStage.Before, "kometbgpu0");
         api.Event.RegisterRenderer(gpuEnd, EnumRenderStage.Done, "kometbgpu1");
+        FrameStats.PeriodicSample += GpuBusy.Sample;
         api.Event.RegisterRenderer(hud, EnumRenderStage.Ortho, "kometbasehud");
 
         api.Input.RegisterHotKey("kometbasehud", "Baseline: Performance-HUD", GlKeys.F7, HotkeyType.HelpAndOverlays);
@@ -88,10 +90,13 @@ public class BaselineModSystem : ModSystem
         HitchLog.CommandHint = "client-main.log";
         cameraSampler = () =>
         {
+            HitchLog.NotePaused(capi?.IsGamePaused ?? false);
+            if (HitchLog.PendingWantsDialogs) HitchLog.NoteDialogs(OpenDialogNames(capi));
             Vintagestory.API.Common.Entities.EntityPos pos = capi?.World?.Player?.Entity?.Pos;
             if (pos != null) HitchLog.NoteCamera(pos.Yaw, pos.Pitch, pos.X, pos.Y, pos.Z);
         };
         MeasurementPatches.FrameBoundary += cameraSampler;
+        FrameStats.PeriodicSample += TesselationStats.Sample;
 
         api.ChatCommands.Create("vsbase")
             .WithDescription("Vanilla-Performance-Messung: HUD umschalten")
@@ -102,11 +107,28 @@ public class BaselineModSystem : ModSystem
             });
     }
 
+    private static string OpenDialogNames(ICoreClientAPI api)
+    {
+        var open = api?.Gui?.OpenedGuis;
+        if (open == null) return null;
+        System.Text.StringBuilder sb = null;
+        foreach (var g in open)
+        {
+            var name = g?.GetType().Name;
+            if (name == null || name.StartsWith("Hud", StringComparison.Ordinal)) continue;
+            sb ??= new System.Text.StringBuilder();
+            if (sb.Length > 0) sb.Append(',');
+            sb.Append(name);
+        }
+        return sb?.ToString();
+    }
+
     public override void Dispose()
     {
         if (cameraSampler != null)
         {
             MeasurementPatches.FrameBoundary -= cameraSampler;
+            FrameStats.PeriodicSample -= TesselationStats.Sample;
             cameraSampler = null;
             HitchLog.Log = null;
         }
@@ -117,6 +139,7 @@ public class BaselineModSystem : ModSystem
             gpuBegin = null;
             gpuEnd = null;
             GpuFrameTimer.Enabled = false;
+            FrameStats.PeriodicSample -= GpuBusy.Sample;
         }
         if (hud != null && capi != null)
         {

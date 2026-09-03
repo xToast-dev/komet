@@ -82,7 +82,7 @@ public partial class KometModSystem
                 })
             .EndSubCommand()
             .BeginSubCommand("toggle")
-                .WithDescription("Ein einzelnes System an/aus: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit - zur Bisektion oder zum A/B-Messen")
+                .WithDescription("Ein einzelnes System an/aus: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit, entload, entsync ... - zur Bisektion oder zum A/B-Messen")
                 .WithArgs(api.ChatCommands.Parsers.Word("system"))
                 .HandleWith(args => TextCommandResult.Success(ToggleSystem(args[0] as string)))
             .EndSubCommand()
@@ -104,6 +104,18 @@ public partial class KometModSystem
                     var report = Patches.RetessSourcePatches.BuildReport();
                     Mod.Logger.Notification("retess report:\n{0}", report);
                     return TextCommandResult.Success(report);
+                })
+            .EndSubCommand()
+            .BeginSubCommand("conflicts")
+                .WithDescription("Wer patcht komets methoden oder komet-code, und weicht die engine vom verifizierten build ab? Prueft sofort neu")
+                .HandleWith(_ =>
+                {
+                    if (!PatchGuard.EngineChecked)
+                        PatchGuard.CheckEngine(Vintagestory.API.Config.GameVersion.LongGameVersion);
+                    PatchGuard.Scan();
+                    var text = PatchGuard.ReportLines();
+                    Mod.Logger.Notification("patch guard:\n{0}", text);
+                    return TextCommandResult.Success(text);
                 })
             .EndSubCommand()
             .BeginSubCommand("safemode")
@@ -168,6 +180,37 @@ public partial class KometModSystem
         new StressTest.Phase { Name = "entity-tess-budget aus",
             Enter = () => Patches.EntityTessPatches.Enabled = false,
             Exit = () => Patches.EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0 },
+        // Off = everything held finishes at once and every packet goes straight to vanilla.
+        // Only streaming scenes (join flood, flying) have entity loads to measure.
+        // Off = vanilla's 200 pieces per tick; only measurable while the minimap fills.
+        new StressTest.Phase { Name = "minimap-budget aus (200/tick)",
+            Enter = () => Patches.MinimapPatches.Enabled = false,
+            Exit = () => Patches.MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0 },
+        new StressTest.Phase { Name = "minimap-direktupload aus (FBO)",
+            Enter = () => Patches.MinimapPatches.DirectUpload = false,
+            Exit = () => Patches.MinimapPatches.DirectUpload = config.MinimapDirectUpload },
+        // Off = vanilla's whole-queue drain; only a streaming scene has bursts to cut.
+        new StressTest.Phase { Name = "task-budget aus",
+            Enter = () => Patches.MainThreadTaskPatches.BudgetMs = 0,
+            Exit = () => Patches.MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs) },
+        // Off = every entity animates every frame, as vanilla; measurable wherever many
+        // entities are loaded (a farm, a join flood).
+        new StressTest.Phase { Name = "anim-lod aus",
+            Enter = () => Patches.EntityAnimPatches.LodEnabled = false,
+            Exit = () => Patches.EntityAnimPatches.LodEnabled = config.EntityAnimationLod },
+        new StressTest.Phase { Name = "entity-lade-budget aus",
+            Enter = () => { Patches.EntityLoadPatches.Enabled = false; Patches.EntityLoadPatches.FlushAll(); },
+            Exit = () => Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 },
+        // Server side, singleplayer only: fewer position/attribute packets means less for the
+        // integrated server to build and the shared GC to collect - a GC-column effect, like
+        // the recycler, not a per-frame CPU one.
+        new StressTest.Phase { Name = "entity-sync-tuning aus (server)",
+            Enter = () => { Patches.EntitySyncPatches.DistanceSendRate = false; Patches.EntitySyncPatches.TrackingHysteresis = false; },
+            Exit = () => { Patches.EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
+                           Patches.EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning; } },
+        new StressTest.Phase { Name = "attribut-noop-skip aus (server)",
+            Enter = () => Patches.EntitySyncPatches.AttributeNoOpSkip = false,
+            Exit = () => Patches.EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip },
         new StressTest.Phase { Name = "kanten-koalesz aus",
             Enter = () => { Patches.EdgeCoalescePatches.Enabled = false; Patches.EdgeCoalescePatches.FlushAll(); },
             Exit = () => Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0 },
@@ -243,6 +286,14 @@ public partial class KometModSystem
         new StressTest.Phase { Name = "sweep-gegenprobe an (diagnose)",
             Enter = () => { CullVerifier.SampleEvery = 512; CullVerifier.Reset(); },
             Exit = () => CullVerifier.SampleEvery = config.VerifyCullSweepEvery },
+        // The two always-on attributions, priced like the before-stage attribution: a few
+        // Stopwatch reads per frame, but measured rather than assumed.
+        new StressTest.Phase { Name = "task-attribution aus (vanilla-drain)",
+            Enter = () => Patches.MainThreadTaskPatches.Enabled = false,
+            Exit = () => Patches.MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks },
+        new StressTest.Phase { Name = "tick-profiler aus",
+            Enter = () => { Patches.TickProfiler.Enabled = false; WrapTickListeners(); },
+            Exit = () => { Patches.TickProfiler.Enabled = config.ProfileTickListeners; WrapTickListeners(); } },
         new StressTest.Phase { Name = "sweep-vektorkernel aus (skalar)",
             Enter = () => FastCuller.VectorCulling = false,
             Exit = () => FastCuller.VectorCulling = config.VectorCulling && FastCuller.VectorAvailable },
@@ -443,6 +494,116 @@ public partial class KometModSystem
                     state = "kanten-koaleszenz AN (experiment; default ist aus)";
                 }
                 break;
+            case "entload":
+                if (Patches.EntityLoadPatches.Enabled)
+                {
+                    // never strand a held entity: everything pending finishes before vanilla takes over
+                    Patches.EntityLoadPatches.Enabled = false;
+                    Patches.EntityLoadPatches.FlushAll();
+                    state = "entity-lade-budget AUS (vanilla: jede entity komplett in ihrem paket-task; alles gehaltene sofort geladen)";
+                }
+                else
+                {
+                    Patches.EntityLoadPatches.Enabled = true;
+                    state = "entity-lade-budget AN (" + Patches.EntityLoadPatches.BudgetMs.ToString("0.#",
+                        System.Globalization.CultureInfo.CurrentCulture) + " ms/frame, naechste entity zuerst)";
+                }
+                break;
+            case "minimap":
+                Patches.MinimapPatches.Enabled = !Patches.MinimapPatches.Enabled;
+                state = "minimap-budget " + (Patches.MinimapPatches.Enabled
+                    ? "AN (" + Patches.MinimapPatches.TargetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " ms je tick, kappe passt sich an)"
+                    : "AUS (vanilla: bis zu 200 kacheln je tick)");
+                break;
+            case "minimapdirect":
+                Patches.MinimapPatches.DirectUpload = !Patches.MinimapPatches.DirectUpload;
+                state = "minimap-direktupload " + (Patches.MinimapPatches.DirectUpload
+                    ? "AN (kacheln per glTexSubImage2D in die komponenten-textur)"
+                    : "AUS (vanilla: framebuffer-draw je kachel)");
+                break;
+            case "taskbudget":
+                Patches.MainThreadTaskPatches.BudgetMs = Patches.MainThreadTaskPatches.BudgetMs > 0
+                    ? 0 : (config.MainThreadTaskBudgetMs > 0 ? config.MainThreadTaskBudgetMs : 3.0);
+                state = "task-drain-budget " + (Patches.MainThreadTaskPatches.BudgetMs > 0
+                    ? "AN (" + Patches.MainThreadTaskPatches.BudgetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " ms je frame, rest geht geordnet in den naechsten frame)"
+                    : "AUS (vanilla: alles, was ansteht, laeuft in diesem frame)")
+                    + (Patches.MainThreadTaskPatches.Enabled ? "" : " - wirkt erst mit 'mtt' AN");
+                break;
+            case "animlod":
+                Patches.EntityAnimPatches.LodEnabled = !Patches.EntityAnimPatches.LodEnabled;
+                state = "anim-lod " + (Patches.EntityAnimPatches.LodEnabled
+                    ? "AN (schatten-only entities jeder 3., ab " + Patches.EntityAnimPatches.FarBlocks.ToString("0", System.Globalization.CultureInfo.CurrentCulture)
+                      + " bloecken jeder 2. frame)"
+                    : "AUS (vanilla: jede entity jeden frame)")
+                    + (Patches.EntityAnimPatches.Enabled ? "" : " - wirkt erst mit 'entbefore' AN");
+                break;
+            case "entbefore":
+                Patches.EntityAnimPatches.Enabled = !Patches.EntityAnimPatches.Enabled;
+                state = "entity-before-attribution " + (Patches.EntityAnimPatches.Enabled
+                    ? "AN (vor-render und anim getrennt gestoppt, ruckler-zeilen nennen die entity)"
+                    : "AUS (vanilla-schleife, damit auch kein anim-lod)");
+                break;
+            case "clientalloc":
+                Patches.ClientAllocPatches.Enabled = !Patches.ClientAllocPatches.Enabled;
+                state = "client-alloc-attribution " + (Patches.ClientAllocPatches.Enabled
+                    ? "AN (worker-threads und threadpool je aufrufer)" : "AUS");
+                break;
+            case "allocsample":
+                if (AllocSampler.Enabled)
+                {
+                    Measure.FrameStats.PeriodicSample -= AllocSampler.Sample;
+                    AllocSampler.Stop();
+                    state = "alloc-stichprobe AUS";
+                }
+                else
+                {
+                    AllocSampler.Start();
+                    if (AllocSampler.Enabled) Measure.FrameStats.PeriodicSample += AllocSampler.Sample;
+                    state = AllocSampler.Enabled
+                        ? "alloc-stichprobe AN (runtime-events, alle threads, nach typ)"
+                        : "alloc-stichprobe konnte nicht starten: " + AllocSampler.Failure;
+                }
+                break;
+            case "packetsrc":
+                Patches.PacketSourcePatches.Enabled = !Patches.PacketSourcePatches.Enabled;
+                state = "block-paket-quellen (server) " + (Patches.PacketSourcePatches.Enabled ? "AN" : "AUS")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - misst nur den integrierten server");
+                break;
+            case "serveralloc":
+                Patches.ServerAllocPatches.Enabled = !Patches.ServerAllocPatches.Enabled;
+                state = "server-alloc-attribution " + (Patches.ServerAllocPatches.Enabled ? "AN" : "AUS")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - misst nur den integrierten server");
+                break;
+            case "mtt":
+                Patches.MainThreadTaskPatches.Enabled = !Patches.MainThreadTaskPatches.Enabled;
+                state = "hauptthread-task-attribution " + (Patches.MainThreadTaskPatches.Enabled
+                    ? "AN (jede task wird gestoppt, ruckler-zeilen nennen den paket-typ)"
+                    : "AUS (vanilla-drain)");
+                break;
+            case "tickprofiler":
+                Patches.TickProfiler.Enabled = !Patches.TickProfiler.Enabled;
+                WrapTickListeners();
+                state = "tick-profiler " + (Patches.TickProfiler.Enabled
+                    ? "AN (" + Patches.TickProfiler.StatWrapped + " listener gewickelt)"
+                    : "AUS (vanilla-delegates)");
+                break;
+            case "entsync":
+                Patches.EntitySyncPatches.DistanceSendRate = !Patches.EntitySyncPatches.DistanceSendRate;
+                Patches.EntitySyncPatches.TrackingHysteresis = Patches.EntitySyncPatches.DistanceSendRate;
+                state = "entity-sync-tuning (server) " + (Patches.EntitySyncPatches.DistanceSendRate
+                    ? "AN (positionen distanzabhaengig, tracking mit hysterese)"
+                    : "AUS (vanilla: 30 Hz fuer alle, hartes tracking-band)")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - wirkt nur auf einem server, auf dem komet laeuft");
+                break;
+            case "attrskip":
+                Patches.EntitySyncPatches.AttributeNoOpSkip = !Patches.EntitySyncPatches.AttributeNoOpSkip;
+                state = "attribut-noop-skip (server) " + (Patches.EntitySyncPatches.AttributeNoOpSkip
+                    ? "AN (unveraenderte attribut-pfade werden nicht gesendet)"
+                    : "AUS (vanilla: jeder dirty-pfad geht raus)")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - wirkt nur auf einem server, auf dem komet laeuft");
+                break;
             case "edgeprio":
                 if (Patches.EdgeRetessPriorityPatches.Enabled)
                 {
@@ -459,9 +620,9 @@ public partial class KometModSystem
                 break;
             default:
                 return "unbekannt. Systeme: cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
-                     + "prebuild, firepit, enttess, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
-                     + "beforeattr, retess, hudraster, cullcheck, cellsize, shadowbox, shadowfade, shadowdist, "
-                     + "shadowlod, shadowstab, shadowthrottle";
+                     + "prebuild, firepit, enttess, entload, minimap, minimapdirect, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
+                     + "beforeattr, tickprofiler, mtt, taskbudget, entbefore, animlod, serveralloc, clientalloc, allocsample, packetsrc, retess, hudraster, cullcheck, cellsize, shadowbox, shadowfade, "
+                     + "shadowdist, shadowlod, shadowstab, shadowthrottle, entsync, attrskip";
         }
 
         var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
@@ -581,6 +742,17 @@ public partial class KometModSystem
         UploadBudget.Reset();
         Patches.PrioUploadPatches.ResetStats();
         Patches.EntityTessPatches.ResetStats();
+        Patches.EntityLoadPatches.ResetStats();
+        Patches.MinimapPatches.ResetStats();
+        Patches.MainThreadTaskPatches.Reset();
+        Patches.TickProfiler.Reset();
+        Patches.EntityAnimPatches.ResetStats();
+        Patches.ServerAllocPatches.ResetStats();
+        Patches.ClientAllocPatches.ResetStats();
+        AllocSampler.ResetStats();
+        Patches.PacketSourcePatches.ResetStats();
+        Measure.GpuBusy.Reset();
+        Patches.EntitySyncPatches.ResetStats();
         FastCuller.Workers.StatContendedInline = 0;
         Patches.MeshRecyclerPatches.ResetStats();
         Patches.TightClonePatches.ResetStats();

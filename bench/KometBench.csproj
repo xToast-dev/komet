@@ -17,6 +17,7 @@
   <ItemGroup>
     <Compile Include="../src/FastCuller.cs" />
     <Compile Include="../src/WorkerSet.cs" />
+    <Compile Include="../src/CpuTopology.cs" />
     <Compile Include="../src/CullVerifier.cs" />
     <Compile Include="../src/RayTraversal.cs" />
     <Compile Include="../shared/FrameStats.cs" />

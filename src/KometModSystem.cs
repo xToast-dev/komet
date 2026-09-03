@@ -38,11 +38,18 @@ public partial class KometModSystem : ModSystem
     private long edgeFlushListenerId = -1;
     private long fbRebuildListenerId = -1;
     private int fbRebuildTries;
+    private long guardListenerId = -1;
+    private Action guardFinalize;
     private Action cameraSampler;
     private Action firepitBoundary;
     private bool uploadBudgetHooked;
     private bool entityTessHooked;
     private bool rendererProfilerHooked;
+    private bool entityLoadHooked;
+    private bool mainTaskHooked;
+    private bool entityAnimHooked;
+    private bool tickProfilerHooked;
+    private string fbBlockedBy;
 
     public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Client;
 
@@ -132,6 +139,8 @@ public partial class KometModSystem : ModSystem
                 gpuEnd = new GpuFrameTimer.EndRenderer();
                 api.Event.RegisterRenderer(gpuBegin, EnumRenderStage.Before, "kometgpu0");
                 api.Event.RegisterRenderer(gpuEnd, EnumRenderStage.Done, "kometgpu1");
+                // the driver's busy figure next to the span, where the OS publishes one (amdgpu sysfs)
+                FrameStats.PeriodicSample += GpuBusy.Sample;
             }, "gpu frame timing");
 
         if (config.ReclaimEmptyPools)
@@ -185,6 +194,14 @@ public partial class KometModSystem : ModSystem
             // where the unnamed world-join bursts live, and naming a hitch must not depend
             // on having armed the profiler before it happened.
             Patches.RendererProfiler.AttributeBeforeStage = config.AttributeBeforeStage;
+
+            // The game tick's listeners get the same treatment as the Before stage: always
+            // wrapped (a few dozen delegates, two Stopwatch reads each), so a "tick 12,7"
+            // hitch names its listener instead of a bucket with a hundred owners.
+            Patches.TickProfiler.Enabled = config.ProfileTickListeners;
+            HitchLog.TopTickListenerProvider = Patches.TickProfiler.TopOfCurrentFrame;
+            MeasurementPatches.FrameBoundary += Patches.TickProfiler.EndFrame;
+            tickProfilerHooked = true;
             WrapRenderers();
         }, config.ProfileRenderers
             ? "per renderer profiling"
@@ -201,6 +218,9 @@ public partial class KometModSystem : ModSystem
         HitchLog.CommandHint = "'.komet hitch'";
         cameraSampler = SampleCameraForHitchLog;
         MeasurementPatches.FrameBoundary += cameraSampler;
+        // the tesselation rates fold with the GC rates at the frame boundary - not in the
+        // HUD, whose visibility must not decide whether a report has numbers in it
+        FrameStats.PeriodicSample += TesselationStats.Sample;
 
         // Both halves, because they can disagree: DOTNET_gcServer only reaches the process
         // through the desktop icon or vs-launch.sh, so a request that never arrived looks
@@ -249,37 +269,23 @@ public partial class KometModSystem : ModSystem
         // BuildExtendedChunkData came back). This is the only hook early enough.
         api.Event.LeaveWorld += OnLeaveWorldEarly;
 
+        // Patch collision guard: who else is on the methods komet patches (or on komet's own
+        // code), and is the engine underneath the build komet was verified against. Once at
+        // world start - by LevelFinalize every mod has run its Start - then every 10 s for
+        // the mods that patch lazily. Each finding is logged once and stays in the report;
+        // nothing is "resolved", which side should win is not this mod's call.
+        PatchGuard.Warn = msg => Mod.Logger.Warning(msg);
+        PatchGuard.Notify = msg => Mod.Logger.Notification(msg);
+        guardFinalize = () => RunPatchGuard(engineCheck: true);
+        api.Event.LevelFinalize += guardFinalize;
+        guardListenerId = api.Event.RegisterGameTickListener(_ => RunPatchGuard(engineCheck: false), 10000);
+
         // The enlarged shadow framebuffers have to be forced into existence: the engine builds
         // its framebuffers at window creation, before any mod loads, so the transpiler alone
         // reaches nothing on a normal launch (see ShadowResPatches.TryForceRebuild). Retried on
         // a slow tick because the engine suppresses buffer rebuilds while it is still loading.
         if (config.ShadowMapExtraQuality > 0)
-            fbRebuildListenerId = api.Event.RegisterGameTickListener(_ =>
-            {
-                var done = true;
-                try
-                {
-                    if (capi?.World is Vintagestory.Client.NoObf.ClientMain game
-                        && game.Platform is Vintagestory.Client.NoObf.ClientPlatformWindows platform)
-                        done = Patches.ShadowResPatches.TryForceRebuild(platform, msg => Mod.Logger.Notification(msg));
-                }
-                catch (Exception e)
-                {
-                    Mod.Logger.Error("shadow framebuffer rebuild failed, shadow map stays vanilla-sized:\n{0}", e);
-                }
-                // 240 tries = two minutes: a window minimised through the whole loading
-                // phase (alt-tab in fullscreen) is now a legitimate reason to keep waiting,
-                // not an error. Giving up is harmless - the shadow map stays vanilla-sized -
-                // but it must say so, or a HUD reading "5120px" looks like a broken patch.
-                if ((done || ++fbRebuildTries > 240) && fbRebuildListenerId >= 0)
-                {
-                    if (!done)
-                        Mod.Logger.Notification(
-                            "shadow map rebuild abandoned after {0} tries (window never ready) - map stays vanilla-sized this session", fbRebuildTries - 1);
-                    capi?.Event.UnregisterGameTickListener(fbRebuildListenerId);
-                    fbRebuildListenerId = -1;
-                }
-            }, 500);
+            fbRebuildListenerId = api.Event.RegisterGameTickListener(FbRebuildTick, 500);
 
         // 50 ms cadence: together with the per-tick cap this sets the drain capacity
         // (~5000/s baseline, more in catch-up mode) - it must exceed any realistic inflow.
@@ -299,6 +305,29 @@ public partial class KometModSystem : ModSystem
 
     private void ApplyPatches(ICoreAPI api)
     {
+        // Measurement only: who on the client's worker threads and the thread pool allocates
+        // - the report's "rest" (03.09.: 79 of 216 MB/s unnamed while 384 of 402 hitches sat on
+        // a GC pause). Applied always, gated at runtime, sampled with the other rates.
+        Patch(() =>
+        {
+            Patches.ClientAllocPatches.Apply(harmony);
+            Patches.ClientAllocPatches.Enabled = config.ClientAllocAttribution;
+            FrameStats.PeriodicSample += Patches.ClientAllocPatches.Sample;
+        }, "client thread allocation attribution " + (config.ClientAllocAttribution ? "on" : "off")
+           + "; '.komet toggle clientalloc' flips it");
+
+        // The sample-based view over every thread in the process, from the runtime's own
+        // allocation tick events - names what no bracket reaches (03.09.: "rest 46 MB/s"
+        // after every engine thread was bracketed).
+        if (config.AllocSampling)
+            Patch(() =>
+            {
+                AllocSampler.Start();
+                if (!AllocSampler.Enabled)
+                    throw new InvalidOperationException(AllocSampler.Failure ?? "the runtime event listener did not start");
+                FrameStats.PeriodicSample += AllocSampler.Sample;
+            }, "allocation sampling by thread and type (runtime GCAllocationTick events); '.komet toggle allocsample' flips it");
+
         if (config.FastFrustumCulling)
             Patch(() =>
             {
@@ -327,7 +356,10 @@ public partial class KometModSystem : ModSystem
               $"shadow patches (fade fix {(config.FixShadowFadeCutoff ? "on" : "off")}, "
               + $"distance x{config.ShadowDistanceMultiplier:0.##}, symmetric box {(config.SymmetricShadowBox ? "on" : "off")})");
 
-        // measurement first: the throttle and the HUD both hang off it
+        // measurement first: the throttle and the HUD both hang off it. The optional
+        // attribution brackets report themselves by name when an engine build changed the
+        // method they hang on (see MeasurementPatches.Apply); the core accounting throws.
+        MeasurementPatches.Warn = msg => Mod.Logger.Warning(msg);
         Patch(() => MeasurementPatches.Apply(harmony), "frame + render stage measurement");
 
         if (config.SunOcclusionQueryInterval > 1)
@@ -369,12 +401,20 @@ public partial class KometModSystem : ModSystem
             : "priority chunk uploads unbudgeted (vanilla); '.komet toggle prioupload' enables the budget live");
 
         if (config.TesselationNoIdleSleep || config.TesselationThreadPriority || config.TesselationNeighbourPrefetch)
+        {
+            // Thread.Priority is stored and never applied on Linux (CoreCLR's PAL; measured
+            // for the cull workers, which sit at the process nice value whatever they ask
+            // for), and a lower nice value needs privileges the game does not have. Saying
+            // "thread priority: True" in a Linux log claimed a lever that does not exist.
+            var priority = config.TesselationThreadPriority && !OperatingSystem.IsLinux();
             Patch(() => Patches.TesselationPatches.Apply(harmony,
-                            config.TesselationNoIdleSleep, config.TesselationThreadPriority,
+                            config.TesselationNoIdleSleep, priority,
                             config.TesselationNeighbourPrefetch),
                   "faster chunk loading (no idle sleep: " + config.TesselationNoIdleSleep
-                  + ", thread priority: " + config.TesselationThreadPriority
+                  + ", thread priority: " + (priority ? "True"
+                      : config.TesselationThreadPriority ? "not available on Linux" : "False")
                   + ", neighbour prefetch: " + config.TesselationNeighbourPrefetch + ")");
+        }
 
         if (config.FirepitContentsMaxDistance > 0 || config.FirepitLightCacheMs > 0)
             Patch(() =>
@@ -462,6 +502,68 @@ public partial class KometModSystem : ModSystem
                 entityTessHooked = true;
             }, $"entity tesselation budget ({config.EntityTesselationBudgetMs:0.#} ms/frame)");
 
+        // Always applied, gated at runtime: '.komet toggle entload' must be able to A/B the
+        // deferred entity loading while a join flood is on screen. Off = flush everything
+        // held and hand every packet straight back to vanilla.
+        Patch(() =>
+        {
+            Patches.EntityLoadPatches.Log = msg => Mod.Logger.Warning(msg);
+            Patches.EntityLoadPatches.Apply(harmony);
+            Patches.EntityLoadPatches.BudgetMs = config.EntityLoadBudgetMs > 0 ? config.EntityLoadBudgetMs : 1.5;
+            Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0;
+            MeasurementPatches.FrameBoundary += Patches.EntityLoadPatches.OnFrameBoundary;
+            entityLoadHooked = true;
+        }, config.EntityLoadBudgetMs > 0
+            ? $"entity load budget ({config.EntityLoadBudgetMs:0.#} ms/frame, nearest entity first)"
+            : "entity load budget off (vanilla: each entity finishes in its packet's task); '.komet toggle entload' enables it live");
+
+        // Always applied, gated at runtime ('.komet toggle minimap'): the transpiled cap
+        // returns vanilla's 200 while disabled, so off is exactly vanilla.
+        Patch(() =>
+        {
+            Patches.MinimapPatches.Apply(harmony);
+            Patches.MinimapPatches.TargetMs = config.MinimapPieceBudgetMs > 0 ? config.MinimapPieceBudgetMs : 1.0;
+            Patches.MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0;
+            Patches.MinimapPatches.DirectUpload = config.MinimapDirectUpload;
+        }, (config.MinimapPieceBudgetMs > 0
+            ? $"minimap piece upload budget ({config.MinimapPieceBudgetMs:0.#} ms/tick, adaptive cap)"
+            : "minimap piece upload unbudgeted (vanilla 200/tick); '.komet toggle minimap' enables the budget live")
+           + (config.MinimapDirectUpload ? ", pieces composed by direct sub-image upload" : ", pieces composed by vanilla's framebuffer draw"));
+
+        // Always applied, gated at runtime: the drain is a 1:1 transcription with a clock
+        // around each task, and '.komet toggle mtt' hands it back to vanilla.
+        Patch(() =>
+        {
+            Patches.MainThreadTaskPatches.Apply(harmony);
+            Patches.MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks;
+            Patches.MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs);
+            MeasurementPatches.FrameBoundary += Patches.MainThreadTaskPatches.EndFrame;
+            mainTaskHooked = true;
+        }, (config.AttributeMainThreadTasks
+            ? "main-thread task attribution (a 'draussen' hitch names its packet type)"
+            : "main-thread task attribution off (vanilla drain); '.komet toggle mtt' enables it live")
+           + (config.MainThreadTaskBudgetMs > 0
+               ? $", drain budget {config.MainThreadTaskBudgetMs:0.#} ms/frame (remainder requeued in order)"
+               : ", no drain budget (vanilla: everything queued runs in the frame)"));
+
+        // Always applied, gated at runtime: the Before-stage loop is a 1:1 transcription with
+        // clocks around its two halves; '.komet toggle entbefore' hands it back to vanilla,
+        // '.komet toggle animlod' flips the reduced animation rate for far / shadow-only entities.
+        Patch(() =>
+        {
+            Patches.EntityAnimPatches.Apply(harmony);
+            Patches.EntityAnimPatches.Enabled = config.AttributeEntityBeforeStage;
+            Patches.EntityAnimPatches.LodEnabled = config.EntityAnimationLod;
+            Patches.EntityAnimPatches.FarBlocks = Math.Max(8, config.EntityAnimationFarBlocks);
+            HitchLog.EntityFrameProvider = Patches.EntityAnimPatches.TopOfCurrentFrame;
+            MeasurementPatches.FrameBoundary += Patches.EntityAnimPatches.EndFrame;
+            entityAnimHooked = true;
+        }, config.AttributeEntityBeforeStage
+            ? (config.EntityAnimationLod
+                ? $"entity before-stage attribution + animation LOD (shadow-only entities every 3rd frame, rendered beyond {config.EntityAnimationFarBlocks:0} blocks every 2nd)"
+                : "entity before-stage attribution (animation LOD off; '.komet toggle animlod' enables it live)")
+            : "entity before-stage untouched (vanilla loop); '.komet toggle entbefore' enables the attribution live");
+
         // Always applied, gated at runtime: default off since 1.42.2 (prime suspect for wrong
         // terrain AO - see KometConfig), and '.komet toggle prebuild' has to be able to switch
         // it back on without a restart, which a patch that was never applied cannot do.
@@ -537,17 +639,127 @@ public partial class KometModSystem : ModSystem
     /// the frame in between - which is the frame the hitch log is about to book. Null-safe
     /// throughout: in menus there is simply no sample.
     /// </summary>
+    private void RunPatchGuard(bool engineCheck)
+    {
+        try
+        {
+            if (engineCheck && !PatchGuard.EngineChecked)
+                PatchGuard.CheckEngine(Vintagestory.API.Config.GameVersion.LongGameVersion);
+            PatchGuard.Scan();
+            if (engineCheck)
+            {
+                if (PatchGuard.Findings.Count == 0)
+                    Mod.Logger.Notification("patch-kollisionen: keine - niemand sonst patcht komets methoden oder komet-code");
+                else
+                    Mod.Logger.Notification("patch-kollisionen: {0} ({1} hoch) - '.komet conflicts' fuer die liste",
+                        PatchGuard.Findings.Count, PatchGuard.CountAt(PatchGuard.Severity.Hoch));
+            }
+        }
+        catch (Exception e)
+        {
+            // a guard that reports problems must never become one
+            Mod.Logger.Notification("patch guard konnte nicht pruefen ({0}), laeuft ohne ihn weiter", e.GetType().Name);
+        }
+    }
+
     private void SampleCameraForHitchLog()
     {
+        // pause first: a pending hitch that spans the pause menu is dropped before the
+        // camera sample would commit it
+        HitchLog.NotePaused(capi?.IsGamePaused ?? false);
+        // an Ortho-heavy hitch names the dialogs that were open - the string is only built
+        // when such a hitch is pending
+        if (HitchLog.PendingWantsDialogs) HitchLog.NoteDialogs(OpenDialogNames(capi));
         var pos = capi?.World?.Player?.Entity?.Pos;
         if (pos != null) HitchLog.NoteCamera(pos.Yaw, pos.Pitch, pos.X, pos.Y, pos.Z);
+    }
+
+    /// <summary>The non-HUD dialogs currently open, comma separated; null when none.</summary>
+    internal static string OpenDialogNames(ICoreClientAPI api)
+    {
+        var open = api?.Gui?.OpenedGuis;
+        if (open == null) return null;
+        System.Text.StringBuilder sb = null;
+        foreach (var g in open)
+        {
+            var name = g?.GetType().Name;
+            // the HUD elements are always "open"; the question is which real dialog was
+            if (name == null || name.StartsWith("Hud", StringComparison.Ordinal)) continue;
+            sb ??= new System.Text.StringBuilder();
+            if (sb.Length > 0) sb.Append(',');
+            sb.Append(name);
+        }
+        return sb?.ToString();
     }
 
     private static readonly AccessTools.FieldRef<Vintagestory.Client.NoObf.ClientMain, Vintagestory.Client.NoObf.ClientEventManager> EventManagerRef =
         AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.ClientMain, Vintagestory.Client.NoObf.ClientEventManager>("eventManager");
 
+    /// <summary>
+    /// Forces the enlarged shadow framebuffers into existence once the engine lets it (see
+    /// ShadowResPatches.TryForceRebuild). Never gives up: after two minutes of "not yet" the
+    /// cadence drops to five seconds and the blocking reason is logged once. The old version
+    /// abandoned the rebuild after 240 tries, and on 01.09. a whole session ran with the
+    /// vanilla-sized map because the window was not ready for those two minutes - the log
+    /// said "window never ready" and nothing about why. A minimised window through the
+    /// loading phase is legitimate; a shadow map that silently stays small is not.
+    /// </summary>
+    private void FbRebuildTick(float dt)
+    {
+        var done = true;
+        try
+        {
+            if (capi?.World is Vintagestory.Client.NoObf.ClientMain game
+                && game.Platform is Vintagestory.Client.NoObf.ClientPlatformWindows platform)
+                done = Patches.ShadowResPatches.TryForceRebuild(platform, msg => Mod.Logger.Notification(msg), out fbBlockedBy);
+        }
+        catch (Exception e)
+        {
+            Mod.Logger.Error("shadow framebuffer rebuild failed, shadow map stays vanilla-sized:\n{0}", e);
+        }
+        if (fbRebuildListenerId < 0) return;
+        if (done)
+        {
+            capi?.Event.UnregisterGameTickListener(fbRebuildListenerId);
+            fbRebuildListenerId = -1;
+            return;
+        }
+        if (++fbRebuildTries == 240)
+        {
+            Mod.Logger.Notification(
+                "shadow map rebuild still pending after {0} tries ({1}) - keeps trying every 5 s, the map is vanilla-sized until then",
+                fbRebuildTries, fbBlockedBy ?? "reason unknown");
+            capi?.Event.UnregisterGameTickListener(fbRebuildListenerId);
+            fbRebuildListenerId = capi?.Event.RegisterGameTickListener(FbRebuildTick, 5000) ?? -1;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the tick listeners wrapped (they register throughout a session) - and unwraps
+    /// them while the engine's own tick profiler is on, because that one names listeners by
+    /// their handler's target type, which a wrapper would hide.
+    /// </summary>
+    private void WrapTickListeners()
+    {
+        try
+        {
+            if (capi?.World is not Vintagestory.Client.NoObf.ClientMain game) return;
+            var manager = EventManagerRef(game);
+            if (Patches.TickProfiler.Enabled && !Vintagestory.Client.ScreenManager.FrameProfiler.Enabled)
+                Patches.TickProfiler.Wrap(manager);
+            else
+                Patches.TickProfiler.Unwrap(manager);
+        }
+        catch (Exception e)
+        {
+            Patches.TickProfiler.Enabled = false;
+            Mod.Logger.Error("tick listener profiling failed, switching it off:\n{0}", e);
+        }
+    }
+
     private void WrapRenderers()
     {
+        WrapTickListeners();
         try
         {
             if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
@@ -622,6 +834,32 @@ public partial class KometModSystem : ModSystem
             MeasurementPatches.FrameBoundary -= Patches.EntityTessPatches.OnFrameBoundary;
             entityTessHooked = false;
         }
+        if (entityLoadHooked)
+        {
+            MeasurementPatches.FrameBoundary -= Patches.EntityLoadPatches.OnFrameBoundary;
+            entityLoadHooked = false;
+        }
+        if (mainTaskHooked)
+        {
+            MeasurementPatches.FrameBoundary -= Patches.MainThreadTaskPatches.EndFrame;
+            mainTaskHooked = false;
+        }
+        if (entityAnimHooked)
+        {
+            MeasurementPatches.FrameBoundary -= Patches.EntityAnimPatches.EndFrame;
+            HitchLog.EntityFrameProvider = null;
+            entityAnimHooked = false;
+        }
+        if (tickProfilerHooked)
+        {
+            MeasurementPatches.FrameBoundary -= Patches.TickProfiler.EndFrame;
+            HitchLog.TopTickListenerProvider = null;
+            tickProfilerHooked = false;
+        }
+        // held entities belong to the world that is going away; the cached game instance too
+        Patches.EntityLoadPatches.Reset();
+        Patches.EntityAnimPatches.Reset();
+        Patches.MainThreadTaskPatches.Detach();
         if (firepitBoundary != null)
         {
             MeasurementPatches.FrameBoundary -= firepitBoundary;
@@ -651,6 +889,12 @@ public partial class KometModSystem : ModSystem
 
         HitchLog.TopRendererProvider = null;
         HitchLog.Log = null;
+        FrameStats.PeriodicSample -= TesselationStats.Sample;
+        FrameStats.PeriodicSample -= Patches.ClientAllocPatches.Sample;
+        Patches.ClientAllocPatches.Clear();
+        FrameStats.PeriodicSample -= AllocSampler.Sample;
+        AllocSampler.Stop();
+        AllocSampler.Clear();
         if (capi != null) capi.Event.LeaveWorld -= OnLeaveWorldEarly;
         // belt and braces: normally already done by OnLeaveWorldEarly, but Dispose can also
         // come without a DestroyGameSession (mod reload), and both are idempotent
@@ -668,7 +912,10 @@ public partial class KometModSystem : ModSystem
             try
             {
                 if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
+                {
                     Patches.RendererProfiler.Unwrap(EventManagerRef(game));
+                    Patches.TickProfiler.Unwrap(EventManagerRef(game));
+                }
             }
             catch { /* the world is going away anyway */ }
         }
@@ -680,6 +927,17 @@ public partial class KometModSystem : ModSystem
             InflowBrake.Enabled = false;
         }
         if (statsListenerId >= 0) capi?.Event.UnregisterGameTickListener(statsListenerId);
+        if (guardFinalize != null && capi != null)
+        {
+            capi.Event.LevelFinalize -= guardFinalize;
+            guardFinalize = null;
+        }
+        if (guardListenerId >= 0)
+        {
+            capi?.Event.UnregisterGameTickListener(guardListenerId);
+            guardListenerId = -1;
+        }
+        PatchGuard.Reset();
         if (gpuBegin != null && capi != null)
         {
             capi.Event.UnregisterRenderer(gpuBegin, EnumRenderStage.Before);
@@ -687,6 +945,7 @@ public partial class KometModSystem : ModSystem
             gpuBegin = null;
             gpuEnd = null;
             GpuFrameTimer.Enabled = false;
+            FrameStats.PeriodicSample -= GpuBusy.Sample;
         }
         if (reclaimer != null && capi != null)
         {
@@ -714,5 +973,9 @@ public partial class KometModSystem : ModSystem
     {
         Patches.TesselationPatches.Shutdown();
         WindowPrebuilder.Shutdown();
+        // entities still held for the load budget were meant for this world; finishing them
+        // into a disposing session would register renderers on a dying event manager
+        Patches.EntityLoadPatches.Reset();
+        Patches.EntityAnimPatches.Reset();
     }
 }

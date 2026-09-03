@@ -1747,6 +1747,233 @@ gleichmäßiger.
 
 ---
 
+## Entity-Laden: Budget und Nächste-zuerst (02.09.)
+
+Wie Entities beim Client ankommen, aus dem Dekompilat: **nicht** mit dem Chunk-Paket (das
+`Entities`-Feld von `Packet_ServerChunk` bleibt in 1.22 leer) und **nicht** über die
+`EntityLoadQueue`, die `ClientSystemEntities.OnGameTick` jeden Tick leert — die hat keinen
+Produzenten mehr, beides sind tote Pfade. Tatsächlich beginnt der Server ein Entity zu
+*tracken*, sobald dessen Chunk gesendet ist (`PhysicsManager`, alle 200 ms), und schickt dafür
+ein volles Entity-Paket (Id 33) je Entity; Spawns kommen als Paket 34. Jedes davon wird auf dem
+Client eine Main-Thread-Task, und die macht alles auf einmal: Entity erzeugen, deserialisieren,
+`Initialize` (Behaviors, Animator, Attribute), im Chunk registrieren, in `LoadedEntities`
+eintragen, `OnEntityLoaded` feuern — was den Renderer anlegt. Beim Weltbeitritt und bei jedem
+Schub frisch gestreamter Chunks landen so Hunderte davon in **einem** Task-Drain, in der
+Reihenfolge, in der der Server sein Dictionary gerade durchlief.
+
+`EntityLoadPatches` trennt an der Stelle, an der Vanilla selbst trennt: Erzeugen und
+`FromBytes` (billig, und es liefert die Position) laufen sofort beim Paket; der teure Rest —
+`Initialize`, Chunk-Registrierung, Renderer — wartet in Distanz-Bins (32 Blöcke je Bin) und wird
+an der Frame-Grenze unter `EntityLoadBudgetMs` (1,5 ms/Frame) abgearbeitet, nächstes Entity
+zuerst. Liveness wie bei allen Budgets der Mod: mindestens zwei je Frame, ein Rückstau kann nie
+verhungern; `.komet toggle entload` aus = alles Gehaltene wird sofort fertiggestellt.
+
+Kohärenz mit jedem anderen Paket, das ein Entity nennt, ist exakt: Attribute (37/38/60),
+Custom-Pakete (67), die Spawn-Position (80), das Bulk-Paket (40) und ein wiederholtes 33/34
+stellen ein gehaltenes Entity **vor** dem Vanilla-Handler fertig, so dass dessen
+`LoadedEntities`-Lookup genau so trifft wie ohne Budget; ein Despawn (36) für ein gehaltenes
+Entity verwirft es (es war nirgends registriert). Beobachtbar ändert sich nur, *wann* ein
+entferntes Entity in einem Schub erscheint — dieselbe Klasse von Änderung wie das
+Prio-Upload-Budget für Chunk-Meshes. Ruckler-Zeilen tragen `entload X`, Report-Zeile
+`entity-laden`, HUD-Zeile `entity-laden`.
+
+Erster Feldreport (02.09., Join-Flut, 3 min): 1.608 geladen, davon **1.188 vorgezogen** — das
+Budget griff nur bei jedem vierten Entity. Ursache: fast jedes frisch getrackte Entity bekommt
+binnen 200 ms ein Attribut-Update (Paket 38/60), und das stellte das gehaltene Entity sofort
+fertig. Seitdem werden Attribut-Pakete (37/38/60) direkt in den Baum des gehaltenen Entities
+gefaltet (`FromBytes` bzw. `PartialUpdate`, dieselben Aufrufe wie Vanilla auf einem geladenen
+Entity); der Vanilla-Handler findet die Id danach nicht in `LoadedEntities` und tut nichts —
+äquivalent zu einem etwas später gesendeten vollen Paket. Nur 40, 67 und 80 brauchen ein
+initialisiertes Entity und stellen weiterhin sofort fertig.
+
+## Minimap: Kachel-Uploads unter Budget (02.09.)
+
+Der Tick-Profiler nannte im ersten Report den dominanten Bucket der Join-Flut beim Namen:
+127 von 339 Rucklern waren `tick`, jeder mit `tick-listener WorldMapManager.OnClientTick` bei
+2,5 bis 8,5 ms. Mechanismus aus `ChunkMapLayer` (VSEssentials): Kacheln (ein 32×32-Bild je
+Chunk-Spalte) entstehen auf einem Worker und landen in einer Queue; `OnTick` holt bis zu **200**
+davon je 20-ms-Tick und macht je betroffener 3×3-Komponente einen Framebuffer auf, lädt jede
+Kachel als Textur hoch und zeichnet sie in die 96×96-Textur. Beim Streamen (jede geladene
+Spalte reiht sich selbst und vier Nachbarn ein) sind das Hunderte Uploads und Draws in einem
+Tick, auf dem Main-Thread — für ein HUD-Element, das niemand so schnell braucht.
+
+`MinimapPatches`: ein Transpiler ersetzt die Konstante 200 durch `PiecesPerTick()`, und ein
+Prefix/Postfix-Paar misst jeden Tick, der Kacheln entnommen hat. Die Kappe halbiert sich, wenn
+der Tick über 1,5× `MinimapPieceBudgetMs` (1 ms) lag, und verdoppelt sich bis auf Vanillas 200,
+wenn er unter der Hälfte blieb — die Flut läuft mit ~1 ms je Tick, eine geöffnete Weltkarte auf
+leerem Frame füllt sich weiter mit Vanilla-Tempo. Nichts geht verloren, die Kacheln bleiben in
+der Engine-Queue. `.komet toggle minimap`, HUD/Report-Zeile `minimap`, Stress-Phase
+`minimap-budget aus (200/tick)`. Aus = exakt Vanilla (die Funktion liefert dann 200).
+
+## Hauptthread-Tasks und Tick-Listener: die zwei namenlosen Buckets (02.09.)
+
+Zwei Buckets des Hitch-Logs hatten bis jetzt keinen Besitzer:
+
+**`draussen`** ist alles zwischen den Render-Stages und der nächsten Frame-Grenze — und dort
+läuft `ClientMain.ExecuteMainThreadTasks`, das jedes Server-Paket außer Chunk-Daten als
+`ClientTask` (`readpacket33`, `readpacket38`, …) ausführt: Entity-Loads, Block-Updates,
+Attribut-Syncs, Inventar. Ein Schub davon las sich bisher als Treiber-Back-Pressure, weil er
+nicht vom Swap zu unterscheiden war. `MainThreadTaskPatches` ersetzt den Drain durch eine
+1:1-Transkription mit einer Uhr um jede Task (gleicher Lock, gleiche Suspend/Requeue-Regel,
+gleiche Profiler-Marks, Exceptions propagieren wie vorher). Der Frame behält Summe und
+schwerste Task (`tasks 9,1 (readpacket33 8,2)` in der Ruckler-Zeile), eine geglättete Tabelle
+je Code steht im Report (`hauptthread-tasks: …`). `.komet toggle mtt` gibt den Drain an Vanilla.
+
+**`tick`** gehört den Tick-Listenern (`EventManager.GameTickListenersEntity`, ein paar Dutzend
+System- und Mod-Listener) plus allen Block-Entity-Ticks. `TickProfiler` wickelt jeden dieser
+Listener-Delegates in einen Timer — die Liste wird per Id verwaltet, Identität ist hier kein
+Problem —, die Ruckler-Zeile nennt den teuersten (`tick-listener ClientSystemEntities.OnGameTick
+7,5 ms`), der Report rangiert sie (`tick-listener: …`). Block-Listener (Tausende bei 1536)
+werden bewusst nicht gewickelt; ihr Anteil ist, was die Summe nicht erklärt. Solange der
+Engine-eigene Tick-Profiler (`extendedDebugInfo`) läuft, wird entwickelt, weil der die
+Listener über den Target-Typ des Handlers benennt. `.komet toggle tickprofiler`.
+
+Beides sind Diagnosen, nicht Optimierungen, und beide stehen als Stress-Phasen im Plan
+(`task-attribution aus`, `tick-profiler aus`), damit ihr Preis gemessen ist statt angenommen.
+
+## Server-Seite: Entity-Sync (02.09.)
+
+Im Singleplayer teilt sich der integrierte Server Prozess und GC mit dem Client — jedes Paket,
+das er nicht baut, ist Müll, den der Client-Frame nicht einsammelt. `EntitySyncPatches` (Harmony-
+Id `komet.server`, läuft auch auf einem dedizierten Server mit Komet) transkribiert vier
+Methoden aus `PhysicsManager` mit je einer zusätzlichen Bedingung:
+
+1. **Distanzabhängige Senderate.** Vanilla schickt jedem Client für jedes getrackte Entity, das
+   sich bewegt hat, in jedem Physik-Tick (30 Hz) ein Positionspaket. Bis 40 Blöcke bleibt das so,
+   bis 80 Blöcke gehen die Pakete mit 15 Hz raus, darüber mit 10 Hz. Der Client interpoliert
+   ohnehin zwischen Snapshots (`EntityBehaviorInterpolatePosition`), der Tick-Zähler im Paket
+   verträgt Lücken (UDP), Teleports werden nie ausgedünnt.
+2. **Tracking-Hysterese.** Ein Entity ist getrackt, solange es im Radius liegt, und untracked
+   im Moment, in dem es draußen ist — eines, das um die Grenze wandert (oder ein Spieler, der
+   hin- und hergeht), bekommt so immer wieder volles Paket, Client-Erzeugung und Despawn. Jetzt
+   bleibt ein bereits getracktes Entity getrackt, bis es 15 % jenseits des Radius steht.
+   Simulationszustand und `IsTracked` bleiben exakt Vanilla; nur die Client-Liste kennt das Band.
+3. **Nächste zuerst am Cap.** Greift `TrackedEntitiesPerClient`, lässt Vanilla neue Entities in
+   Dictionary-Reihenfolge zu; jetzt gewinnen die nächsten.
+4. **Attribut-Sync ohne No-Ops.** Alle 200 ms werden je Entity die dirty Attribut-Pfade
+   serialisiert und gesendet; Server-Code markiert bei jedem `Set` dirty, ob der Wert sich
+   änderte oder nicht. Pfade, deren Bytes dem zuletzt gesendeten Stand gleichen, fallen weg, ein
+   leer gewordenes Paket wird nicht gebaut. Der Cache wird bei jedem vollen Entity-Paket
+   invalidiert (ein neu trackender Client bekommt den kompletten Baum), also kann kein Client auf
+   einem A-B-A-Wert hängen bleiben. Client-seitige Listener feuern für unveränderte Werte nicht
+   mehr — die Engine-Konvention für ereignisartige Attribute ist aus genau dem Grund ein Zähler
+   (`onHurtCounter`).
+
+Delta-Kodierung der Positionen ist bewusst **nicht** gebaut: das Wire-Format hängt an beiden
+Seiten, die Ersparnis wäre Bandbreite, und die ist über Loopback keine Größe — die Allokation
+je Paket bliebe.
+
+`.komet toggle entsync|attrskip`, Report-Zeile `entity-sync (server): positionen … gespart,
+hysterese-halte, attribute … gespart, pakete unterdrueckt`, Stress-Phasen `entity-sync-tuning
+aus (server)` und `attribut-noop-skip aus (server)`. Auf einem fremden Server ohne Komet stehen
+die Zähler auf Null und die Zeile sagt es.
+
+## Schattenkarten-Rebuild: nie mehr aufgeben (02.09.)
+
+Der erzwungene Framebuffer-Rebuild für `ShadowMapExtraQuality` gab nach 240 Versuchen (zwei
+Minuten) auf. Am 01.09. lief eine ganze Session mit vanilla-großer Karte, das Log sagte
+„window never ready" und nichts darüber, *warum*. Jetzt sinkt die Kadenz nach zwei Minuten auf
+fünf Sekunden und der blockierende Grund wird einmal geloggt (Engine unterdrückt Reloads, Fenster
+minimiert, Fenstergröße/SSAA kann keine Framebuffer, Größenausdruck nie erreicht) — ein
+minimiertes Fenster durch die ganze Ladephase ist legitim, eine still klein gebliebene
+Schattenkarte nicht.
+
+## Minimap: direkter Kachel-Upload statt Framebuffer (02.09., Runde 3)
+
+Der zweite Report zeigte die Kappe am Boden (8 Kacheln je Tick) und trotzdem 1,14 ms je
+Upload-Tick — 0,14 ms für ein 4-KB-Bild. Das ist, was Vanillas `FinishSetChunks` je Kachel
+kostet: ein Framebuffer-Objekt je Komponente je Tick angelegt und wieder zerstört, ein
+Shader-Wechsel, die 32×32-Kachel als Staging-Textur hochgeladen **mit Mipmaps**, ein Quad
+durch das `texture2texture`-Programm gezeichnet, FBO abgebaut. Alles, um 32×32 Pixel in ein
+Rechteck einer 96×96-Textur zu kopieren — also genau ein `glTexSubImage2D`.
+
+Die Orientierung ist aus dem Shader belegt: `texture2texture.vsh` spiegelt nicht
+(`posTL = (pos+1)/2; posTL.y = ys + posTL.y*height`), das Quad trägt an Vertex (-1,-1) die
+UV (0,0), `ys` liegt an der unteren Kante des Zielrechtecks in Framebuffer-Zeilen. Kachel-Zeile
+r landet also auf Textur-Zeile 32·(i/3)+r, Spalte 32·(i%3)+c — dieselben Zeilen, die der
+Sub-Image-Upload schreibt. `MinimapPatches.FinishSetChunksPrefix` ersetzt den Draw dadurch,
+Textur-Anlage (96×96 aus dem geteilten Leer-Puffer) und Mipmap-Regeneration danach bleiben
+Vanilla. Einziger semantischer Unterschied: der Alpha-Test des Shaders (Quellpixel unter 0,005
+Alpha wurden übersprungen, der alte Pixel blieb) — eine Kachel hat solche Pixel nur, wo die
+Regen-Höhenkarte außerhalb des Bereichs liegt, und das sind in jeder Generation derselben
+Kachel dieselben Pixel. Die Kappe klettert damit von selbst wieder auf 200.
+`.komet toggle minimapdirect`, Stress-Phase `minimap-direktupload aus (FBO)`, Report-Zeile
+`minimap: … direkt-upload (N kacheln in M komponenten)`.
+
+## Task-Drain: Zeitbudget mit Vanillas Requeue (02.09.)
+
+Mit der Task-Attribution hatte der `draussen`-Bucket im zweiten Report Namen:
+`tasks 16,9 (loadchunk 16,8)` und `tasks 13,8 (loadchunk 12,4)`. Der Netzwerk-Thread reicht dem
+Drain einen ganzen Chunk-Schub auf einmal (Singleplayer: Paket 10 läuft als Objekt über
+`DummyNetConnection`, der Client-Netz-Thread packt aus und reiht je Chunk eine `loadchunk`-Task
+ein), und `ExecuteMainThreadTasks` lief sie alle in einem Frame ab.
+
+`MainThreadTaskPatches.RunTasks` hat jetzt ein Budget (`MainThreadTaskBudgetMs`, 3 ms): ist es
+überschritten, geht der Rest mit **Vanillas eigenem Requeue** zurück — der Suspend-Pfad, den
+`SuspendMainThreadTasks` auch nimmt: der Rest kommt an den **Anfang** der geteilten Queue, vor
+alles, was inzwischen ankam. Reihenfolge bleibt, nichts geht verloren, ein Paket, das einen
+Chunk referenziert, läuft weiterhin nach dessen `loadchunk`. Liveness: mindestens 8 Tasks laufen
+immer; das Budget dehnt sich mit dem Rückstau (×2 bei 256 wartenden Tasks) und wird über 4096
+ignoriert — eine Queue, die schneller wächst, als das Budget abträgt, darf nicht unbegrenzt
+wachsen. Reine Regel `OverBudget(budget, spent, ran, remaining)` im Verify.
+`.komet toggle taskbudget`, Stress-Phase `task-budget aus`, Report: `hauptthread-tasks: …
+budget 3 ms: N frames gekappt, M tasks verschoben`, HUD `mt-tasks · N frames gekappt`.
+
+## Server-Allokation: die 193 MB/s bekommen Namen (02.09.)
+
+Jede gen0-Sammlung pausiert den Render-Thread, egal wer alloziert hat. Die Join-Flut-Reports
+vom 02.09. maßen 279 MB/s, davon 193 unattribuiert (`rest = ungemessen, v.a. integrierter
+server`), 35 gen0/s, und 52 von 54 Rucklern saßen auf einer GC-Pause. Der größte verbliebene
+Hebel liegt auf der Server-Seite des Prozesses — und hatte keinen Namen. Die GC-Konfiguration ist
+als Hebel ausgemessen und tot (gen0size und Server-GC: seltener, aber längere Pausen; siehe
+Ruckler-Kapitel), also bleibt nur: weniger allozieren, und dafür erst messen, wer.
+
+`ServerAllocPatches` (Server-Harmony-Id, in Singleplayer im selben Prozess) legt
+`GC.GetAllocatedBytesForCurrentThread` um die Arbeit — dasselbe Werkzeug wie `netz`/`prefetch`
+auf der Client-Seite. Thread-Ebene (disjunkt, je ein Thread): `tick` (`ServerMain.Process`),
+jede `ServerThread`-Schleife über ihren Namen (`chunkdb`, `compress`, `relight`, `blockticks`),
+`worldgen` (die zusätzlichen Worldgen-Threads, `GenerateChunkColumns_OnSeparateThread`),
+`physik-worker` (`PhysicsManager.DoWork`) und `physik-helper` (seine Queue-Aktionen, gewickelt).
+Darunter Verdächtige **innerhalb** dieser Threads: `send-chunks` (Chunk-Pakete bauen),
+`entities`, `physik-tick`, `mt-tasks`, `worldgen-passes` (`runGenerators`), `db-laden`
+(`TryLoadChunkColumn`), `chunk-einbau` (`mainThreadLoadChunkColumn` — trotz Namens auf dem
+Chunk-Thread). Bytes gehören dem Thread, der den Code ausführte, also steckt jeder Verdächtige
+in genau einer Thread-Summe. Raten werden einmal je Sekunde aus dem Server-Tick gefaltet
+(Interlocked-Zähler, jeder Thread bucht selbst).
+
+Im Report: `alloc-quellen: netz …, server N, rest M` — die Thread-Summe verlässt die
+Rest-Spalte —, darunter `alloc server: chunkdb 120, tick 40, … MB/s | davon worldgen-passes 90,
+send-chunks 30, …`. Messung, kein Eingriff; `.komet toggle serveralloc`. Der nächste Report
+entscheidet, welcher Allokator als Erster dran ist.
+
+## Entity-Before-Stage: Attribution und Animations-LOD (02.09.)
+
+Drei Ruckler des zweiten Reports hießen `before 17-20 ms | renderer Before-ree 17-19 ms`, davon
+nur 1,2-1,5 ms `enttess`. `SystemRenderEntities.OnBeforeRender` läuft je Frame über **alle**
+geladenen Entities: Frustum-Test, `EntityRenderer.BeforeRender` für die sichtbaren
+(Shape-Tesselation, zwei Licht-Lookups), dann `AnimManager.OnClientFrame` für alle — und das
+treibt den Animator (Gelenk-Matrizen, die teuerste CPU-Arbeit je Entity) für jede Entity, die
+gerendert, schatten-gerendert oder tot ist. Bei 255 Blöcken Schattenreichweite ist fast jede
+geladene Entity schatten-gerendert.
+
+`EntityAnimPatches` ersetzt die Schleife durch eine 1:1-Transkription mit zwei Uhren
+(`vor-render` / `anim`), zählt die Entities je Hälfte und behält die teuerste einzelne Entity
+des Frames. Ruckler-Zeile: `entities vor-render 2,1 ms, anim 9,3 ms/188 (top
+wolf-eurasian-adult-male 1,2)`; Report `entity-before: …`, HUD `entity-anim`. Provider-Muster
+wie der Tick-Profiler (`HitchLog.EntityFrameProvider`, gelesen bei der Ruckler-Erkennung, vor
+`EndFrame`).
+
+Die Optimierung darauf: eine Entity, von der nur der **Schatten** gerendert wird (außerhalb des
+Sicht-Frustums, innerhalb des Schatten-Frustums), bekommt ihre Animation jeden dritten Frame,
+eine gerenderte Entity jenseits `EntityAnimationFarBlocks` (48) jeden zweiten — jeweils mit dem
+dt der übersprungenen Frames aufaddiert, die Animations-**Zeit** läuft also exakt wie vorher,
+nur seltener abgetastet. Eigener Spieler, nahe Entities und tote (ihre Todesanimation muss zu
+Ende laufen; Vanillas eigenes Gate `!Alive` bleibt) immer in voller Rate. Die Reihen werden über
+die Entity-Id verteilt (`IsTurn(frame, id, divisor)`), damit die gesparte Arbeit gleichmäßig
+über die Frames liegt statt jeder dritte Frame billig zu sein. Reine Regeln `Divisor` und
+`IsTurn` im Verify. `.komet toggle animlod` (Rate), `.komet toggle entbefore` (die ganze
+Transkription, ohne sie auch kein LOD), Stress-Phase `anim-lod aus`.
+
 ## Benutzung
 
 ```bash
@@ -2110,3 +2337,388 @@ Interessant sind vor allem:
   Flaschenhals.
 * `draw ranges … x fewer` — der reale Merge-Faktor in deiner Welt.
 * `occlusion pass … peak` — sollte jetzt einstellig statt dreistellig sein.
+
+## Feldreport schwache Hardware: i3-7100U, HD 620, „Optimum"-Build (03.09.)
+
+Ein Tester-Log (2 Kerne / 4 Threads, Intel HD 620, 12 GB, KDE neon; Spiel als modifizierter
+Engine-Build „Optimum v0.3.14", 123 Mods, fps-limit 30) hat sieben Dinge gezeigt, von denen
+fünf in der Mod lagen. Reihenfolge nach Schwere, nicht nach Auffälligkeit.
+
+**1. `AmbiguousMatchException` in `MeasurementPatches.Apply` — Root Cause und Teil-Anwendung.**
+`AccessTools.Method(typeof(ChunkTesselator), "populateTesselatedChunkPart")` ohne Signatur
+löst über `Type.GetMethod(name)` auf, und das wirft, sobald eine zweite Überladung existiert —
+der Optimum-Build hat eine. Schlimmer als der Fehler war sein Ort: mitten in der Gruppe. Die
+Klammern davor (Stages, Tick, Upload, Tesselation, Nachbarn, Relight) waren angewendet, die
+danach (JSON-Alloc, Netz-Alloc, **Swap-Timing**) fehlten still, und das Log sagte „could not
+enable … running without it" — beides falsch. Jetzt: die vier Kern-Klammern sind Pflicht und
+werfen; jede Attributions-Klammer wird einzeln angewendet (`Optional(name, …)`), ein Ausfall
+wird **mit Namen** geloggt und steht im Report (`messung ohne: …`). Für die Klone-Klammer
+werden **alle** Überladungen des Namens gepatcht (`PatchEveryOverload`), Prefix/Postfix sind
+verschachtelungssicher (thread-statische Tiefe, nur der äußerste Aufruf bucht) — welche
+Überladung die Engine ruft und ob eine die andere wickelt, ist ihr Ding. Verify stellt einen
+Typ mit zwei Überladungen nach, prüft dass die reine Namenssuche wirft, und dass der
+verschachtelte Aufruf einmal bucht.
+
+**2. `gpu 173.73 ms` bei 33,9 ms Frame — der GPU-Timer stand seit dem zweiten Frame.**
+Der Ring aus vier `GL_TIME_ELAPSED`-Queries verweigerte einen `BeginQuery` auf einem Slot,
+dessen Ergebnis noch nicht gelesen war. Gelesen wurde zweimal je Sekunde, verbraucht ein Slot je
+Frame: nach vier Frames war der Ring voll, und der End-Handler — die einzige Stelle, an der die
+Lese-Uhr lief — kehrte ohne aktive Query sofort zurück. Der einzige Wert, der je gelesen wurde,
+war der eines Join-Frames, für den Rest der Session eingefroren. Das erklärt rückwirkend auch
+das „byte-identisch über und unter Wasser" (als Glättungsträgheit gedeutet) und den
+„GPU-gebunden"-Befund eines früheren RX-570-Reports — beide waren dieselbe eine Zahl. Jetzt:
+Slots werden überschrieben (ungelesenes Ergebnis verfällt), die Regel lebt GL-frei in
+`GpuFrameTimer.QueryRing`, Verify treibt 3000 Frames hindurch (jeder Frame beginnt eine Query,
+~200 Lesungen, nie der gerade beendete oder der nächste Slot) und simuliert die alte Regel als
+Gegenprobe (steht nach vier Frames). Der Report trägt jetzt `gpu … (N proben)`.
+
+**3. `gc 0.0 ms/s, 0 MB/s alloc, cpu 0.0, 0 chunks/s` neben Rucklern mit 40 ms GC-Pause.**
+Alle Sekundenraten wurden in `DebugHud.SampleWorld()` gefaltet — also nur bei sichtbarem
+Overlay. Ein `.komet report` mit HUD aus (so kommt jeder Feldreport) druckte Nullen. Jetzt
+faltet `FrameStats.Advance` an der Frame-Grenze alle 0,5 s (`SampleGc` + `PeriodicSample`,
+worauf `TesselationStats.Sample` hängt), Render-Thread, HUD egal. Verify: 3 s synthetische
+Frames ohne HUD → ~6 Faltungen, keine innerhalb des Intervalls.
+
+**4. Thread-Überbelegung: 4 Cull + 3 Occlusion + 5 Worldgen auf 4 Hardware-Threads.**
+`WorkerSet.AutoThreads` riet „über vier Hardware-Threads zweifach SMT" — richtig für 6c/12t,
+exakt falsch für den 2c/4t-Laptop, der als vier Kerne galt. Dazu `ServerWorldgenThreads = 6`
+ohne Blick auf die Maschine (`additionalWorldGenThreadsCount = 5`). Zwölf beschäftigte Threads
+auf vier Hardware-Threads, der Render-Thread und der Collector hinten in der Warteschlange —
+die 992-ms-„gen1"-Pause im Log ist Summe aller Pausen eines 2,5-s-Ticks, aber jede einzelne
+davon wartet darauf, dass alle diese Threads einen Kern bekommen. Jetzt `CpuTopology`: Linux
+liest `physical_package_id`/`core_id` aus sysfs, Windows `GetLogicalProcessorInformation`,
+macOS `hw.physicalcpu`; die Rate-Regel bleibt Fallback, der Report nennt die Quelle
+(`kerne: 2 physisch von 4 logischen (sysfs)`). Budgets: Cull-Helfer = physisch − 1, Occlusion =
+physisch − 2, **null ist erlaubt** (auf zwei Kernen läuft der Occlusion-Walk inline auf seinem
+eigenen Thread statt als dritter Busy-Thread); Worldgen = min(konfiguriert, Hardware-Threads
+− 2) — der 12-Thread-Desktop behält 6, der Laptop bekommt 2, das Log nennt die Kappe. Verify:
+sysfs-Parser mit Laptop-, Desktop-, Zwei-Sockel- und Datei-fehlt-Topologie, alle Budgets.
+
+**5. `shadow map framebuffers rebuilt at 5120px` auf einer HD 620 mit Schatten unter Maximum.**
+`ShadowMapExtraQuality = 1` existiert, weil der Regler bei 4 (6144 px) endet. Unterhalb kann der
+Spieler selbst höher stellen und hat es nicht — auf einer iGPU aus gutem Grund. Die Stufe griff
+trotzdem, und der erzwungene Framebuffer-Rebuild beim Join (der **alle** Framebuffer neu baut)
+lief auch bei Schatten *aus*. Jetzt `StepsFor(engineSteps, extra)`: Extra-Stufen nur ab
+Engine-Stufe 6 (= Qualität 4); darunter Vanilla-Größe, und `TryForceRebuild` steigt mit
+Log-Zeile aus statt zu rebuilden. Stellt der Spieler mitten in der Session auf 4, baut die
+Engine selbst neu und die Regel greift. Konfig-Kommentar entsprechend; Verify pinnt die Regel.
+
+**6. `ruckler: 5638.5 ms … draussen 5627.3` acht Sekunden nach „Client pause state is now on".**
+Das Pausenmenü stand offen. `HitchLog.NotePaused` (vor der Kamera-Probe an jeder Frame-Grenze,
+aus `capi.IsGamePaused`) verwirft einen anstehenden Ruckler, dessen Frame pausiert begann oder
+endete; Summary und Hitch-Report nennen die Zahl (`N im pausenmenue verworfen`). Verify: 5-s-
+Pausenframe und der Schließ-Frame werden verworfen, ein echter Stall danach bucht.
+
+**7. `thread priority: True` unter Linux.** `Thread.Priority` wird auf Linux gespeichert und
+nie angewendet (CoreCLR-PAL; für die Cull-Worker gemessen), und ein niedrigerer Nice-Wert
+braucht Rechte, die das Spiel nicht hat. Die Log-Zeile behauptete einen Hebel, den es nicht
+gibt; jetzt „not available on Linux", und die Patch-Hälfte wird dort gar nicht erst installiert.
+
+**Nicht von der Mod, und deshalb nicht angefasst:** der 3,3-s-Frame bei 208 s (`tick 2561.6`,
+gc 992,8 summiert) — ein Tick-Listener, den dieser Build (Stand 6fda7bd) noch nicht benennen
+konnte; der `TickProfiler` dieses Arbeitsstands nennt ihn im nächsten Log. Die `Before-ree`-
+Bursts von 70–148 ms (Entity-Before-Stage, „enttess" nur 18 ms davon) — dafür sind
+`EntityAnimPatches` (Attribution + Animations-LOD) und `EntityLoadPatches` (Lade-Budget) im
+selben Arbeitsstand. `DarkVision`-Shaderpatch-Fehler und die 724 fehlenden Texturen/Shapes
+sind Mod-Konflikte anderer Mods. Optimums Threadpool-Kappe (`worker=10`) berührt Komet nicht:
+Cull, Occlusion, Prefetch und Prebuild laufen auf eigenen Threads.
+
+## Patch-Wächter: wer sonst noch auf Komets Methoden sitzt (03.09.)
+
+Zwei Arten, wie ein Komet-Patch aufhören kann zu bedeuten, was er bedeutet. **Eine andere
+Harmony-Mod** patcht dieselbe Engine-Methode: ein fremder Transpiler schreibt die IL um, die
+Komets Transpiler erwartet (und Harmony führt bei *jedem* Patch-Vorgang auf der Methode alle
+Transpiler neu aus — Komets läuft dann im Patch-Aufruf der anderen Mod und wirft dort, wenn die
+Form nicht mehr passt); ein fremder Prefix, der `bool` zurückgibt, kann das Original abbrechen,
+das Komets Prefix/Postfix klammern; oder eine Mod patcht direkt Komet-Code. **Ein Fork-Client**
+(der „Optimum"-Build des Feldreports) patcht gar nicht, sondern liefert geänderte Assemblies —
+und Komets 1:1-Transkriptionen (Task-Drain, Entity-Before-Schleife, Minimap-Upload, Entity-Sync)
+ersetzen dort still, was der Fork in derselben Methode geändert hat. Keine Exception, keine
+Log-Zeile.
+
+`src/PatchGuard.cs` beantwortet beides, ohne Verhalten zu ändern — eine Kollision wird gemeldet,
+nie „aufgelöst", denn wer gewinnen soll, ist nicht Sache dieser Mod.
+
+**Harmony-Kollisionen** kommen aus Harmonys eigenem Register (`Harmony.GetAllPatchedMethods` +
+`GetPatchInfo`): jede gepatchte Methode im Prozess mit Besitzern, Art und Priorität. Gemeldet
+wird jeder fremde Patch auf einer Methode, die Komet patcht, und jeder Patch auf Komet-Code.
+Stufen: **hoch** = fremder Transpiler neben Komets Transpiler, fremder abbrechender Prefix neben
+Komets abbrechendem Prefix (die Zeile sagt, wer zuerst läuft), Patch auf Komet-Code; **mittel** =
+abbrechender Prefix auf einer nur gemessenen Methode (die Messung bucht dann einen übersprungenen
+Aufruf), fremder Transpiler unter Komets Prefix/Postfix; **info** = nicht abbrechende Prefixe,
+Postfixe, Finalizer. Geprüft bei `LevelFinalize` (alle Mods sind dann gestartet) und alle 10 s
+danach, weil Mods auch spät patchen; jeder Fund wird einmal als Warnung geloggt
+(`patch-kollision HOCH: Typ.Methode - 'modid' transpiler (prio 400) neben komet transpiler: …`),
+bleibt im Report (`patch-kollisionen: N (x hoch, y mittel, z info)` plus eine Zeile je Fund)
+und in `.komet conflicts`. Komets eigene Ids sind `komet`, `komet.server`, `komet.verify`.
+
+**Engine-Fingerabdruck.** `./build.sh fingerprint` lässt die Verify-Suite laufen (die wendet
+jeden Patch an) und hasht danach jede gepatchte Engine-Methode in `src/EngineFingerprint.g.cs`:
+FNV-1a über Opcodes plus *aufgelöste* Operanden (Member-Namen statt Metadaten-Tokens,
+Sprungziele als Offsets, Literale als Text), damit ein Neubau derselben Quelle gleich hasht;
+dazu Spielversion und Modul-Ids der betroffenen Assemblies. Harmony patcht auf Native-Ebene und
+lässt die IL unberührt, also liest der Hash auf einer gepatchten Methode dasselbe wie auf einer
+frischen. Beim Weltstart vergleicht `PatchGuard.CheckEngine` erst die Modul-Ids (die
+Ganz-Build-Antwort), dann jede gepatchte Methode, die die Tabelle kennt. Ergebnis als eine
+Zeile im Log und Report: `engine: v1.22.7 (Stable) - assemblies wie verifiziert (1.22.7), alle 78
+gepatchten methoden unveraendert`, oder bei einem Fork `… VintagestoryLib weicht vom
+verifizierten build ab; 3 von 78 gepatchten methoden VERAENDERT: A, B, C - komets transpiler und
+1:1-transkriptionen dort laufen gegen fremden code`. Weicht nur die Assembly ab, aber keine
+Methode, steht das ebenso da — dann treffen Komets Patches bekannten Code, und der Report des
+Testers ist trotz Fork verwertbar.
+
+Verify enthält den Vergleich als letzten Check: jede von der Suite gepatchte Engine-Methode muss
+in der Tabelle stehen und unverändert sein, sonst „run ./build.sh fingerprint" — nach einem
+Spiel-Update ist das der eine Handgriff. Dazu die Live-Prüfung selbst (keine Abweichung gegen
+die Installation, und eine mutierte Tabellenzeile wird beim Namen genannt) und der
+Kollisionsscanner mit drei Fremdpatches aus einer zweiten Harmony-Instanz: abbrechender Prefix
+auf einer gemessenen Methode (mittel, „laeuft VOR"), Transpiler auf `window_RenderFrame` (hoch),
+Postfix auf `WorkerSet.AutoThreads` (hoch, Komet-Code); jeder Fund einmal geloggt, ein Rescan
+ohne Änderung meldet nichts, nach dem Unpatch ist die Liste leer. Nebenbefund des Tests:
+Komet hat auf `TriggerRenderStage` selbst einen abbrechenden Prefix (Shadow-Throttle), ein
+fremder abbrechender Prefix dort ist deshalb zu Recht „hoch".
+
+## Log 03.09. (eigener Rechner): der Rest bekommt Namen, und der GC seine Überlebenden
+
+Der erste Log nach dem Feldreport, noch mit dem Build vom Vorabend (`b260902.1910`, also ohne
+die Fixes desselben Tages — `gpu 1,32 ms` ist dort noch der eingefrorene Wert), Join-Flut mit
+721 Chunks/s empfangen, 204/s tesseliert, Warteschlange 4.500: **384 von 402 Rucklern tragen
+eine GC-Pause**, 193 ms/s Pausenzeit, 27 gen0/s, längste gen0/gen1-Pause 33 ms. 216 MB/s
+Allokation, davon `server 69`, `tess 35`, `netz 17`, `main 11`, `prefetch 4` — und **79 MB/s
+„rest = ungemessen"**. Die anderen Zeilen des Logs sind Einzelfälle: `readpacket6 693 ms` ist
+`LevelFinalize` beim Beitritt; die 31 ms für `trader-female-clothing-temperate` sind die
+Hauptthread-Hälfte einer Händler-Tesselation mit Kleidung, die das Entity-Budget nicht teilen
+kann (mindestens eine je Frame); `WorldMapManager.OnClientTick 10,5 ms` einmal.
+
+Zwei Messungen, damit der nächste Log die GC-Frage beantwortet statt sie zu stellen:
+
+**`ClientAllocPatches`** — die acht Engine-Worker-Threads des Clients (`tesselateterrain`,
+`networkproc`, `relight`, `compresschunks`, `chunkvis`, `chunkculling`, `blockticking`,
+`asyncparticles`) bekommen je eine Klammer um `ClientThread.Update`, benannt nach dem
+Thread-Namen — disjunkt und vollständig für alles, was diese Threads tun. Dazu wird jede an
+`TyronThreadPool.QueueTask(Action, string)` übergebene Aktion gewickelt, sodass ihre Bytes auf
+dem Aufrufer-Namen landen, egal welcher Pool-Thread sie ausführt (die `Func<Task>`-Variante
+bleibt draußen: nach einem `await` läuft die Fortsetzung womöglich auf einem anderen Thread, und
+ein Per-Thread-Zähler kann ihr nicht folgen). Die bestehenden Klammern (Meshing in
+`TesselateChunk`, Netzwerk-Systemtick) bleiben und speisen weiter die `laden:`-Zeile; das
+Thread-`tess` und `netz` hier enthalten sie. Report: `alloc-quellen: main, client-threads,
+threadpool, prefetch, server, rest` plus `alloc client-threads: tess 35, netz 17, compress …
+MB/s | threadpool N MB/s: enttess …`. `.komet toggle clientalloc`, Konfig
+`ClientAllocAttribution` (Layout 10).
+
+**GC-Überlebende.** Die Pause wird für das bezahlt, was der Collector *behält*, nicht für
+das, was alloziert wurde: Müll ist billig, Überlebende werden markiert und nach gen1 kopiert,
+und die Karten der alten Generation, die auf sie zeigen, werden gescannt. Gestreamte Weltdaten
+überleben per Definition. `FrameStats` liest jetzt in jedem Frame, der eine Sammlungsgrenze
+überschritten hat, `GC.GetGCMemoryInfo(Ephemeral)` — bei 27/s und 90 fps sieht das fast jede
+Sammlung genau einmal — und faltet `befoerdert MB/s`, `MB je sammlung`, Generation und Pause der
+letzten Sammlung, Heap-Größe. Report-Zeile `gc-details: gen1 x/s, befoerdert N MB/s = M MB je
+sammlung (bis zu P % der allokation ueberlebt), letzte gen1 9,4 ms pause, heap 2.100 MB`.
+gen0- und gen1-Beförderung zählen beide, ein zweimal befördertes Objekt also doppelt — der
+Anteil ist eine Obergrenze. Liegt er nahe der Allokationsrate, sind es Weltdaten, die leben
+müssen, und nur weniger laden je Sekunde hilft (die Zuflussbremse stand in diesem Log bereits
+auf 3 %); liegt er weit darunter, ist es Müll, und die `alloc-quellen`-Zeilen sagen wessen.
+
+## GPU-Spanne ist nicht GPU-Last, eine Stichprobe über alle Threads, und SheyderMod (03.09., abends)
+
+### „Meine GPU ist nach dem letzten Patch extrem ausgelastet"
+
+War sie vorher auch. Alter und neuer Report haben dieselbe Framezeit (10,86 gegen 10,93 ms),
+dieselbe Swap-Wartezeit (0,51 ms), dieselbe Schattenkarte (7168 px), dieselben Anzeigewerte
+(Vsync aus, Limit 240). Der einzige Unterschied war die gpu-Zahl: 1,32 ms gegen 10,20 ms. Die
+1,32 ms stammten vom eingefrorenen Timer der Vorversion (siehe oben), gelesen in der ersten
+halben Sekunde im Ladebildschirm. Die 10,20 ms sind das reale Bild, und das war vorher nur
+nicht sichtbar.
+
+Und selbst diese Zahl heißt nicht „die GPU rechnet 10 ms". `GL_TIME_ELAPSED` misst die Spanne
+zwischen erstem und letztem Befehl des Frames auf der GPU, **inklusive der Lücken, in denen
+sie auf den Hauptthread wartet**. Ein CPU-limitierter Frame, der über 10 ms Befehle
+nachschiebt, liest sich genauso wie ein GPU-limitierter, der 10 ms rechnet. Der Hauptthread
+war mit rund 9,7 ms seinerseits fast voll; welche Seite die Wand ist, sagt die Spanne nicht.
+
+Was es sagt, ist die Auslastung des Treibers. Auf Linux veröffentlicht amdgpu sie in sysfs
+(`/sys/class/drm/cardN/device/gpu_busy_percent`), ein Integer, vom Treiber gepflegt. Neu in
+`shared/GpuBusy.cs`: zweimal die Sekunde gelesen (Mikrosekunden, kein GL-Aufruf, kein
+Treiber-Sync), erste Karte mit der Datei (Connector-Einträge wie `card1-DP-1` werden
+übersprungen), nach drei unlesbaren Werten schaltet sich die Zeile ab statt zu lügen. HUD-Zeile
+`gpu-last 93 %`, Report `gpu 10,20 ms (153 proben, auslastung 93 % laut amdgpu)`. Die Marke
+„GPU-LIMITIERT" entscheidet ab jetzt die Auslastung (ab 90 %), wo es sie gibt; ohne Zahl bleibt
+die alte Spannen-Regel als das schwächere Signal, das sie ist. Intel und NVIDIA liefern in
+sysfs nichts Vergleichbares, Windows hat keine Datei; die Zeile fehlt dann, statt zu raten.
+
+Zur Einordnung der Last selbst: ohne Vsync und mit Limit 240 rendert das Spiel so schnell es
+kann. Bei 91 fps ist die GPU dann in jedem Build nahe Vollast. Komets eigener Anteil sind die
+Standardwerte 255 Blocks Schattenweite, eine Extrastufe Schattenkarte und LOD3 im Schattenpass;
+dazu kommt SheyderMod mit Deferred Rendering, GTAO, SSR und volumetrischem Nebel, alles
+GPU-Arbeit.
+
+### SheyderMod: was es ist und wo es Komet berührt
+
+Kein „einfacher Shader-Mod". Die Dekompilierung (110 Dateien) zeigt eine eigene
+Blockbeleuchtung (Sonnen-Bake und Laternen-Rebake, gerechnet auf der **Relight-Thread des
+Clients** mit 25 ms Budget je Tick, Lichtvolumen im eigenen Speicher, Überschreiben von
+`currentChunkRgbsExt` im Postfix auf `ChunkTesselator.BeginProcessChunk`), Deferred Rendering,
+GTAO, Bloom, Lens Flare, mechanische Schatten in den Shadow-Stages, Specular-Atlas, SSR für
+Wasser, volumetrischer Nebel. 19 gepatchte Engine-Methoden.
+
+Geprüft, Methode für Methode gegen Komets Patchziele:
+
+- **Harmony-Überlappung** gibt es genau eine: `JsonTesselator.AddJsonModelDataToMesh`.
+  SheyderMod beleuchtet dort in Prefix und Postfix breite Shapes nach, Komet hat dort nur die
+  Allokationsklammer. Kein Abbruch, kein Transpiler, nichts zu entscheiden.
+- **BeginProcessChunk-Postfix gegen den Fenster-Vorbau:** Komets Prefetch tauscht in
+  `BuildExtendedChunkData` das vorgebaute Fenster ein, SheyderMods Postfix überschreibt danach
+  die Lichtwerte im Feld, das der Tesselator hält. Reihenfolge stimmt, beide auf dem
+  Tesselations-Thread, kein zweiter Tesselator.
+- **EntityShapeRenderer.BeforeRender-Postfix gegen die Entity-Transkription:** Komets Schleife
+  ruft `renderer.BeforeRender(dt)` für sichtbare Entities, das ist die gepatchte Methode, der
+  Postfix läuft. Das Anim-LOD betrifft nur `AnimManager.OnClientFrame`.
+- **Mechanische Schatten in ShadowFar:** Komets Drossel überspringt die Stage samt Renderer;
+  die zurückgehaltene Karte enthält den Beitrag des letzten echten Renders. Bei bis zu vier
+  Frames Alter bei 90 fps nicht sichtbar.
+- **Relight-Thread:** SheyderMods Bake läuft im Postfix auf
+  `ClientSystemRelight.OnSeperateThreadGameTick`, also **innerhalb** von Komets Thread-Klammer.
+  Sein Allokationsanteil steht in der Zeile `alloc client-threads` unter `relight`; im Report
+  vom 03.09. lag er unter 0,5 MB/s.
+- SheyderMod hat keine eigenen Threads (`new Thread`, `Task.Run`, ThreadPool: keine Treffer).
+
+Zwei Dinge waren trotzdem falsch, beide auf Komets Seite:
+
+1. **Der Patch-Wächter hat die Messklammer als Kollision gewarnt.** Zwei Zeilen
+   `patch-kollision INFO` im Warning-Log, dazu „Captured 2 issues during startup". Ein
+   fremder Prefix ohne Abbruch neben einer reinen Zeitmessung ist keine Kollision im Sinn der
+   Frage „überschreibt jemand Komets Funktion". Der Wächter erkennt jetzt, wenn alles, was
+   Komet auf der Methode hat, aus `shared/MeasurementPatches` stammt (`Finding.MeasurementOnly`),
+   schreibt dann „neben komets messklammer (prefix+postfix): … komet misst hier nur, nichts zu
+   entscheiden", und **Info-Befunde gehen ins Notification-Log**, nur Mittel und Hoch bleiben
+   Warnungen. Die Swap-Transpiler-Klammer zählt als Messklammer, `SunRelightChunk` mit dem
+   Postfix des Vorbaus nicht; beides im Harness festgenagelt.
+2. **Die Klammern schlossen vor dem fremden Postfix.** Bei gleicher Priorität läuft der
+   Postfix der früher registrierten Mod zuerst, also Komets; SheyderMods Nachbeleuchtung lag
+   damit außerhalb der `shapes`-Klammer und landete im `rest`. Alle Mess-Prefixe stehen jetzt
+   auf `Priority.First`, alle Mess-Postfixe auf `Priority.Last`. Harmony sortiert Prefixe UND
+   Postfixe absteigend nach Priorität, also läuft First als erster Prefix und Last als letzter
+   Postfix; der Harness prüft die Reihenfolge gegen die echte Harmony und als Gegenprobe, dass
+   gleiche Priorität die äußere Reihenfolge nicht liefert. Komets eigene Patches auf gemessenen
+   Methoden (Vorbau, Prio-Upload) lagen schon auf Low. Nebeneffekt: ein fremder High-Prefix
+   läuft jetzt NACH Komets Mess-Prefix, was der Wächter entsprechend meldet.
+
+### Stichprobe statt Klammer: `alloc-stichprobe`
+
+Nach der Klammer um jeden Engine-Thread blieben im Report 46 MB/s „rest = ungemessen". Wer
+das ist, sagt keine Klammer, denn eine Klammer braucht ein Ziel. Die Runtime selbst zählt
+aber mit: mit dem GC-Keyword auf Verbose feuert der CLR etwa alle 100 KB Allokation ein
+`GCAllocationTick`-Ereignis mit Größe, Typ des Objekts, das die Schwelle überschritten hat,
+und OS-Thread-Id. `src/AllocSampler.cs` ist ein prozessinterner `EventListener` darauf: kein
+Patch, keine Klammer, keine Engine-Methode berührt. Bei 200 MB/s sind das zweitausend
+Ereignisse die Sekunde, je ein Dictionary-Zugriff auf dem Dispatch-Thread der Runtime.
+
+Die Thread-Id wird zum Namen über das, was das OS weiß: Linux `/proc/self/task/tid/comm`
+(gefüllt aus `Thread.Name`, auf 15 Zeichen gekürzt, deshalb `tesselateterrai`), Windows
+`GetThreadDescription`. Bekannte Engine-Namen bekommen die Labels der anderen Zeilen
+(`tess`, `netz`, `chunkdb`), Komets Worker verlieren ihre Nummer (`komet-cull`), der
+Hauptthread heißt `main` über seine beim Start gemerkte Id. Ein Thread, der stirbt, bevor
+seine Ticks verarbeitet sind, wird als `#tid` gebucht; das kam im Harness prompt vor
+(Standalone-Probe: die Ereignisse eines 50-ms-Threads kamen nach seinem Ende an) und ist bei
+den langlebigen Engine-Threads kein Thema.
+
+Report-Zeile: `alloc-stichprobe (N proben a ~100 KB): threads main 14, tess 27, netz 21,
+chunkdb 26, … MB/s | typen Int32[] 58, Byte[] 41, MeshData 6 … MB/s`. Es ist eine
+Stichprobe, und die Zeile sagt es: die Thread-Summen treffen die Allokationsrate im Rahmen
+des Sampling-Rauschens, die Typ-Verteilung ist dieselbe 100-KB-Lotterie. Genau genug für
+„wessen Müll ist das, und was für Arrays", was die Frage ist. Config `AllocSampling`
+(Layout 11), Toggle `allocsample`; der Sampler bucht seinen eigenen Dispatch-Thread ehrlich
+als `eventpipe`.
+
+### Paket 58 heißt ExchangeBlock, und wer es schickt, sagt jetzt der Server
+
+`hauptthread-tasks: readpacket58 0,01 ms (638.134x)`: 7.000 Pakete die Sekunde beim
+Streamen. Die Id stand nur in der Engine (`Packet_ServerIdEnum`); `src/TaskCodes.cs` liest
+die Tabelle einmal per Reflection, und der Drain bucht ab jetzt `readpacket58=ExchangeBlock`
+und `readpacket6=LevelFinalize`, in Ruckler-Zeile und Report gleich.
+
+Was das kostet: jedes Paket ein Hauptthread-Task, ein Blockschreiben, eine Dirty-Markierung.
+Die Retess-Quellen desselben Reports: `MainThreadTaskPatches.RunTasks 32 %` aller
+Dirty-Markierungen, dazu `BlockAccessorRelaxed.ExchangeBlock 9 %`; ein frisch gemeshter
+Chunk, dem danach seine Blöcke ausgetauscht werden, wird ein zweites Mal tesseliert.
+Bulk-Accessoren sind es nicht (deren Commit geht über `SendBlockUpdateBulk` als Sammelpaket);
+Einzelpakete kommen aus `world.BlockAccessor.ExchangeBlock` direkt. Kandidaten im
+Survival-Code: `BlockShapeFromAttributes.OnServerGameTick("melt")` (Schnee, der von Dächern
+schmilzt), Farmland, Crops, Bienenstöcke, Kohlenmeiler. Statt zu raten:
+`src/Patches/PacketSourcePatches.cs`, ein Prefix auf `ServerMain.SendSetBlock` (dem einen
+Trichter für Exchange- und Set-Einzelpakete), zählt beide Sorten und nimmt jeden 16. Aufruf
+als Kandidaten für einen Stack-Walk bis zum ersten Frame außerhalb der Accessor-Leitung,
+gedeckelt auf 25 Captures die Sekunde. Report: `block-pakete (server): exchange 638.134,
+set 12 seit reset = 7.001/s | quellen: BlockShapeFromAttributes.OnServerGameTick 91 %, …`.
+Ob sich ein Sammelpaket oder ein serverseitiges Zusammenfassen lohnt, entscheidet dieses
+Ranking im nächsten Report; die Exchange-Semantik (Block-Entity bleibt) verbietet ein
+Umbiegen auf das vorhandene SetBlocks-Sammelpaket.
+
+### Upload 12,7 ms bei 6 ms Budget: neue GL-Pools werden gezählt
+
+Die Ruckler-Liste hatte mehrmals `before 13,5 | upload 12,7` und `upload 9,7`, gegen ein
+Upload-Ziel von 6 ms. Ein Vertex-Budget kann eine Kostenart nicht sehen: `MeshDataPoolManager.AddModel`
+legt, wenn kein Pool Platz hat, per `MeshDataPool.AllocateNewPool` einen neuen an, und das
+ist `AllocateEmptyMesh` mit GL-Puffern von Dutzenden Megabyte, mitten im Upload-Drain. Neue
+optionale Messklammer in `shared/MeasurementPatches.cs` (Zeit je Anlage, Anzahl je Frame),
+in der Ruckler-Zeile `upload 12,7 (davon 1 neue pools 9,8)` sobald es ein echter Anteil ist,
+im Report `mesh-pools angelegt: N seit reset, X ms gesamt, laengste Y ms`. Erst wenn der
+nächste Report sagt, wie oft und wie teuer, lohnt eine Antwort (Pools vorab anlegen, kleinere
+Pools, Anlage aus dem Drain heraus).
+
+### Verifiziert
+
+Sechs neue Checks: Klammer-Reihenfolge gegen echte Harmony samt Gegenprobe; Paketnamen aus der
+Engine-Tabelle und Buchung unter dem beschriebenen Namen; sysfs-Leser (Parsen, Kartenwahl,
+Connector-Ausschluss, Abschalten nach drei Fehlern, LIMITIERT-Regel mit und ohne Zahl);
+Allokations-Sampler Ende-zu-Ende (48 MB auf einem Thread `kv-alloc`, gebucht nach Thread und
+als `Byte[]`); Pool-Anlage bis in die Ruckler-Zeile; Paketquellen-Sampler mit Ranking,
+Auswahlregel und Capture-Deckel. Der Patch-Wächter-Check prüft zusätzlich den
+Messklammer-Fall (Info, Notification, nicht Warning). Fingerabdruck auf 82 Methoden.
+
+## GPU-Zeit je Render-Stage, und Ortho-Ruckler nennen ihren Dialog (03.09., spät)
+
+### „Mein GPU-Frame springt über 95 %"
+
+Der Report dazu kam noch vom Build 0053 (Kopfzeile), also ohne `gpu-last`. Die 95 % sind
+Spanne durch Framezeit, und die Spanne enthält den Leerlauf (siehe oben). Aber der Wunsch,
+die GPU-Seite zu optimieren, ist berechtigt, und dafür fehlte das Instrument: `gpu 11,56 ms`
+sagt nicht, ob die Schattenkarte, die ferne Kaskade mit LOD3, der Opaque-Pass oder SheyderMods
+Post-Processing die Millisekunden hält. Blind an der Schattenauflösung zu drehen wäre Raten.
+
+Neu in `shared/GpuFrameTimer.cs`: am Anfang jeder Render-Stage schreibt der Mess-Prefix auf
+`TriggerRenderStage` eine `GL_TIMESTAMP`-Query (genau dort, wo die CPU-Stage-Uhr startet),
+der End-Renderer eine letzte am Frame-Ende. Die Differenzen sind die GPU-Spanne je Stage;
+eine Stage, die die Engine in diesem Frame nicht auslöst (gedrosselte ferne Kaskade, OIT
+aus), hat keinen Stempel und null Zeit. Timestamps verschachteln nicht und stören die
+Elapsed-Query nicht. Gelesen wird ein drei Frames alter Satz einmal die Sekunde, ein
+Rückgabe-Aufruf je gestempelter Stage. `StageRing` und `Intervals` sind GL-frei und im
+Harness geprüft (Slot je Frame, übersprungene Stages null, Summe gleich Spanne, Kadenz
+1/s, ohne Endstempel kein offenes Intervall).
+
+Report: `gpu je stage: before 0,6 | schatten 3,1 (fern 2,2, nah 0,9) | opaque 5,2 | oit 0,4 |
+post 1,9 | ortho 0,3 | done 0,1 ms`; HUD-Zeile `gpu-stages`. Die Engine-Arbeit zwischen zwei
+Triggern (Framebuffer-Wechsel, Clears) landet in der Stage davor. Was daraus folgt, entscheidet
+der nächste Report: `schatten` groß gegen `opaque` heißt Schattenkarte und Kaskaden-LOD
+(`ShadowMapExtraQuality`, `ShadowSkipRedundantLod`, `ShadowNearUpdateInterval`); `post` groß
+heißt SheyderMods Effekte; `opaque` groß bei kleinen Schatten heißt Geometrie und
+Fragment-Shader, wo eine Mod wenig zu holen hat.
+
+### `ortho 2645,2 | gc 879,6`: der Dialog bekommt einen Namen
+
+Der 2,7-Sekunden-Frame stand still, hatte keinen Logeintrag daneben, und die 326, 54, 67, 51
+und 80 ms Ortho-Frames drumherum sehen aus wie ein Dialog, der zum ersten Mal aufgeht und dann
+je Frame Tausende Kacheln zeichnet (Weltkarte bei 43.000 geladenen Chunks: 17.455
+Kartenkomponenten) oder das Handbuch beim ersten Öffnen. Welcher, konnte die Zeile nicht sagen.
+Jetzt: hängt ein Ruckler mit mindestens einem Viertel Ortho-Anteil an, holt der Kamera-Sampler
+vor dem Commit die offenen Nicht-HUD-Dialoge aus `api.Gui.OpenedGuis`, und die Zeile endet mit
+`| dialoge GuiDialogWorldMap`. Der String entsteht nur, wenn so ein Ruckler ansteht. Baseline
+gleich. Die 880 ms gen1-Pause in diesem Frame ist der Preis der Allokation, die der Dialog
+beim Aufbau macht; mit dem Namen ist der nächste Schritt (Vorbau beim Öffnen, Kappen der
+Zeichnung je Frame) eine Entscheidung mit Adresse.
+
+Ebenfalls aus dem Log: `readpacket11` ist UnloadServerChunk, der Tesselations-Thread hatte
+`58 MB/s: rest 56` bei 217 Chunks/s (258 KB je Chunk, ungeklärt; die Stichprobe nennt Thread
+und Typ), und die 10 ms für den ersten Frame eines neuen Schweins sind der Animator-Aufbau je
+Shape (`pig-eurasian-adult-male` diesmal, vorher `-female`), ein Kandidat für einen Vorbau beim
+Entity-Laden.

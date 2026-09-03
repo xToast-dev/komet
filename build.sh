@@ -5,6 +5,8 @@
 #   ./build.sh bench      just the throughput benchmark
 #   ./build.sh preview    print the HUD text without starting the game
 #   ./build.sh config     regenerate dist/komet.json from the real config class
+#   ./build.sh fingerprint  regenerate src/EngineFingerprint.g.cs (IL hashes of every engine
+#                           method the patches touch, against VS_INSTALL) - after a game update
 #   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,6 +31,12 @@ case "${1:-check}" in
   config)
     dotnet build verify -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
     exec dotnet verify/bin/Release/net10.0/KometVerify.dll config "${2:-dist/komet.json}"
+    ;;
+  fingerprint)
+    # Runs the whole check suite first (that is what applies every patch), then hashes the
+    # patched engine methods. A failing check means an incomplete patch set - nothing is written.
+    dotnet build verify -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
+    exec dotnet verify/bin/Release/net10.0/KometVerify.dll fingerprint "${2:-src/EngineFingerprint.g.cs}"
     ;;
   release)
     # A release candidate is whatever survived the full check suite - build, verify, bench.

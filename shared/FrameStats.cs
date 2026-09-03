@@ -114,7 +114,8 @@ public static class FrameStats
     public static Action<double, double, double, double> FrameSummary;
 
     // ---- garbage collector ---------------------------------------------------------
-    // Sampled by the HUD once a second. The pause total is the number that matters: it is
+    // Sampled from the frame boundary every SampleIntervalSeconds, HUD or no HUD. The pause
+    // total is the number that matters: it is
     // time the runtime stopped every thread at once, which is the only mechanism that can
     // make the render thread, the tesselation thread and the occlusion worker all slow down
     // by the same factor at the same moment.
@@ -123,6 +124,53 @@ public static class FrameStats
     public static double Gen0PerSecond { get; private set; }
     /// <summary>Gen2 collections per second - each one is a candidate for a dropped frame.</summary>
     public static double Gen2PerSecond { get; private set; }
+    public static double Gen1PerSecond { get; private set; }
+
+    // ---- what the collector had to keep ----------------------------------------------
+    // "216 MB/s allocated, 27 gen0 a second, every hitch on a pause" says how much is
+    // allocated, not how much SURVIVES - and that is the number that decides the lever.
+    // Garbage is cheap to collect; a gen0 pause is spent on the survivors (marking, copying
+    // into gen1) and on the old-generation cards that point at them. Streamed world data
+    // survives by definition. GC.GetGCMemoryInfo(Ephemeral) reports the promoted bytes of
+    // the last gen0/gen1 collection; read once per frame that saw a collection, so at 27/s
+    // and 90 fps nearly every collection is seen once. Gen0 and gen1 promotion both count,
+    // so an object promoted twice counts twice - the figure is an upper bound on survival.
+
+    /// <summary>Bytes promoted out of gen0/gen1 per second, smoothed.</summary>
+    public static double PromotedMbPerSecond { get; private set; }
+    /// <summary>Promoted bytes per ephemeral collection, smoothed - the pause's workload.</summary>
+    public static double PromotedMbPerGc { get; private set; }
+    /// <summary>Total heap after the last ephemeral collection.</summary>
+    public static double GcHeapMb { get; private set; }
+    /// <summary>Generation (0/1) and pause of the last ephemeral collection seen; -1 = none yet.</summary>
+    public static int LastGcGeneration { get; private set; } = -1;
+    public static double LastGcPauseMs { get; private set; }
+    /// <summary>Ephemeral collections whose info was read since start.</summary>
+    public static long GcInfosSeen { get; private set; }
+
+    private static long lastGcIndex;
+    private static long promotedBytesAccum;
+    private static int gcSeenAccum;
+
+    private static void NoteEphemeralGc()
+    {
+        try
+        {
+            var info = GC.GetGCMemoryInfo(GCKind.Ephemeral);
+            if (info.Index == lastGcIndex) return;
+            lastGcIndex = info.Index;
+            promotedBytesAccum += info.PromotedBytes;
+            gcSeenAccum++;
+            GcInfosSeen++;
+            LastGcGeneration = info.Generation;
+            LastGcPauseMs = info.PauseDurations.Length > 0 ? info.PauseDurations[0].TotalMilliseconds : 0;
+            GcHeapMb = info.HeapSizeBytes / 1048576.0;
+        }
+        catch (Exception)
+        {
+            // a runtime without the info: the rows stay at zero, nothing else changes
+        }
+    }
     /// <summary>Milliseconds per second the GC paused all threads.</summary>
     public static double GcPauseMsPerSecond { get; private set; }
 
@@ -133,7 +181,7 @@ public static class FrameStats
     /// </summary>
     public static double AllocMbPerSecond { get; private set; }
 
-    private static int seenGen0, seenGen2;
+    private static int seenGen0, seenGen1, seenGen2;
     private static double seenPauseMs;
     private static long seenAllocBytes;
     private static long gcSeenAt;
@@ -178,11 +226,29 @@ public static class FrameStats
     /// </summary>
     public static double CpuCoresBusy { get; private set; }
 
-    /// <summary>Folds the GC counters into per-second rates. Call about once a second.</summary>
+    /// <summary>
+    /// Anything else that folds counters into per-second rates (the tesselation throughput,
+    /// in TesselationStats). Invoked from the frame boundary right after <see cref="SampleGc"/>,
+    /// on the render thread, every <see cref="SampleIntervalSeconds"/>.
+    /// </summary>
+    public static Action PeriodicSample;
+
+    /// <summary>
+    /// How often the per-second rates fold. They used to fold inside the HUD's own refresh
+    /// cycle, i.e. only while the overlay was showing - and a '.komet report' taken with the
+    /// overlay off, which is how every field report arrives, printed zeros for the GC rate,
+    /// the allocation rate, the CPU load and the chunks per second while the same report's
+    /// hitch lines carried 40 ms GC pauses. The rates are frame accounting, not HUD decoration.
+    /// </summary>
+    public const double SampleIntervalSeconds = 0.5;
+    private static long sampleSeenAt;
+
+    /// <summary>Folds the GC counters into per-second rates. Called from the frame boundary
+    /// every <see cref="SampleIntervalSeconds"/>; a direct call is harmless (0.2 s guard).</summary>
     public static void SampleGc()
     {
         var now = System.Diagnostics.Stopwatch.GetTimestamp();
-        int g0 = GC.CollectionCount(0), g2 = GC.CollectionCount(2);
+        int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
         var pauseMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         var alloc = GC.GetTotalAllocatedBytes(precise: false);
         var mainAlloc = GC.GetAllocatedBytesForCurrentThread();
@@ -198,7 +264,13 @@ public static class FrameStats
             {
                 var a = 0.4; // fast enough to catch an underwater excursion while it lasts
                 Gen0PerSecond += ((g0 - seenGen0) / dt - Gen0PerSecond) * a;
+                Gen1PerSecond += ((g1 - seenGen1) / dt - Gen1PerSecond) * a;
                 Gen2PerSecond += ((g2 - seenGen2) / dt - Gen2PerSecond) * a;
+                PromotedMbPerSecond += (promotedBytesAccum / dt / 1048576.0 - PromotedMbPerSecond) * a;
+                if (gcSeenAccum > 0)
+                    PromotedMbPerGc += (promotedBytesAccum / (double)gcSeenAccum / 1048576.0 - PromotedMbPerGc) * a;
+                promotedBytesAccum = 0;
+                gcSeenAccum = 0;
                 GcPauseMsPerSecond += ((pauseMs - seenPauseMs) / dt - GcPauseMsPerSecond) * a;
                 AllocMbPerSecond += ((alloc - seenAllocBytes) / dt / 1048576.0 - AllocMbPerSecond) * a;
                 MainAllocMbPerSecond += ((mainAlloc - seenMainAllocB) / dt / 1048576.0 - MainAllocMbPerSecond) * a;
@@ -210,6 +282,7 @@ public static class FrameStats
 
         seenCpuTime = cpuTime;
         seenGen0 = g0;
+        seenGen1 = g1;
         seenGen2 = g2;
         seenPauseMs = pauseMs;
         seenAllocBytes = alloc;
@@ -317,6 +390,22 @@ public static class FrameStats
     public static void AddSwapTicks(long ticks) => swapTicks += ticks;
     public static void AddUploadMs(double ms) => uploadMsThisFrame += ms;
 
+    /// <summary>One mesh pool created inside this frame's upload drain, and what it cost.
+    /// The upload figure already contains the time; this names the share.</summary>
+    public static void AddPoolAlloc(double ms)
+    {
+        poolAllocMsThisFrame += ms;
+        poolAllocsThisFrame++;
+        StatPoolAllocs++;
+        StatPoolAllocMs += ms;
+        if (ms > MaxPoolAllocMs) MaxPoolAllocMs = ms;
+    }
+    private static double poolAllocMsThisFrame;
+    private static int poolAllocsThisFrame;
+    public static long StatPoolAllocs { get; private set; }
+    public static double StatPoolAllocMs { get; private set; }
+    public static double MaxPoolAllocMs { get; private set; }
+
     /// <summary>The debug overlay's own text-rebuild cost in this frame, so a hitch it caused
     /// names itself instead of reading as an engine ortho problem.</summary>
     public static void AddHudMs(double ms) => hudMsThisFrame += ms;
@@ -326,6 +415,27 @@ public static class FrameStats
     /// and the liquid-depth pass - a 65 ms before-hitch needs to say which of them it was.</summary>
     public static void AddEntityTessMs(double ms) => entityTessMsThisFrame += ms;
     private static double entityTessMsThisFrame;
+
+    /// <summary>
+    /// One finished main-thread task (ClientMain.ExecuteMainThreadTasks) inside this frame:
+    /// its code and cost. The frame keeps the total and the single heaviest task, so a
+    /// "draussen" hitch can say "tasks 9,1 (readpacket33 8,2)" instead of nothing. Fed by
+    /// the optimising mod's task-drain transcription; never called in the baseline.
+    /// </summary>
+    public static void AddMainThreadTask(string code, double ms)
+    {
+        mainTaskMsThisFrame += ms;
+        if (ms > mainTaskTopMs) { mainTaskTopMs = ms; mainTaskTop = code; }
+    }
+    private static double mainTaskMsThisFrame, mainTaskTopMs;
+    private static string mainTaskTop;
+
+    /// <summary>Smoothed milliseconds per frame the main-thread task drain took.</summary>
+    public static double AvgMainTaskMs { get; private set; }
+
+    /// <summary>Main-thread entity loading (the budgeted half) inside this frame.</summary>
+    public static void AddEntityLoadMs(double ms) => entityLoadMsThisFrame += ms;
+    private static double entityLoadMsThisFrame;
 
     public static void AddStageTicks(int stage, long ticks)
     {
@@ -363,6 +473,7 @@ public static class FrameStats
             AvgCullMs = Blend(AvgCullMs, cullMs, first);
             AvgUploadMs = Blend(AvgUploadMs, uploadMsThisFrame, first);
             AvgSwapMs = Blend(AvgSwapMs, swapTicks * TicksToMs, first);
+            AvgMainTaskMs = Blend(AvgMainTaskMs, mainTaskMsThisFrame, first);
             LastSwapMs = swapTicks * TicksToMs;
             LastShadowMs = StageTickSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone,
                                         EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone);
@@ -371,6 +482,16 @@ public static class FrameStats
                 StageMs[i] = Blend(StageMs[i], stageTicks[i] * TicksToMs, first);
 
             for (var i = 0; i < Counters.Count; i++) Counters[i].Advance(first, Alpha);
+
+            // a collection boundary crossed inside this frame: read what it promoted
+            if (gen0 >= 0 && prevGen0 >= 0 && (gen0 != prevGen0 || gen1 != prevGen1)) NoteEphemeralGc();
+
+            if (sampleSeenAt == 0 || (now - sampleSeenAt) * TicksToMs >= SampleIntervalSeconds * 1000.0)
+            {
+                sampleSeenAt = now;
+                SampleGc();
+                PeriodicSample?.Invoke();
+            }
 
             // Rolling peaks, so a single hitch does not stick to the display forever. The
             // breakdown snapshot must happen here, while this frame's buckets are still
@@ -437,7 +558,9 @@ public static class FrameStats
                 HitchLog.OnFrame(frameMs, AvgFrameMs, gcPauseMs, hitchBuckets, gcTag,
                                  cullMs, uploadMsThisFrame, cullWaitTicks * TicksToMs,
                                  hudMsThisFrame, entityTessMsThisFrame,
-                                 cullRebuildTicks * TicksToMs, cullRebuilds);
+                                 cullRebuildTicks * TicksToMs, cullRebuilds,
+                                 mainTaskMsThisFrame, mainTaskTop, mainTaskTopMs,
+                                 entityLoadMsThisFrame, poolAllocMsThisFrame, poolAllocsThisFrame);
 
                 // The finished frame's totals for anyone steering off them (the upload
                 // budget's frame-pressure input). Same warmup gate as the hitch log: the
@@ -459,8 +582,14 @@ public static class FrameStats
         gameTickTicks = 0;
         swapTicks = 0;
         uploadMsThisFrame = 0;
+        poolAllocMsThisFrame = 0;
+        poolAllocsThisFrame = 0;
         hudMsThisFrame = 0;
         entityTessMsThisFrame = 0;
+        mainTaskMsThisFrame = 0;
+        mainTaskTopMs = 0;
+        mainTaskTop = null;
+        entityLoadMsThisFrame = 0;
         Array.Clear(stageTicks, 0, StageCount);
         prevFrameTs = now;
         prevGcPauseMs = gcPauseTotalMs;
@@ -512,16 +641,28 @@ public static class FrameStats
 
     public static void Reset()
     {
+        StatPoolAllocs = 0;
+        StatPoolAllocMs = 0;
+        MaxPoolAllocMs = 0;
         HasData = false;
         TotalFrames = 0;
         prevFrameTs = 0;
+        sampleSeenAt = 0;
+        promotedBytesAccum = 0;
+        gcSeenAccum = 0;
         prevGcPauseMs = 0;
         prevGen0 = prevGen1 = prevGen2 = -1;
         cullTicks = cullWaitTicks = cullRebuildTicks = gameTickTicks = swapTicks = 0;
         cullRebuilds = 0;
         uploadMsThisFrame = 0;
+        poolAllocMsThisFrame = 0;
+        poolAllocsThisFrame = 0;
         hudMsThisFrame = 0;
         entityTessMsThisFrame = 0;
+        mainTaskMsThisFrame = mainTaskTopMs = 0;
+        mainTaskTop = null;
+        entityLoadMsThisFrame = 0;
+        AvgMainTaskMs = 0;
         peakFrames = 0;
         frameMsPeak = cullMsPeak = uploadMsPeak = 0;
         Array.Clear(stageTicks, 0, StageCount);

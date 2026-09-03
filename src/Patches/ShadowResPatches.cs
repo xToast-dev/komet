@@ -36,12 +36,32 @@ namespace Komet.Patches;
 /// 8192 -> 537 MB of video memory. Two steps is the default since 1.42.0, because the symmetric
 /// box's cost was finally measured rather than estimated: 1,48-1,59x wider per axis at a normal
 /// sun elevation, which one step (1,17x) did not cover and two (1,33x) very nearly do.
+///
+/// The steps apply only when the slider sits at its ceiling (quality 4). That is the case the
+/// patch exists for - the menu cannot go higher. Below it the player CAN go higher and chose
+/// not to, and that choice usually has a reason: a tester on an Intel HD 620 ran at a lower
+/// quality and still got a 5120 px map forced on top (and, with shadows off entirely, a
+/// pointless rebuild of every framebuffer at world join). Fill rate on an integrated GPU is the
+/// one resource this patch spends, so it now spends it only where the player has already
+/// spent everything the menu offers.
 /// </summary>
 public static class ShadowResPatches
 {
     /// <summary>Quality steps added on top of the setting, for the framebuffer size only.
     /// Each step is 1024 texels per axis. 0 = exactly vanilla.</summary>
     public static int ExtraSteps;
+
+    /// <summary>The engine's step count at the graphics menu's ceiling: quality 4 gives
+    /// Math.Max(4, 4 + 2) = 6, i.e. 6144 px. Below this the slider can still be raised.</summary>
+    internal const int SliderCeilingSteps = 6;
+
+    /// <summary>The rule: engine steps in, steps to allocate out. Pure, for the harness.</summary>
+    internal static int StepsFor(int engineSteps, int extraSteps)
+        => engineSteps >= SliderCeilingSteps ? engineSteps + extraSteps : engineSteps;
+
+    /// <summary>Whether the extra steps have any effect at this quality setting.</summary>
+    public static bool AppliesAt(int shadowMapQuality)
+        => Math.Max(4, shadowMapQuality + 2) >= SliderCeilingSteps;
 
     /// <summary>Edge length the shadow maps ended up with, 0 until the patched setup has run.</summary>
     public static int ShadowMapSize { get; private set; }
@@ -101,7 +121,7 @@ public static class ShadowResPatches
     /// <summary>Called with the engine's quality steps, returns the steps to allocate for.</summary>
     public static int AddSteps(int steps)
     {
-        var result = steps + ExtraSteps;
+        var result = StepsFor(steps, ExtraSteps);
         ShadowMapSize = result * 1024;
         return result;
     }
@@ -123,9 +143,35 @@ public static class ShadowResPatches
     /// Returns true when done (success or permanent failure), false to be called again.
     /// </summary>
     public static bool TryForceRebuild(ClientPlatformWindows platform, Action<string> log)
+        => TryForceRebuild(platform, log, out _);
+
+    /// <summary>
+    /// Same, and names what blocked a retry - a session that ended with "window never
+    /// ready" and no reason is exactly the report this could not answer.
+    /// </summary>
+    public static bool TryForceRebuild(ClientPlatformWindows platform, Action<string> log, out string blockedBy)
     {
+        blockedBy = null;
         if (ExtraSteps == 0 || ShadowMapSize > 0) return true;   // nothing to do / already real
-        if (ShaderRegistry.SupressShaderAndBufferReloads) return false; // engine busy - retry
+
+        // Below the slider's ceiling the transpiler would allocate the vanilla size anyway,
+        // so a forced rebuild - which recreates EVERY framebuffer, not just the shadow maps -
+        // would be a world-join hitch for nothing. Should the player raise the slider later,
+        // the engine's own rebuild runs the transpiler and the rule applies then.
+        var quality = ClientSettings.ShadowMapQuality;
+        if (!AppliesAt(quality))
+        {
+            log?.Invoke(quality == 0
+                ? "shadows are off - the extra shadow map step waits until they are on and at quality 4"
+                : $"shadow quality {quality} is below the menu's ceiling (4), where the extra step applies - "
+                  + $"raise the slider instead; the map stays at {Math.Max(4, quality + 2) * 1024}px");
+            return true;
+        }
+        if (ShaderRegistry.SupressShaderAndBufferReloads)
+        {
+            blockedBy = "engine suppresses buffer reloads";
+            return false; // engine busy - retry
+        }
 
         // Never rebuild into a window that cannot host framebuffers. This shipped a crash
         // (31.08.2026, Windows tester): alt-tab out of fullscreen minimises the window,
@@ -135,10 +181,19 @@ public static class ShadowResPatches
         // engine itself never rebuilds while minimised (Window_Resize checks the state);
         // this forced rebuild has to hold itself to the same rule.
         NativeWindow win = platform.window;
-        if (win == null) return false;
+        if (win == null)
+        {
+            blockedBy = "no window yet";
+            return false;
+        }
         if (!CanHostFramebuffers(win.WindowState == WindowState.Minimized,
                 win.ClientSize.X, win.ClientSize.Y, ClientSettings.SSAA))
+        {
+            blockedBy = win.WindowState == WindowState.Minimized
+                ? "window minimised"
+                : $"window {win.ClientSize.X}x{win.ClientSize.Y} at SSAA {ClientSettings.SSAA:0.##} cannot host framebuffers";
             return false; // alt-tabbed / degenerate window - retry when it is visible again
+        }
 
         try
         {
@@ -155,6 +210,7 @@ public static class ShadowResPatches
             log?.Invoke($"shadow map framebuffers rebuilt at {ShadowMapSize}px (vanilla setup ran before the mod loaded)");
             return true;
         }
+        blockedBy = "rebuild ran but the shadow size expression was never reached";
         return false; // suppressed after all, or setup took another path - retry
     }
 

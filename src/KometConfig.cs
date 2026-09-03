@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "6";
+    public const string Current = "11";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -53,7 +53,9 @@ public class KometConfig
     /// The count is derived from physical cores rather than hardware threads because the sweep
     /// is a memory-bound linear scan, where an SMT sibling adds queueing and not throughput -
     /// and because eleven cull threads on a six core part left nothing for the render thread,
-    /// the tesselator, or the collector.
+    /// the tesselator, or the collector. Physical cores are read from the OS (sysfs, Win32,
+    /// sysctl - the report's "kerne:" line names the source); the old "above four hardware
+    /// threads assume SMT" guess took a 2c/4t laptop for four cores.
     /// </summary>
     public int CullingThreads { get; set; }
 
@@ -122,9 +124,10 @@ public class KometConfig
     public bool FastOcclusionCulling { get; set; } = true;
 
     /// <summary>
-    /// Helper threads for the occlusion walk. 0 = auto: physical cores minus two, capped at 8.
-    /// Its own dedicated set, separate from the cull threads, so a walk in flight can never
-    /// hold up a render stage queued behind it.
+    /// Helper threads for the occlusion walk. 0 = auto: physical cores minus two, capped at 8 -
+    /// which is zero helpers on a dual core, where the walk then runs inline on its own thread
+    /// instead of adding a third busy thread to two cores. Its own dedicated set, separate from
+    /// the cull threads, so a walk in flight can never hold up a render stage queued behind it.
     /// </summary>
     public int OcclusionCullingThreads { get; set; }
 
@@ -355,6 +358,12 @@ public class KometConfig
     /// Cost per step, two cascades at 4 bytes per depth texel: 288 MB at 6144, 411 MB at 7168,
     /// 537 MB at 8192. The pass draws the same geometry either way - resolution costs fill
     /// rate and memory, not triangles. 0 = vanilla size.
+    ///
+    /// Applies only while the shadow slider sits at its ceiling (quality 4) - the case the
+    /// patch exists for, because the menu cannot go higher. At a lower setting the player can
+    /// still raise the slider and has chosen not to; the map then stays at the vanilla size for
+    /// that setting, and the world-join framebuffer rebuild is skipped as well. Raise the
+    /// slider to 4 mid-session and the engine's own rebuild applies the extra steps.
     /// </summary>
     public int ShadowMapExtraQuality { get; set; } = 1;
 
@@ -632,6 +641,12 @@ public class KometConfig
     /// the generation latency instead of flooding. Default 6 since 1.30.0 - more of the
     /// machine's cores doing useful work while exploring. Lower this if the inflow brake
     /// (AdaptiveChunkInflow) is disabled, because then nothing paces delivery.
+    ///
+    /// This is an upper bound: the value applied is capped at the machine's hardware threads
+    /// minus two, so the render thread and the client's tesselation thread always keep one
+    /// each. A 12-thread desktop gets all 6; a 4-thread laptop gets 2, where the old code put
+    /// five extra generator threads next to render, tesselation and the cull helpers and every
+    /// GC pause waited for all of them. The log names the cap when it bites.
     /// </summary>
     public int ServerWorldgenThreads { get; set; } = 6;
 
@@ -648,6 +663,52 @@ public class KometConfig
     /// value - which is the default here, because delivery has not been the bottleneck.
     /// </summary>
     public int ServerChunksColumnsPerTick { get; set; }
+
+    /// <summary>
+    /// Server-side entity sync tuning (applies wherever the server half of this mod runs -
+    /// the integrated singleplayer server, or a dedicated server with komet installed):
+    /// position packets for tracked entities go out at 30 Hz only within 40 blocks (15 Hz
+    /// to 80, 10 Hz beyond - the client interpolates between snapshots anyway, teleports are
+    /// never thinned); an entity already tracked by a client stays tracked until it is 15 %
+    /// beyond the range, so nothing flaps spawn/despawn at the boundary; and when the
+    /// per-client tracking cap bites, the nearest entities are admitted first. Every packet
+    /// the integrated server does not build is garbage the client frame does not collect.
+    /// '.komet toggle entsync' flips it live (singleplayer).
+    /// </summary>
+    public bool ServerEntitySyncTuning { get; set; } = true;
+
+    /// <summary>
+    /// Server-side: drop attribute sync paths whose serialised bytes equal what was last sent
+    /// for that entity, and do not build a partial-update packet that ends up empty. Server
+    /// code marks a path dirty on every Set whether or not the value changed. The cache is
+    /// invalidated whenever a full entity packet goes out, so a newly tracking client always
+    /// receives the current tree. Client-side attribute listeners fire only for changed
+    /// values - the engine's convention for event-like attributes is a counter for exactly
+    /// that reason. '.komet toggle attrskip' flips it live (singleplayer).
+    /// </summary>
+    public bool ServerAttributeNoOpSkip { get; set; } = true;
+
+    /// <summary>
+    /// Allocation attribution for the client's own worker threads (tesselation, network,
+    /// relight, compress, chunk visibility, culling, block ticks, particles - one bracket
+    /// around each thread's tick) and for every TyronThreadPool task by its caller name. Pure
+    /// measurement: the report's alloc-quellen line then names what used to be "rest" (79 of
+    /// 216 MB/s in the 03.09. report, with 384 of 402 hitches on a GC pause), and the
+    /// gc-details line says how much of the allocation the collector had to keep.
+    /// '.komet toggle clientalloc' flips it live.
+    /// </summary>
+    public bool ClientAllocAttribution { get; set; } = true;
+
+    /// <summary>
+    /// Allocation sampling for EVERY thread in the process, by thread name and by object type,
+    /// from the runtime's own GCAllocationTick events (one per ~100 KB allocated) - no patch on
+    /// anything. Names what no bracket reaches: the runtime's pool, other mods' workers, this
+    /// mod's culling threads (the 03.09. report still had "rest 46 MB/s" after every engine
+    /// thread was bracketed). Report line "alloc-stichprobe". About two thousand events a
+    /// second at 200 MB/s, each a dictionary lookup on the runtime's dispatch thread.
+    /// '.komet toggle allocsample' flips it live.
+    /// </summary>
+    public bool AllocSampling { get; set; } = true;
 
     /// <summary>
     /// Milliseconds to collect edge-only re-tesselation marks before issuing one per chunk.
@@ -714,6 +775,104 @@ public class KometConfig
     /// starves. The player's own renderer is structurally unaffected. 0 = vanilla.
     /// </summary>
     public double EntityTesselationBudgetMs { get; set; } = 2.0;
+
+    /// <summary>
+    /// Main-thread milliseconds per frame for FINISHING entity loads - Initialize (behaviours,
+    /// animator), chunk registration, renderer creation - nearest entity first. Entities reach
+    /// the client one packet per entity as the server starts tracking them (200 ms batches,
+    /// hundreds at a world join), and each packet used to do all of that at once inside the
+    /// main-thread task drain: a "draussen" burst with an allocation spike behind it. Now the
+    /// cheap half (create + deserialise, which yields the position) runs on arrival and the
+    /// rest is held in distance bins and finished at the frame boundary under this budget,
+    /// at least two per frame (liveness). Any other packet naming a held entity finishes it
+    /// on the spot, so nothing observable changes except WHEN a distant entity appears in a
+    /// burst. Hitch lines carry "entload X". 0 = vanilla. '.komet toggle entload' flips it
+    /// live (off flushes everything held).
+    /// </summary>
+    public double EntityLoadBudgetMs { get; set; } = 1.5;
+
+    /// <summary>
+    /// Time every main-thread task (ClientMain.ExecuteMainThreadTasks: every non-chunk server
+    /// packet runs there - entity loads, block updates, attribute syncs) so a "draussen"
+    /// hitch names its heaviest task code ("tasks 9,1 (readpacket33 8,2)") and the report
+    /// lists the codes by cost. Two Stopwatch reads per task; the drain itself is a 1:1
+    /// transcription. '.komet toggle mtt' hands the drain back to vanilla.
+    /// </summary>
+    public bool AttributeMainThreadTasks { get; set; } = true;
+
+    /// <summary>
+    /// Wrap the client's game tick listeners (a few dozen system and mod listeners; never
+    /// the thousands of block entity ticks) in timing delegates, so a "tick" hitch names its
+    /// listener and the report ranks them. Stands down automatically while the engine's own
+    /// tick profiler (extendedDebugInfo) is on. '.komet toggle tickprofiler'.
+    /// </summary>
+    public bool ProfileTickListeners { get; set; } = true;
+
+    /// <summary>
+    /// Main-thread milliseconds per 20 ms tick the minimap may spend uploading freshly
+    /// generated map pieces; the per-tick piece cap adapts around it (halves when a tick
+    /// overran, doubles up to vanilla's 200 when it had room). The tick profiler's first field
+    /// report named this the dominant hitch bucket of a join flood: WorldMapManager.OnClientTick
+    /// at 2,5-8,5 ms, from hundreds of texture uploads and framebuffer draws per tick while
+    /// chunks stream in. Pieces are never dropped, only spread over the following ticks; an
+    /// opened world map on an idle frame still fills at vanilla speed. 0 = vanilla.
+    /// '.komet toggle minimap' flips it live.
+    /// </summary>
+    public double MinimapPieceBudgetMs { get; set; } = 1.0;
+
+    /// <summary>
+    /// Compose minimap pieces into their 96x96 component texture with a direct sub-image
+    /// upload instead of vanilla's per-piece framebuffer draw (FBO created and destroyed per
+    /// component per tick, staging texture with mipmaps, shader switch, quad draw). The
+    /// second 02.09. report showed the piece cap pinned at 8 and still 1,14 ms per tick -
+    /// 0,14 ms per 4 KB image. Pixels land on the same rows and columns (the texture2texture
+    /// shader does not flip). '.komet toggle minimapdirect' flips it live.
+    /// </summary>
+    public bool MinimapDirectUpload { get; set; } = true;
+
+    /// <summary>
+    /// Main-thread milliseconds per frame the task drain (ClientMain.ExecuteMainThreadTasks:
+    /// every server packet that is not chunk data, plus chunk installs) may run before the
+    /// remainder goes back to the front of the queue with vanilla's own requeue - order is
+    /// kept, nothing is dropped. The 02.09. report had "draussen 17,7 | tasks 16,9 (loadchunk
+    /// 16,8)": a whole batch of chunk installs in one frame. At least 8 tasks always run, the
+    /// budget stretches with the backlog and is ignored above 4096 waiting tasks. Needs
+    /// AttributeMainThreadTasks (the transcribed drain). 0 = vanilla (drain everything).
+    /// '.komet toggle taskbudget' flips it live.
+    /// </summary>
+    public double MainThreadTaskBudgetMs { get; set; } = 3.0;
+
+    /// <summary>
+    /// Measure the integrated server's allocation per thread and per suspect (worldgen,
+    /// chunk packets, entity simulation, physics, database loads) so the report's
+    /// alloc-quellen line names what used to be "rest" - in the 02.09. join floods 193 of
+    /// 279 MB/s, behind 35 gen0 collections per second and 52 of 54 hitches. Measurement
+    /// only; singleplayer only (a remote server is not this process).
+    /// </summary>
+    public bool ServerAllocAttribution { get; set; } = true;
+
+    /// <summary>
+    /// Transcribe SystemRenderEntities.OnBeforeRender with clocks around its two halves
+    /// (EntityRenderer.BeforeRender for visible entities, AnimManager.OnClientFrame for all)
+    /// and keep the frame's most expensive entity, so a "before 19 ms | renderer Before-ree"
+    /// hitch names animation or tesselation and the entity. Also the carrier of the
+    /// animation LOD below. Off = vanilla's loop, untouched.
+    /// </summary>
+    public bool AttributeEntityBeforeStage { get; set; } = true;
+
+    /// <summary>
+    /// Animate entities that are only shadow-rendered (outside the view frustum, inside the
+    /// shadow frustum - most loaded entities at 255 blocks of shadow range) every third frame
+    /// and rendered entities beyond EntityAnimationFarBlocks every second frame, each time
+    /// with the skipped frames' dt folded in: animation time runs exactly as before, sampled
+    /// less often. Own player, near entities and dead ones are always at full rate. Needs
+    /// AttributeEntityBeforeStage. '.komet toggle animlod' flips it live.
+    /// </summary>
+    public bool EntityAnimationLod { get; set; } = true;
+
+    /// <summary>Horizontal distance in blocks beyond which a rendered entity animates
+    /// every second frame (at 86 fps: 43 Hz, on a creature a few pixels tall).</summary>
+    public double EntityAnimationFarBlocks { get; set; } = 48;
 
     /// <summary>
     /// Replace the engine MeshDataRecycler's storage with a size-class pool behind the same

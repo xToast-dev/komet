@@ -6,7 +6,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>Komet</AssemblyName>
     <RootNamespace>Komet</RootNamespace>
-    <Version>1.2.0-pre1</Version>
+    <Version>1.2.0-pre.2</Version>
     <!-- Build stamp: the minute this DLL was compiled, carried in the InformationalVersion and
          shown next to the version in HUD, report and chat line (see shared/KometVersion.cs).
          Computed here rather than kept in a file, so it can never disagree with the binary. -->

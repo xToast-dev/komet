@@ -56,6 +56,18 @@ public static class HitchLog
     /// at detection time, before the profiler folds and clears its per-frame ticks.</summary>
     public static Func<(string name, double ms)?> TopRendererProvider;
 
+    /// <summary>The frame's most expensive game tick listener, from the tick profiler -
+    /// same contract as <see cref="TopRendererProvider"/>: raw per-frame ticks, queried at
+    /// detection time before the profiler folds them. Null when nothing is wrapped.</summary>
+    public static Func<(string name, double ms)?> TopTickListenerProvider;
+
+    /// <summary>
+    /// The entity Before stage split of the frame just ended (vor-render ms, animation ms,
+    /// entities animated, the most expensive single entity and its ms), when the optimising
+    /// mod measures it. Read at hitch detection, like the tick listener.
+    /// </summary>
+    public static Func<(double beforeMs, double animMs, int animated, string topName, double topMs)?> EntityFrameProvider;
+
     public struct Entry
     {
         public double AtSeconds;
@@ -105,6 +117,45 @@ public static class HitchLog
         /// </summary>
         public double SweepRebuildMs;
         public int SweepRebuilds;
+
+        /// <summary>
+        /// Main-thread task drain inside this frame (ClientMain.ExecuteMainThreadTasks - every
+        /// server packet that is not chunk data runs there: entity loads, block updates,
+        /// attribute syncs), and the single most expensive task code of the frame. This is
+        /// the "draussen" bucket's biggest unnamed tenant: it runs after the render stages
+        /// and before the next frame boundary, so until now a task burst read as driver
+        /// back-pressure. Only the optimising mod fills these; the baseline books 0.
+        /// </summary>
+        public double MainTaskMs;
+        public string MainTaskTop;
+        public double MainTaskTopMs;
+
+        /// <summary>Mesh pools created inside this frame's upload drain, and their share of it.</summary>
+        public double PoolAllocMs;
+        public int PoolAllocs;
+
+        /// <summary>Dialogs open during an Ortho-dominated frame: the GUI's cost has a name.</summary>
+        public string Dialogs;
+
+        /// <summary>The frame's most expensive game tick listener (name and ms), when the
+        /// tick profiler measured it. A tick hitch then names its listener instead of
+        /// leaving "tick 12,7" as a bucket with a hundred possible owners.</summary>
+        public string TickTop;
+        public double TickTopMs;
+
+        /// <summary>Main-thread entity loading inside this frame (the budgeted second half:
+        /// Initialize, chunk registration, renderer creation). Booked separately from
+        /// MainTaskMs because the budget moves it OUT of the task drain and into the frame
+        /// boundary - a before-hitch has to be able to say it was this.</summary>
+        public double EntityLoadMs;
+
+        /// <summary>The entity Before stage's two halves (EntityRenderer.BeforeRender for
+        /// the visible ones, AnimManager.OnClientFrame for all) plus the frame's most
+        /// expensive single entity - so a "before 19 ms | renderer Before-ree" hitch can say
+        /// whether it was animation, and of what.</summary>
+        public double EntityBeforeMs, EntityAnimMs, EntityTopMs;
+        public int EntityAnimated;
+        public string EntityTopName;
     }
 
     private const int Capacity = 48;
@@ -122,6 +173,12 @@ public static class HitchLog
     public static int CountStill { get; private set; }
     public static int CountGcPause { get; private set; }
     public static int CountGen2 { get; private set; }
+    /// <summary>Frames over the threshold that were dropped because the game was paused at
+    /// one of the frame's two boundaries. A tester's log carried a 5,6 s "draussen" hitch
+    /// that was the pause menu standing open - which reads exactly like a stall and is not
+    /// one. Counted so the report can say the log is complete.</summary>
+    public static int CountPaused { get; private set; }
+    private static bool prevPaused;
     private static readonly int[] dominantCounts = new int[BucketCount];
 
     private static readonly Stopwatch uptime = Stopwatch.StartNew();
@@ -150,7 +207,9 @@ public static class HitchLog
     public static void OnFrame(double frameMs, double avgFrameMs, double gcPauseMs, double[] buckets,
                                string gcTag = null, double sweepMs = 0, double uploadMs = 0,
                                double sweepWaitMs = 0, double hudMs = 0, double entityTessMs = 0,
-                               double sweepRebuildMs = 0, int sweepRebuilds = 0)
+                               double sweepRebuildMs = 0, int sweepRebuilds = 0,
+                               double mainTaskMs = 0, string mainTaskTop = null, double mainTaskTopMs = 0,
+                               double entityLoadMs = 0, double poolAllocMs = 0, int poolAllocs = 0)
     {
         // a pending hitch whose camera sample never came (main menu, no wiring) is booked
         // without one rather than lost
@@ -182,6 +241,12 @@ public static class HitchLog
             SweepRebuilds = sweepRebuilds,
             HudMs = hudMs,
             EntityTessMs = entityTessMs,
+            MainTaskMs = mainTaskMs,
+            MainTaskTop = mainTaskTop,
+            MainTaskTopMs = mainTaskTopMs,
+            EntityLoadMs = entityLoadMs,
+            PoolAllocMs = poolAllocMs,
+            PoolAllocs = poolAllocs,
         };
         // The 0.5 ms floor matters since the Before stage is attributed on every frame: on
         // an unsampled frame the "top renderer" is merely the top BEFORE renderer, and a
@@ -193,7 +258,60 @@ public static class HitchLog
             pending.TopRenderer = top.Value.name;
             pending.TopRendererMs = top.Value.ms;
         }
+        // Same floor for the tick listener: a 30 ms opaque hitch must not get a 0,1 ms
+        // listener stamped on as if it explained anything.
+        var tickTop = TopTickListenerProvider?.Invoke();
+        if (tickTop.HasValue && tickTop.Value.ms >= 0.5)
+        {
+            pending.TickTop = tickTop.Value.name;
+            pending.TickTopMs = tickTop.Value.ms;
+        }
+        var ent = EntityFrameProvider?.Invoke();
+        if (ent.HasValue)
+        {
+            pending.EntityBeforeMs = ent.Value.beforeMs;
+            pending.EntityAnimMs = ent.Value.animMs;
+            pending.EntityAnimated = ent.Value.animated;
+            pending.EntityTopName = ent.Value.topName;
+            pending.EntityTopMs = ent.Value.topMs;
+        }
         hasPending = true;
+    }
+
+    /// <summary>
+    /// The pause state at this frame boundary, sampled BEFORE the camera. A pending hitch whose
+    /// frame started or ended paused is dropped: the singleplayer pause menu stops the game
+    /// clock and the frame that spans it (or the one that leaves it) is menu time, not a
+    /// stutter. The previous boundary counts too, because the frame that closes the menu
+    /// begins paused and ends running.
+    /// </summary>
+    /// <summary>
+    /// True while a pending hitch spent a quarter or more of its frame in the Ortho stage -
+    /// the GUI - so the caller knows whether naming the open dialogs is worth a string.
+    /// </summary>
+    public static bool PendingWantsDialogs
+        => hasPending && pending.Buckets[Ortho] >= pending.FrameMs * 0.25;
+
+    /// <summary>
+    /// Names the open dialogs on a pending Ortho hitch. The 03.09. log had a 2,7 s frame with
+    /// "ortho 2645" and an 880 ms gen1 pause, standing still, nothing in the log beside it -
+    /// a first-opened world map or handbook, presumably, but the line could not say which.
+    /// Called before the camera sample commits the hitch.
+    /// </summary>
+    public static void NoteDialogs(string names)
+    {
+        if (!hasPending || string.IsNullOrEmpty(names)) return;
+        if (pending.Buckets[Ortho] >= pending.FrameMs * 0.25) pending.Dialogs = names;
+    }
+
+    public static void NotePaused(bool paused)
+    {
+        if (hasPending && (paused || prevPaused))
+        {
+            hasPending = false;
+            CountPaused++;
+        }
+        prevPaused = paused;
     }
 
     /// <summary>
@@ -314,7 +432,8 @@ public static class HitchLog
         }
         // Only when they explain a meaningful share - a 20 ms hitch with 0,1 ms of sweep says
         // "not the sweep" loudly enough by not appearing.
-        if (e.SweepMs >= 1.0 || e.UploadMs >= 1.0 || e.HudMs >= 1.0 || e.EntityTessMs >= 1.0)
+        if (e.SweepMs >= 1.0 || e.UploadMs >= 1.0 || e.HudMs >= 1.0 || e.EntityTessMs >= 1.0
+            || e.MainTaskMs >= 1.0 || e.EntityLoadMs >= 1.0)
         {
             sb.AppendFormat(ci, " | davon sweep {0:F1}", e.SweepMs);
             // The wait is a share OF THE SWEEP, so it prints inside the sweep figure. It used
@@ -328,10 +447,37 @@ public static class HitchLog
             if (e.SweepRebuildMs >= 1.0 && e.SweepRebuildMs >= e.SweepMs * 0.25)
                 sb.AppendFormat(ci, " (davon {0:F1} rebuild, {1} pools)", e.SweepRebuildMs, e.SweepRebuilds);
             sb.AppendFormat(ci, ", upload {0:F1}", e.UploadMs);
+            // A new GL pool inside the drain is the one upload cost a vertex budget cannot
+            // bound; named when it is a real share of the upload, like the sweep's wait.
+            if (e.PoolAllocs > 0 && e.PoolAllocMs >= 1.0 && e.PoolAllocMs >= e.UploadMs * 0.25)
+                sb.AppendFormat(ci, " (davon {0} neue pools {1:F1})", e.PoolAllocs, e.PoolAllocMs);
             if (e.EntityTessMs >= 1.0)
                 sb.AppendFormat(ci, ", enttess {0:F1}", e.EntityTessMs);
             if (e.HudMs >= 1.0)
                 sb.AppendFormat(ci, ", hud {0:F1}", e.HudMs);
+            if (e.EntityLoadMs >= 1.0)
+                sb.AppendFormat(ci, ", entload {0:F1}", e.EntityLoadMs);
+            // The task drain names its heaviest task code the way the sweep names its
+            // wait: only when that one task is a real share of the drain.
+            if (e.MainTaskMs >= 1.0)
+            {
+                sb.AppendFormat(ci, ", tasks {0:F1}", e.MainTaskMs);
+                if (e.MainTaskTop != null && e.MainTaskTopMs >= 1.0 && e.MainTaskTopMs >= e.MainTaskMs * 0.25)
+                    sb.AppendFormat(ci, " ({0} {1:F1})", e.MainTaskTop, e.MainTaskTopMs);
+            }
+        }
+        if (e.TickTop != null && e.TickTopMs >= 1.0)
+            sb.AppendFormat(ci, " | tick-listener {0} {1:F1} ms", e.TickTop, e.TickTopMs);
+        if (e.Dialogs != null)
+            sb.Append(" | dialoge ").Append(e.Dialogs);
+        // The entity split only when it explains something; the top entity only when it is
+        // a real share of that - same rules as the sweep's wait and the drain's top task.
+        if (e.EntityBeforeMs + e.EntityAnimMs >= 1.0)
+        {
+            sb.AppendFormat(ci, " | entities vor-render {0:F1} ms, anim {1:F1} ms/{2}",
+                e.EntityBeforeMs, e.EntityAnimMs, e.EntityAnimated);
+            if (e.EntityTopName != null && e.EntityTopMs >= 1.0 && e.EntityTopMs >= (e.EntityBeforeMs + e.EntityAnimMs) * 0.25)
+                sb.AppendFormat(ci, " (top {0} {1:F1})", e.EntityTopName, e.EntityTopMs);
         }
         if (!double.IsNaN(e.TurnDegPerSec))
             sb.AppendFormat(ci, " | {0:F0} grad/s, {1:F1} m/s", e.TurnDegPerSec, e.MoveBlocksPerSec);
@@ -372,10 +518,11 @@ public static class HitchLog
     public static string SummaryLine()
     {
         var ci = CultureInfo.CurrentCulture;
+        var paused = CountPaused > 0 ? string.Format(ci, " | {0} im pausenmenue verworfen", CountPaused) : "";
         if (TotalHitches == 0)
-            return string.Format(ci, "keine (schwelle mind. {0:F0} ms und {1:F1}x avg)", MinMs, Factor);
-        return string.Format(ci, "{0} ({1:F1}/min): {2} beim drehen, {3} in bewegung, {4} im stand, {5} mit gc-pause ({6} gen2)",
-            TotalHitches, PerMinute, CountTurning, CountMoving, CountStill, CountGcPause, CountGen2);
+            return string.Format(ci, "keine (schwelle mind. {0:F0} ms und {1:F1}x avg){2}", MinMs, Factor, paused);
+        return string.Format(ci, "{0} ({1:F1}/min): {2} beim drehen, {3} in bewegung, {4} im stand, {5} mit gc-pause ({6} gen2){7}",
+            TotalHitches, PerMinute, CountTurning, CountMoving, CountStill, CountGcPause, CountGen2, paused);
     }
 
     /// <summary>The .komet hitch report: aggregates first, then the most recent entries.</summary>
@@ -394,6 +541,8 @@ public static class HitchLog
 
         sb.AppendFormat(ci, "kamera: {0} beim drehen (ab {1:F0} grad/s), {2} in bewegung, {3} im stand | {4} mit gc-pause, davon {5} gen2\n",
             CountTurning, TurnThresholdDegPerSec, CountMoving, CountStill, CountGcPause, CountGen2);
+        if (CountPaused > 0)
+            sb.AppendFormat(ci, "pausenmenue: {0} lange frames verworfen (spiel stand, kein ruckler)\n", CountPaused);
 
         // ordered by count, descending - small fixed array, done the plain way
         sb.Append("dominanter bucket: ");
@@ -479,7 +628,8 @@ public static class HitchLog
     {
         ringCount = ringNext = 0;
         hasPending = false;
-        TotalHitches = CountTurning = CountMoving = CountStill = CountGcPause = CountGen2 = 0;
+        TotalHitches = CountTurning = CountMoving = CountStill = CountGcPause = CountGen2 = CountPaused = 0;
+        prevPaused = false;
         Array.Clear(dominantCounts, 0, BucketCount);
         observingSince = 0;
         WorstEphemeralPauseMs = 0;

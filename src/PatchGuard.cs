@@ -1,0 +1,463 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
+using HarmonyLib;
+
+namespace Komet;
+
+/// <summary>
+/// Notices when somebody else is on the same methods - and when the engine underneath is not
+/// the one this mod was verified against.
+///
+/// Two ways a Komet patch can stop meaning what it means. Another Harmony mod patches the same
+/// engine method: a foreign transpiler rewrites the IL Komet's transpiler expects (and Harmony
+/// re-runs every transpiler on the method each time anyone patches it, so Komet's transpiler
+/// then executes inside the OTHER mod's patch call), or a foreign prefix that returns bool can
+/// cancel the original that Komet's prefix/postfix bracket, or a mod patches Komet's own code.
+/// And a forked client (the "Optimum" build of the 02.09. field report) does not patch at all -
+/// it ships modified assemblies, and Komet's 1:1 transcriptions (task drain, entity Before loop,
+/// minimap upload, entity sync) then silently replace whatever the fork changed in those
+/// methods, with no exception and no log line to say so.
+///
+/// The first case is answered from Harmony's own registry: every patched method in the process
+/// with its owners, kinds and priorities. The second from a fingerprint: at build time the verify
+/// harness hashes the IL of every engine method Komet patches (opcodes plus resolved operand
+/// names, so a rebuild with different metadata tokens hashes the same) into
+/// <c>EngineFingerprint.g.cs</c>; at world start the same hash is taken of the live methods.
+/// A method that differs is named, once, and stays in the report. Neither check changes
+/// behaviour - a collision is reported, never "resolved", because which side should win is
+/// not this mod's call.
+/// </summary>
+public static class PatchGuard
+{
+    public enum Severity { Info = 0, Mittel = 1, Hoch = 2 }
+
+    public sealed class Finding
+    {
+        /// <summary>Identity for "already reported": target, owner, kind and patch method.</summary>
+        public string Key;
+        public string Target;
+        public string Owner;
+        public string Kind;
+        public int Priority;
+        public bool CanSkipOriginal;
+        /// <summary>The target is a method of this mod, not of the engine.</summary>
+        public bool OnKometCode;
+        /// <summary>What Komet has on the same method ("prefix(abbrechend)+postfix", "transpiler").</summary>
+        public string Ours;
+        /// <summary>Everything Komet has on this method is a measurement bracket (shared/MeasurementPatches):
+        /// timing or allocation reads that change nothing - a foreign patch next to one is information.</summary>
+        public bool MeasurementOnly;
+        /// <summary>For prefixes: whether the foreign one runs before Komet's.</summary>
+        public bool RunsBeforeOurs;
+        public Severity Severity;
+        public string Why;
+    }
+
+    public sealed class Drift
+    {
+        public string Target;
+        public string Expected;
+        public string Actual;
+    }
+
+    /// <summary>Which Harmony ids are this mod's: the client ("komet"), the server ("komet.server"),
+    /// the harness ("komet.verify").</summary>
+    public static Func<string, bool> IsOwn = id =>
+        id != null && (id == "komet" || id.StartsWith("komet.", StringComparison.Ordinal));
+
+    /// <summary>Warning sink for new findings and for engine drift.</summary>
+    public static Action<string> Warn;
+    /// <summary>Notification sink for the all-clear lines.</summary>
+    public static Action<string> Notify;
+
+    /// <summary>Foreign patches currently present, as of the last <see cref="Scan"/>.</summary>
+    public static readonly List<Finding> Findings = new();
+    /// <summary>Engine methods whose IL differs from the verified build, as of <see cref="CheckEngine"/>.</summary>
+    public static readonly List<Drift> Drifts = new();
+    /// <summary>Assemblies whose module id differs from the verified build.</summary>
+    public static readonly List<string> ForeignAssemblies = new();
+
+    public static int Scans { get; private set; }
+    public static int MethodsChecked { get; private set; }
+    public static int MethodsUnverified { get; private set; }
+    public static string EngineSummary { get; private set; }
+    public static bool EngineChecked { get; private set; }
+
+    private static readonly HashSet<string> reported = new();
+    private static readonly Assembly ownAssembly = typeof(PatchGuard).Assembly;
+
+    private static bool HasGeneratedFingerprint()
+    {
+        return EngineFingerprint.Generated;
+    }
+
+    // ---- harmony collisions ----------------------------------------------------------
+
+    /// <summary>
+    /// Walks Harmony's registry and rebuilds <see cref="Findings"/>. Returns how many findings
+    /// are NEW since the previous scan; each of those is reported once through <see cref="Warn"/>.
+    /// A few hundred dictionary lookups - cheap enough for a slow periodic tick, because mods
+    /// patch lazily (on first use, on world join) and a one-time scan would miss them.
+    /// </summary>
+    public static int Scan()
+    {
+        var current = new List<Finding>();
+        foreach (var method in Harmony.GetAllPatchedMethods())
+        {
+            HarmonyLib.Patches info;
+            try { info = Harmony.GetPatchInfo(method); }
+            catch (Exception) { continue; }
+            if (info == null) continue;
+
+            var onOurCode = method.DeclaringType?.Assembly == ownAssembly;
+            var oursPresent = false;
+            foreach (var owner in info.Owners) if (IsOwn(owner)) { oursPresent = true; break; }
+            if (!onOurCode && !oursPresent) continue;
+
+            var ours = DescribeOurs(info, out var ourPrefixCanSkip, out var ourPrefixPriority, out var ourPrefixIndex, out var ourTranspiler, out var measurementOnly);
+            Collect(current, method, info.Transpilers, "transpiler", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+            Collect(current, method, info.Prefixes, "prefix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+            Collect(current, method, info.Postfixes, "postfix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+            Collect(current, method, info.Finalizers, "finalizer", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+        }
+
+        Findings.Clear();
+        Findings.AddRange(current);
+        Scans++;
+
+        var fresh = 0;
+        foreach (var f in current)
+        {
+            if (!reported.Add(f.Key)) continue;
+            fresh++;
+            // information goes to the notification log; a warning is for something to decide
+            if (f.Severity == Severity.Info) Notify?.Invoke(Format(f));
+            else Warn?.Invoke(Format(f));
+        }
+        return fresh;
+    }
+
+    private static string DescribeOurs(HarmonyLib.Patches info, out bool prefixCanSkip, out int prefixPriority, out int prefixIndex, out bool transpiler, out bool measurementOnly)
+    {
+        prefixCanSkip = false; transpiler = false;
+        var own = 0; var measuring = 0;
+        void Count(Patch p) { own++; if (p.PatchMethod?.DeclaringType == typeof(Komet.Measure.MeasurementPatches)) measuring++; }
+        prefixPriority = int.MinValue; prefixIndex = int.MaxValue;
+        var parts = new List<string>(3);
+        foreach (var p in info.Prefixes)
+        {
+            if (!IsOwn(p.owner)) continue;
+            Count(p);
+            var skip = p.PatchMethod?.ReturnType == typeof(bool);
+            prefixCanSkip |= skip;
+            // the prefix of ours that runs first is the one a foreign prefix is ordered against
+            if (p.priority > prefixPriority || (p.priority == prefixPriority && p.index < prefixIndex))
+            {
+                prefixPriority = p.priority;
+                prefixIndex = p.index;
+            }
+            parts.Add(skip ? "prefix(abbrechend)" : "prefix");
+        }
+        var post = false; var fin = false;
+        foreach (var p in info.Postfixes) if (IsOwn(p.owner)) { Count(p); post = true; }
+        foreach (var p in info.Transpilers) if (IsOwn(p.owner)) { Count(p); transpiler = true; }
+        foreach (var p in info.Finalizers) if (IsOwn(p.owner)) { Count(p); fin = true; }
+        if (post) parts.Add("postfix");
+        if (transpiler) parts.Add("transpiler");
+        if (fin) parts.Add("finalizer");
+        measurementOnly = own > 0 && measuring == own;
+        return parts.Count == 0 ? "-" : string.Join("+", parts);
+    }
+
+    private static void Collect(List<Finding> into, MethodBase method, IEnumerable<Patch> patches, string kind,
+                                bool onOurCode, string ours, bool ourPrefixCanSkip, bool ourTranspiler,
+                                int ourPrefixPriority, int ourPrefixIndex, bool measurementOnly = false)
+    {
+        foreach (var p in patches)
+        {
+            if (IsOwn(p.owner)) continue;
+            var canSkip = kind == "prefix" && p.PatchMethod?.ReturnType == typeof(bool);
+            var f = new Finding
+            {
+                Target = ShortName(method),
+                Owner = p.owner ?? "?",
+                Kind = canSkip ? "prefix(abbrechend)" : kind,
+                Priority = p.priority,
+                CanSkipOriginal = canSkip,
+                OnKometCode = onOurCode,
+                Ours = ours,
+                MeasurementOnly = measurementOnly,
+                RunsBeforeOurs = kind == "prefix" && ourPrefixPriority != int.MinValue
+                                 && (p.priority > ourPrefixPriority || (p.priority == ourPrefixPriority && p.index < ourPrefixIndex)),
+            };
+            f.Key = KeyOf(method) + "|" + f.Owner + "|" + kind + "|" + (p.PatchMethod != null ? KeyOf(p.PatchMethod) : "?");
+            Classify(f, ourPrefixCanSkip, ourTranspiler);
+            into.Add(f);
+        }
+    }
+
+    /// <summary>The rule: what a foreign patch of this kind does to what Komet has there.</summary>
+    internal static void Classify(Finding f, bool ourPrefixCanSkip, bool ourTranspiler)
+    {
+        if (f.OnKometCode)
+        {
+            f.Severity = Severity.Hoch;
+            f.Why = "fremder patch auf komet-code: was diese methode tut, entscheidet nicht mehr komet";
+            return;
+        }
+        switch (f.Kind)
+        {
+            case "transpiler":
+                f.Severity = ourTranspiler ? Severity.Hoch : Severity.Mittel;
+                f.Why = ourTranspiler
+                    ? "beide schreiben dieselbe IL um; harmony fuehrt komets transpiler bei jedem patch-vorgang der anderen mod erneut aus, ein formwechsel wirft dort"
+                    : "die IL unter komets prefix/postfix ist nicht mehr vanilla";
+                return;
+            case "prefix(abbrechend)":
+                if (ourPrefixCanSkip)
+                {
+                    f.Severity = Severity.Hoch;
+                    f.Why = (f.RunsBeforeOurs ? "laeuft VOR komets prefix" : "laeuft NACH komets prefix")
+                            + " - beide koennen das original abbrechen, die prioritaet entscheidet, wessen version laeuft";
+                }
+                else
+                {
+                    f.Severity = Severity.Mittel;
+                    f.Why = "kann das original ueberspringen; komets messung bucht dann einen uebersprungenen aufruf";
+                }
+                return;
+            case "prefix":
+                f.Severity = Severity.Info;
+                f.Why = f.RunsBeforeOurs ? "laeuft vor komets prefix, bricht nicht ab" : "bricht nicht ab";
+                if (f.MeasurementOnly) f.Why += MeasurementNote;
+                return;
+            default:
+                f.Severity = Severity.Info;
+                f.Why = "laeuft nach dem original, unabhaengig von komet";
+                if (f.MeasurementOnly) f.Why += MeasurementNote;
+                return;
+        }
+    }
+
+    private const string MeasurementNote = " - komet misst hier nur (zeit/allokation), nichts zu entscheiden";
+
+    internal static string Format(Finding f)
+        => string.Format(CultureInfo.InvariantCulture,
+            "patch-kollision {0}: {1} - '{2}' {3} (prio {4}) neben {5}: {6}",
+            f.Severity.ToString().ToUpperInvariant(), f.Target, f.Owner, f.Kind, f.Priority,
+            f.MeasurementOnly ? "komets messklammer (" + f.Ours + ")" : "komet " + f.Ours, f.Why);
+
+    public static int CountAt(Severity s)
+    {
+        var n = 0;
+        foreach (var f in Findings) if (f.Severity == s) n++;
+        return n;
+    }
+
+    // ---- engine fingerprint ----------------------------------------------------------
+
+    /// <summary>Stable identity of a method across assembly builds: type, name, parameter types.</summary>
+    public static string KeyOf(MethodBase m)
+    {
+        var sb = new StringBuilder(96);
+        sb.Append(m.DeclaringType?.FullName ?? "?").Append("::").Append(m.Name).Append('(');
+        var ps = m.GetParameters();
+        for (var i = 0; i < ps.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(ps[i].ParameterType.Name);
+        }
+        return sb.Append(')').ToString();
+    }
+
+    /// <summary>Type.Method for log lines - the namespace is noise there.</summary>
+    public static string ShortName(MethodBase m)
+        => (m.DeclaringType?.Name ?? "?") + "." + m.Name;
+
+    /// <summary>
+    /// FNV-1a over the instruction stream as Harmony reads it from metadata: opcode names plus
+    /// resolved operands (member names, not tokens; branch targets as offsets; literals as
+    /// text). Harmony patches at the native level and leaves the IL untouched, so this reads
+    /// the same on a patched method as on a pristine one. Null for a method without IL.
+    /// </summary>
+    public static string FingerprintOf(MethodBase m)
+    {
+        IEnumerable<KeyValuePair<System.Reflection.Emit.OpCode, object>> body;
+        try { body = PatchProcessor.ReadMethodBody(m); }
+        catch (Exception) { return null; }
+
+        const ulong prime = 1099511628211UL;
+        var h = 14695981039346656037UL;
+        void Mix(string s)
+        {
+            if (s != null) foreach (var c in s) { h ^= c; h *= prime; }
+            h ^= 0x1F; h *= prime;
+        }
+        try
+        {
+            foreach (var ins in body)
+            {
+                Mix(ins.Key.Name);
+                Mix(Describe(ins.Value));
+            }
+        }
+        catch (Exception) { return null; }
+        return h.ToString("x16", CultureInfo.InvariantCulture);
+    }
+
+    private static FieldInfo ilOffsetField;
+
+    internal static string Describe(object operand)
+    {
+        switch (operand)
+        {
+            case null: return "";
+            case MethodBase mb: return KeyOf(mb);
+            case FieldInfo fi: return (fi.DeclaringType?.FullName ?? "?") + "::" + fi.Name;
+            case Type t: return t.FullName ?? t.Name;
+            case string s: return "\"" + s + "\"";
+            case System.Reflection.Emit.Label l: return "L" + l.GetHashCode().ToString(CultureInfo.InvariantCulture);
+            case System.Reflection.Emit.LocalBuilder lb: return "V" + lb.LocalIndex + ":" + (lb.LocalType?.FullName ?? "?");
+            case LocalVariableInfo lv: return "V" + lv.LocalIndex + ":" + (lv.LocalType?.FullName ?? "?");
+            case ParameterInfo pi: return "P" + pi.Position;
+            case IFormattable f: return f.ToString(null, CultureInfo.InvariantCulture);
+            case Array arr:
+            {
+                var sb = new StringBuilder("[");
+                foreach (var e in arr) sb.Append(Describe(e)).Append(';');
+                return sb.Append(']').ToString();
+            }
+        }
+        // Harmony's ILInstruction: branch targets resolve to the target instruction, whose
+        // offset is the stable part (a re-emit with the same code has the same offsets)
+        var type = operand.GetType();
+        if (type.Name == "ILInstruction")
+        {
+            ilOffsetField ??= type.GetField("offset", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (ilOffsetField != null) return "->" + ilOffsetField.GetValue(operand);
+        }
+        return type.Name;
+    }
+
+    /// <summary>
+    /// Compares the live engine against the build the verify harness hashed: assembly module
+    /// ids first (the whole-build answer), then every method Komet has patched that the table
+    /// knows (the answer that matters for the transcriptions). Fills <see cref="Drifts"/>,
+    /// <see cref="ForeignAssemblies"/> and <see cref="EngineSummary"/>; the summary goes to
+    /// <see cref="Warn"/> when a patched method differs and to <see cref="Notify"/> otherwise.
+    /// </summary>
+    public static void CheckEngine(string liveVersionText)
+    {
+        Drifts.Clear();
+        ForeignAssemblies.Clear();
+        MethodsChecked = MethodsUnverified = 0;
+        EngineChecked = true;
+
+        if (!HasGeneratedFingerprint())
+        {
+            EngineSummary = "engine: " + liveVersionText + " - kein fingerabdruck einkompiliert (./build.sh fingerprint)";
+            Notify?.Invoke(EngineSummary);
+            return;
+        }
+
+        var loaded = new Dictionary<string, Assembly>(StringComparer.Ordinal);
+        foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = a.GetName().Name;
+            if (name != null && !loaded.ContainsKey(name)) loaded[name] = a;
+        }
+        foreach (var (name, mvid) in EngineFingerprint.Assemblies)
+        {
+            if (!loaded.TryGetValue(name, out var a)) continue; // not loaded yet (server-only dll on a pure client)
+            if (!string.Equals(a.ManifestModule.ModuleVersionId.ToString("D"), mvid, StringComparison.OrdinalIgnoreCase))
+                ForeignAssemblies.Add(name);
+        }
+
+        var expected = new Dictionary<string, string>(EngineFingerprint.Methods.Length, StringComparer.Ordinal);
+        foreach (var (key, hash) in EngineFingerprint.Methods) expected[key] = hash;
+
+        foreach (var method in Harmony.GetAllPatchedMethods())
+        {
+            if (method.DeclaringType?.Assembly == ownAssembly) continue;
+            HarmonyLib.Patches info;
+            try { info = Harmony.GetPatchInfo(method); }
+            catch (Exception) { continue; }
+            if (info == null) continue;
+            var ours = false;
+            foreach (var owner in info.Owners) if (IsOwn(owner)) { ours = true; break; }
+            if (!ours) continue;
+
+            var key = KeyOf(method);
+            if (!expected.TryGetValue(key, out var want)) { MethodsUnverified++; continue; }
+            var have = FingerprintOf(method);
+            MethodsChecked++;
+            if (have != null && have != want)
+                Drifts.Add(new Drift { Target = ShortName(method), Expected = want, Actual = have });
+        }
+
+        var sb = new StringBuilder(256);
+        sb.Append("engine: ").Append(liveVersionText);
+        if (ForeignAssemblies.Count == 0)
+            sb.Append(" - assemblies wie verifiziert (").Append(EngineFingerprint.GameVersion).Append(')');
+        else
+            sb.Append(" - ").Append(string.Join(", ", ForeignAssemblies))
+              .Append(" weichen vom verifizierten build ").Append(EngineFingerprint.GameVersion).Append(" ab");
+        if (Drifts.Count == 0)
+        {
+            sb.Append(", alle ").Append(MethodsChecked).Append(" gepatchten methoden unveraendert");
+            if (ForeignAssemblies.Count > 0) sb.Append(" (komets patches treffen bekannten code)");
+        }
+        else
+        {
+            sb.Append("; ").Append(Drifts.Count).Append(" von ").Append(MethodsChecked).Append(" gepatchten methoden VERAENDERT: ");
+            for (var i = 0; i < Drifts.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(Drifts[i].Target);
+            }
+            sb.Append(" - komets transpiler und 1:1-transkriptionen dort laufen gegen fremden code, das ist nicht verifiziert");
+        }
+        if (MethodsUnverified > 0) sb.Append(" (").Append(MethodsUnverified).Append(" ohne fingerabdruck)");
+        EngineSummary = sb.ToString();
+        if (Drifts.Count > 0) Warn?.Invoke(EngineSummary);
+        else Notify?.Invoke(EngineSummary);
+    }
+
+    // ---- report ----------------------------------------------------------------------
+
+    /// <summary>One-line state for the report header, plus one line per finding.</summary>
+    public static string ReportLines()
+    {
+        var sb = new StringBuilder(256);
+        if (EngineChecked && EngineSummary != null) sb.Append(EngineSummary).Append('\n');
+        if (Scans == 0)
+        {
+            sb.Append("patch-kollisionen: noch nicht geprueft\n");
+            return sb.ToString();
+        }
+        if (Findings.Count == 0)
+        {
+            sb.Append("patch-kollisionen: keine (fremde patches auf komets methoden oder komet-code)\n");
+            return sb.ToString();
+        }
+        sb.AppendFormat(CultureInfo.InvariantCulture, "patch-kollisionen: {0} ({1} hoch, {2} mittel, {3} info)\n",
+            Findings.Count, CountAt(Severity.Hoch), CountAt(Severity.Mittel), CountAt(Severity.Info));
+        foreach (var f in Findings) sb.Append("  ").Append(Format(f)).Append('\n');
+        return sb.ToString();
+    }
+
+    public static void Reset()
+    {
+        Findings.Clear();
+        Drifts.Clear();
+        ForeignAssemblies.Clear();
+        reported.Clear();
+        Scans = 0;
+        MethodsChecked = MethodsUnverified = 0;
+        EngineSummary = null;
+        EngineChecked = false;
+    }
+}
