@@ -3,9 +3,9 @@ using Vintagestory.API.Common;
 [assembly: ModInfo(
     "Komet",
     "komet",
-    Version = "1.2.0-pre1",
+    Version = "1.2.0-pre.2",
     Side = "Universal",
     RequiredOnClient = false,
     RequiredOnServer = false,
-    Description = "Client-side performance mod: faster chunk visibility sweep and occlusion culling, distance culling for block entity renderers, stabilised shadow texels, smoother chunk loading with adaptive inflow, VRAM pool reclaiming - plus an F7 performance HUD with per-renderer timings, hitch log and built-in stress test.",
+    Description = "Universal performance mod for Vintage Story, providing a variety of optimizations and quality-of-life improvements.",
     Authors = new[] { "xToast" })]

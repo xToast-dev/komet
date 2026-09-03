@@ -31,15 +31,37 @@ public static class MeasurementPatches
     /// <summary>The method the upload timing hangs off, so a caller can add a transpiler to it.</summary>
     public static MethodInfo UploadMethod { get; private set; }
 
+    /// <summary>
+    /// Where a skipped optional bracket is reported. Null = silent (the verify harness).
+    /// </summary>
+    public static Action<string> Warn;
+
+    /// <summary>Optional brackets that did not apply in the last <see cref="Apply"/>, by name.
+    /// Empty on a stock engine; the report prints it so a field log says what is missing.</summary>
+    public static readonly System.Collections.Generic.List<string> SkippedBrackets = new();
+
+    /// <summary>
+    /// Applies the frame accounting. The four core brackets (render stages, game tick, chunk
+    /// upload, per-chunk tesselation) are mandatory and throw - without them there is no
+    /// frame accounting at all. Everything after them is attribution detail, and each of
+    /// those brackets is applied on its own: a tester's log (02.09., "Optimum" - a modified
+    /// engine build with a second populateTesselatedChunkPart overload) showed the whole
+    /// group failing on one AmbiguousMatchException, which left the brackets before it
+    /// applied and the ones after it (JSON alloc, network alloc, swap timing) silently
+    /// missing. Half a measurement that reports itself as "could not enable" is the worst of
+    /// both worlds; now the stock engine gets every bracket and a modified one loses exactly
+    /// the bracket it changed, by name.
+    /// </summary>
     public static void Apply(Harmony harmony)
     {
+        SkippedBrackets.Clear();
         var stage = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.TriggerRenderStage),
                         [typeof(EnumRenderStage), typeof(float)])
                     ?? throw new InvalidOperationException("ClientMain.TriggerRenderStage not found");
 
         harmony.Patch(stage,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(StagePrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(StagePostfix))));
+            prefix: OuterPrefix(nameof(StagePrefix)),
+            postfix: OuterPostfix(nameof(StagePostfix)));
 
         // EventManager.TriggerGameTick is the client's whole game tick; ClientEventManager does
         // not override it, so the base method is what runs.
@@ -48,8 +70,8 @@ public static class MeasurementPatches
                    ?? throw new InvalidOperationException("EventManager.TriggerGameTick not found");
 
         harmony.Patch(tick,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TickPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TickPostfix))));
+            prefix: OuterPrefix(nameof(TickPrefix)),
+            postfix: OuterPostfix(nameof(TickPostfix)));
 
         var tesselator = AccessTools.TypeByName("Vintagestory.Client.NoObf.ChunkTesselatorManager")
                          ?? throw new InvalidOperationException("ChunkTesselatorManager not found");
@@ -57,8 +79,8 @@ public static class MeasurementPatches
                        ?? throw new InvalidOperationException("OnBeforeFrame(float) not found");
 
         harmony.Patch(UploadMethod,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(UploadPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(UploadPostfix))));
+            prefix: OuterPrefix(nameof(UploadPrefix)),
+            postfix: OuterPostfix(nameof(UploadPostfix)));
 
         // Tesselation throughput: how long one chunk takes to mesh, and how much of that is
         // spent unpacking and assembling the 27 neighbouring chunks. Runs on the tesselation
@@ -67,14 +89,14 @@ public static class MeasurementPatches
                             [typeof(int), typeof(int), typeof(int), typeof(bool), typeof(bool), typeof(bool).MakeByRefType()])
                         ?? throw new InvalidOperationException("TesselateChunk not found");
         harmony.Patch(tesselate,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TesselatePrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(TesselatePostfix))));
+            prefix: OuterPrefix(nameof(TesselatePrefix)),
+            postfix: OuterPostfix(nameof(TesselatePostfix)));
 
         var buildExt = AccessTools.Method(typeof(ChunkTesselator), "BuildExtendedChunkData")
                        ?? throw new InvalidOperationException("ChunkTesselator.BuildExtendedChunkData not found");
         harmony.Patch(buildExt,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NeighbourPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NeighbourPostfix))));
+            prefix: OuterPrefix(nameof(NeighbourPrefix)),
+            postfix: OuterPostfix(nameof(NeighbourPostfix)));
 
         // Sun relighting that TesselateChunk runs inline before meshing - kept in its own
         // bucket so its share of the per-chunk cost is readable.
@@ -82,8 +104,10 @@ public static class MeasurementPatches
                           [typeof(ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)])
                       ?? throw new InvalidOperationException("SunRelightChunk not found");
         harmony.Patch(relight,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(RelightPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(RelightPostfix))));
+            prefix: OuterPrefix(nameof(RelightPrefix)),
+            postfix: OuterPostfix(nameof(RelightPostfix)));
+
+        // ---- optional brackets: attribution detail, each on its own ----------------
 
         // Allocation attribution INSIDE the meshing pass. A field run measured 219 MB/s on
         // the tesselation thread with the mesh recycler at 100% hits and the neighbour/relight
@@ -91,34 +115,45 @@ public static class MeasurementPatches
         // split it: the per-part clones (populateTesselatedChunkPart -> CloneUsingRecycler,
         // whose small-mesh fallback and extra arrays allocate fresh) versus the per-block
         // JSON shape tesselation. Alloc-only brackets: two thread-local reads per call.
-        var populate = AccessTools.Method(typeof(ChunkTesselator), "populateTesselatedChunkPart")
-                       ?? throw new InvalidOperationException("populateTesselatedChunkPart not found");
-        harmony.Patch(populate,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(AllocPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(PartsAllocPostfix))));
+        //
+        // Every overload of that name is bracketed, not "the" method: a modified engine
+        // build added a second overload, and looking the method up by name alone threw
+        // AmbiguousMatchException. Which overload the engine calls (and whether one wraps
+        // the other) is its business - the prefix/postfix pair is nesting-aware, so a call
+        // reached through another overload books once, on the outermost frame.
+        Optional("tesselation part clones (populateTesselatedChunkPart)", () =>
+            PatchEveryOverload(harmony, typeof(ChunkTesselator), "populateTesselatedChunkPart",
+                OuterPrefix(nameof(PartsAllocPrefix)),
+                OuterPostfix(nameof(PartsAllocPostfix))));
 
         // the 5-arg overload delegates here, so this one bracket sees every call
-        var json = AccessTools.Method(typeof(JsonTesselator), "AddJsonModelDataToMesh",
-                   [typeof(MeshData), typeof(int), typeof(TCTCache), typeof(IMeshPoolSupplier),
-                       typeof(float[]), typeof(IJsonTesselatorHooks), typeof(int)])
-                   ?? throw new InvalidOperationException("AddJsonModelDataToMesh not found");
-        harmony.Patch(json,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(AllocPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(JsonAllocPostfix))));
+        Optional("json shape tesselation (AddJsonModelDataToMesh)", () =>
+        {
+            var json = AccessTools.Method(typeof(JsonTesselator), "AddJsonModelDataToMesh",
+                       [typeof(MeshData), typeof(int), typeof(TCTCache), typeof(IMeshPoolSupplier),
+                           typeof(float[]), typeof(IJsonTesselatorHooks), typeof(int)])
+                       ?? throw new InvalidOperationException("AddJsonModelDataToMesh(7 args) not found");
+            harmony.Patch(json,
+                prefix: OuterPrefix(nameof(AllocPrefix)),
+                postfix: OuterPostfix(nameof(JsonAllocPostfix)));
+        });
 
         // The network thread's share of the allocation rate. SystemNetworkProcess handles
         // every server packet - chunk intake included - inside its own thread tick, and its
         // allocations were the largest unmeasured block in a field report (150 of 161
         // hitches with a gc pause, ~220 MB/s that no existing row could name). Pure
         // measurement: two thread-local reads per 1 ms tick, behaviour untouched.
-        var netTick = AccessTools.Method(
-                          AccessTools.TypeByName("Vintagestory.Client.NoObf.SystemNetworkProcess"),
-                          "OnSeperateThreadGameTick")
-                      ?? throw new InvalidOperationException(
-                          "SystemNetworkProcess.OnSeperateThreadGameTick not found");
-        harmony.Patch(netTick,
-            prefix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NetAllocPrefix))),
-            postfix: new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(NetAllocPostfix))));
+        Optional("network thread allocation (SystemNetworkProcess)", () =>
+        {
+            var netType = AccessTools.TypeByName("Vintagestory.Client.NoObf.SystemNetworkProcess")
+                          ?? throw new InvalidOperationException("SystemNetworkProcess not found");
+            var netTick = AccessTools.Method(netType, "OnSeperateThreadGameTick")
+                          ?? throw new InvalidOperationException(
+                              "SystemNetworkProcess.OnSeperateThreadGameTick not found");
+            harmony.Patch(netTick,
+                prefix: OuterPrefix(nameof(NetAllocPrefix)),
+                postfix: OuterPostfix(nameof(NetAllocPostfix)));
+        });
 
         // How long SwapBuffers itself takes, so "ausserhalb" splits into the swap and the
         // rest of the event loop. Under mesa_glthread every stage timing above only measures
@@ -127,10 +162,102 @@ public static class MeasurementPatches
         // caller rather than a patch on SwapBuffers, because GameWindow.SwapBuffers is a
         // one-line non-virtual method the JIT inlines into window_RenderFrame - a prefix on
         // it would apply cleanly and never run (the dead-profiler lesson).
-        var renderFrame = AccessTools.Method(typeof(ClientPlatformWindows), "window_RenderFrame")
-                          ?? throw new InvalidOperationException("window_RenderFrame not found");
-        harmony.Patch(renderFrame, transpiler: new HarmonyMethod(
-            AccessTools.Method(typeof(MeasurementPatches), nameof(WrapSwapBuffers))));
+        Optional("swap timing (window_RenderFrame)", () =>
+        {
+            var renderFrame = AccessTools.Method(typeof(ClientPlatformWindows), "window_RenderFrame")
+                              ?? throw new InvalidOperationException("window_RenderFrame not found");
+            harmony.Patch(renderFrame, transpiler: new HarmonyMethod(
+                AccessTools.Method(typeof(MeasurementPatches), nameof(WrapSwapBuffers))));
+        });
+
+        // A new mesh pool is a GL buffer allocation of tens of megabytes inside the upload
+        // drain - the 03.09. hitch list had "before 13,5 | upload 12,7" frames against a
+        // 6 ms budget, which a vertex-count budget cannot see coming. Counted and timed, so
+        // the hitch line can say "upload 12,7 (davon 1 neue pools 9,8)" and the report how
+        // many pools a session created and what the longest cost.
+        Optional("mesh pool creation (MeshDataPool.AllocateNewPool)", () =>
+        {
+            var alloc = AccessTools.Method(typeof(MeshDataPool), "AllocateNewPool")
+                        ?? throw new InvalidOperationException("MeshDataPool.AllocateNewPool not found");
+            harmony.Patch(alloc,
+                prefix: OuterPrefix(nameof(PoolAllocPrefix)),
+                postfix: OuterPostfix(nameof(PoolAllocPostfix)));
+        });
+    }
+
+    /// <summary>
+    /// Runs one optional bracket. A failure is logged with the bracket's name and recorded in
+    /// <see cref="SkippedBrackets"/>; the remaining brackets still apply. The throw-away
+    /// exception text is kept short on purpose - the mandatory brackets already proved the
+    /// engine is patchable, so what matters here is WHICH detail is missing.
+    /// </summary>
+    /// <summary>
+    /// The brackets sit OUTSIDE every other mod's prefix and postfix on the same method:
+    /// prefixes at Priority.First run before the rest, postfixes at Priority.Last run after
+    /// them (Harmony orders both kinds by descending priority). What another mod adds inside
+    /// a measured method - SheyderMod relights wide shapes in a postfix on
+    /// AddJsonModelDataToMesh - is then part of that method's figure instead of leaking into
+    /// "rest". The mod's own patches on measured methods already sit at Low for the same
+    /// reason (the window prebuilder, the priority upload drain).
+    /// </summary>
+    public const int OuterPrefixPriority = Priority.First;
+    public const int OuterPostfixPriority = Priority.Last;
+
+    private static HarmonyMethod OuterPrefix(string name)
+        => new(AccessTools.Method(typeof(MeasurementPatches), name)) { priority = OuterPrefixPriority };
+
+    private static HarmonyMethod OuterPostfix(string name)
+        => new(AccessTools.Method(typeof(MeasurementPatches), name)) { priority = OuterPostfixPriority };
+
+    private static void Optional(string name, Action apply)
+    {
+        try
+        {
+            apply();
+        }
+        catch (Exception e)
+        {
+            SkippedBrackets.Add(name);
+            Warn?.Invoke($"measurement bracket '{name}' not applied ({e.GetType().Name}: {FirstLine(e.Message)}) - "
+                         + "the frame accounting works, this one attribution row stays empty");
+        }
+    }
+
+    private static string FirstLine(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var nl = s.IndexOf('\n');
+        return nl < 0 ? s : s.Substring(0, nl);
+    }
+
+    /// <summary>
+    /// Every method of that name declared on the type, in declaration order. Harmony's
+    /// AccessTools.Method(type, name) resolves through Type.GetMethod, which throws
+    /// AmbiguousMatchException the moment a second overload exists - a build of the engine
+    /// with one extra overload is enough. Enumerating never throws, and a caller that wants
+    /// all of them just gets all of them.
+    /// </summary>
+    internal static System.Collections.Generic.List<MethodInfo> MethodsNamed(Type type, string name)
+    {
+        var found = new System.Collections.Generic.List<MethodInfo>();
+        foreach (var m in AccessTools.GetDeclaredMethods(type))
+            if (m.Name == name) found.Add(m);
+        return found;
+    }
+
+    /// <summary>
+    /// Patches every overload of <paramref name="name"/> with the same prefix/postfix pair and
+    /// returns how many. Throws when there is none - a bracket that measures nothing must not
+    /// report itself as applied.
+    /// </summary>
+    internal static int PatchEveryOverload(Harmony harmony, Type type, string name,
+                                           HarmonyMethod prefix, HarmonyMethod postfix)
+    {
+        var overloads = MethodsNamed(type, name);
+        if (overloads.Count == 0)
+            throw new InvalidOperationException($"{type.Name}.{name} not found");
+        foreach (var m in overloads) harmony.Patch(m, prefix: prefix, postfix: postfix);
+        return overloads.Count;
     }
 
     public static void NetAllocPrefix(out long __state)
@@ -191,6 +318,8 @@ public static class MeasurementPatches
     public static void StagePrefix(EnumRenderStage stage, out long __state)
     {
         if (stage == EnumRenderStage.Before) { FrameStats.BeginFrame(); FrameBoundary?.Invoke(); }
+        // the GPU-side stage clock starts where the CPU-side one does
+        GpuFrameTimer.StageBegin(stage);
         __state = Stopwatch.GetTimestamp();
     }
 
@@ -250,8 +379,27 @@ public static class MeasurementPatches
 
     public static void AllocPrefix(out long __state) => __state = GC.GetAllocatedBytesForCurrentThread();
 
+    /// <summary>
+    /// Nesting depth of the part-clone bracket on this thread. Every overload of
+    /// populateTesselatedChunkPart carries the bracket, and an engine build may route one
+    /// overload through another: only the outermost call books, so a nested call never
+    /// counts the same bytes twice. Thread-static because the bracket runs on the tesselation
+    /// thread and (in the verify harness) on the test thread.
+    /// </summary>
+    [ThreadStatic] private static int partsDepth;
+
+    public static void PartsAllocPrefix(out long __state)
+        => __state = partsDepth++ == 0 ? GC.GetAllocatedBytesForCurrentThread() : -1;
+
     public static void PartsAllocPostfix(long __state)
-        => TesselationStats.AddPartsAlloc(GC.GetAllocatedBytesForCurrentThread() - __state);
+    {
+        if (__state < 0) { partsDepth--; return; }
+        // outermost: the depth is known to be exactly one here; resetting rather than
+        // decrementing means an inner overload that threw past its postfix cannot leave
+        // this thread's bracket stuck at a depth where nothing books ever again
+        partsDepth = 0;
+        TesselationStats.AddPartsAlloc(GC.GetAllocatedBytesForCurrentThread() - __state);
+    }
 
     public static void JsonAllocPostfix(long __state)
         => TesselationStats.AddJsonAlloc(GC.GetAllocatedBytesForCurrentThread() - __state);
@@ -262,4 +410,11 @@ public static class MeasurementPatches
     public static void RelightPostfix((long time, long alloc) __state)
         => TesselationStats.AddRelightTicks(Stopwatch.GetTimestamp() - __state.time,
             GC.GetAllocatedBytesForCurrentThread() - __state.alloc);
+
+    // ---- mesh pool creation ----------------------------------------------------------------
+
+    public static void PoolAllocPrefix(out long __state) => __state = Stopwatch.GetTimestamp();
+
+    public static void PoolAllocPostfix(long __state)
+        => FrameStats.AddPoolAlloc((Stopwatch.GetTimestamp() - __state) * 1000.0 / Stopwatch.Frequency);
 }

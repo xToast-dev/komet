@@ -28,7 +28,7 @@ public static class TesselationStats
     private static long partsAllocBytes;
     private static long jsonAllocBytes;
 
-    // last values seen by Sample(), so the HUD gets figures for its own 250 ms window
+    // last values seen by Sample(), so each fold covers exactly the interval since the previous one
     private static long seenTicks, seenNeighbourTicks, seenRelightTicks, seenCount, seenEdges, seenAtTimestamp;
     private static long seenReceived;
     private static long seenAllocB, seenNeighbourAllocB, seenRelightAllocB, seenPartsAllocB, seenJsonAllocB;
@@ -88,6 +88,10 @@ public static class TesselationStats
     public static double JsonAllocMbPerSecond { get; private set; }
     public static long TotalChunks => Interlocked.Read(ref chunkCount);
 
+    /// <summary>Bytes booked by the part-clone bracket since start. Verify reads it to prove
+    /// a nested overload books once; the report only ever sees the per-second rate.</summary>
+    internal static long PartsAllocBytesTotal => Interlocked.Read(ref partsAllocBytes);
+
     public static void AddPartsAlloc(long allocBytes)
     {
         if (allocBytes > 0) Interlocked.Add(ref partsAllocBytes, allocBytes);
@@ -120,8 +124,9 @@ public static class TesselationStats
 
     /// <summary>
     /// Folds everything recorded since the previous call into the smoothed figures. Called
-    /// from the HUD's sampling cycle; an idle tesselation thread decays the rate to zero but
-    /// keeps the last per-chunk cost on display - a cost of "0 ms" would just be false.
+    /// from the frame boundary via FrameStats.PeriodicSample (every half second, HUD or not);
+    /// an idle tesselation thread decays the rate to zero but keeps the last per-chunk cost
+    /// on display - a cost of "0 ms" would just be false.
     /// </summary>
     public static void Sample()
     {

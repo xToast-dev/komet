@@ -53,6 +53,11 @@ internal static class Program
         string[] argv = Environment.GetCommandLineArgs();
         if (argv.Length > 1 && argv[1] == "config")
             return WriteDefaultConfig(argv.Length > 2 ? argv[2] : "dist/komet.json");
+        // "fingerprint <path>": run the suite (it applies every patch), then hash the patched
+        // engine methods into the source file the mod compiles in. The staleness check below
+        // is skipped in this mode - it is the thing being regenerated.
+        var fingerprintMode = argv.Length > 1 && argv[1] == "fingerprint";
+        var fingerprintPath = argv.Length > 2 ? argv[2] : "src/EngineFingerprint.g.cs";
 
         // The strict tests compare byte-identical against vanilla; gap bridging deviates on
         // purpose and has its own test, which flips this on locally and restores it.
@@ -667,6 +672,484 @@ internal static class Program
             PrioUploadPatches.DrainBudgeted(dead, 65536, _ => { disposed++; return 0; });
             if (disposed != 5 || dead.Count != 0)
                 throw new Exception("dead entries must drain completely - they cost no budget");
+        });
+
+
+        Check("main-thread task drain runs in order, times each task, and requeues on suspend", () =>
+        {
+            MethodInfo mtt = AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientMain), "ExecuteMainThreadTasks", new[] { typeof(float) });
+            MainThreadTaskPatches.Apply(harmony);
+            ForceJit(mtt);
+
+            MainThreadTaskPatches.Reset();
+            var order = new List<string>();
+            var q = new Queue<ClientTask>();
+            q.Enqueue(new ClientTask { Code = "a", Action = () => order.Add("a") });
+            q.Enqueue(new ClientTask { Code = "b", Action = () => { order.Add("b"); BusyWait(2.0); } });
+            q.Enqueue(new ClientTask { Code = "c", Action = () => order.Add("c") });
+            int requeued = 0;
+            MainThreadTaskPatches.RunTasks(q, () => false, () => requeued++, null);
+            if (string.Join(",", order) != "a,b,c") throw new Exception("tasks ran as " + string.Join(",", order));
+            if (q.Count != 0 || requeued != 0) throw new Exception("drain left tasks behind or requeued without a suspend");
+            if (MainThreadTaskPatches.StatTasks != 3) throw new Exception($"StatTasks {MainThreadTaskPatches.StatTasks}");
+            if (MainThreadTaskPatches.StatWorstCode != "b" || MainThreadTaskPatches.StatWorstMs < 1.0)
+                throw new Exception($"worst task {MainThreadTaskPatches.StatWorstCode} {MainThreadTaskPatches.StatWorstMs:F2} ms, expected b >= 1 ms");
+            MainThreadTaskPatches.EndFrame();
+            var top = MainThreadTaskPatches.Top(3);
+            if (top.Count == 0 || top[0].code != "b") throw new Exception("per-code table does not rank the slow task first");
+
+            // suspend after the first task: the remainder is handed back once and not run
+            order.Clear();
+            var q2 = new Queue<ClientTask>();
+            bool suspend = false;
+            q2.Enqueue(new ClientTask { Code = "x", Action = () => { order.Add("x"); suspend = true; } });
+            q2.Enqueue(new ClientTask { Code = "y", Action = () => order.Add("y") });
+            requeued = 0;
+            // the real requeue moves the remainder back to the shared queue, emptying this one
+            MainThreadTaskPatches.RunTasks(q2, () => suspend, () => { requeued++; q2.Clear(); }, null);
+            if (string.Join(",", order) != "x" || requeued != 1) throw new Exception("suspend did not stop the drain exactly once");
+
+            // a task without a code is booked, not thrown at
+            var q3 = new Queue<ClientTask>();
+            q3.Enqueue(new ClientTask { Code = null, Action = () => { } });
+            MainThreadTaskPatches.RunTasks(q3, () => false, () => { }, null);
+            MainThreadTaskPatches.Reset();
+        });
+
+        Check("entity loads drain nearest-first under a budget with liveness, and flush on disable", () =>
+        {
+            EntityLoadPatches.Apply(harmony);
+            foreach (string name in new[] { "HandleEntityLoadedPacket", "HandleEntitySpawnPacket", "HandleEntityDespawnPacket",
+                         "HandleEntitiesPacket", "HandleEntityAttributesPacket", "HandleEntityAttributeUpdatePacket",
+                         "HandleEntityBulkAttributesPacket", "HandleEntityPacket" })
+                ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientSystemEntities), name, new[] { typeof(Packet_Server) }));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.SystemNetworkProcess), "HandleEntitySpawnPosition", new[] { typeof(Packet_Server) }));
+
+            // the rules
+            if (!EntityLoadPatches.ShouldLoad(10, 0, 1.5, 2) || !EntityLoadPatches.ShouldLoad(10, 1, 1.5, 2))
+                throw new Exception("liveness: the first two loads of a frame must always run");
+            if (EntityLoadPatches.ShouldLoad(1.5, 2, 1.5, 2)) throw new Exception("budget ignored once liveness is satisfied");
+            if (!EntityLoadPatches.ShouldLoad(1.4, 2, 1.5, 2)) throw new Exception("under budget must continue");
+            if (EntityLoadPatches.BinOf(0) != 0 || EntityLoadPatches.BinOf(33 * 33) != 1
+                || EntityLoadPatches.BinOf(double.NaN) != EntityLoadPatches.BinCount - 1
+                || EntityLoadPatches.BinOf(1e12) != EntityLoadPatches.BinCount - 1)
+                throw new Exception("distance bins");
+
+            // nearest-first under a budget: far ones were held first, the near ones still go first
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+            EntityLoadPatches.HoldForTest(101, 9);
+            EntityLoadPatches.HoldForTest(102, 9);
+            EntityLoadPatches.HoldForTest(103, 9);
+            EntityLoadPatches.HoldForTest(1, 0);
+            EntityLoadPatches.HoldForTest(5, 2);
+            var loaded = new List<long>();
+            double spent = EntityLoadPatches.Drain(1.0, p => { loaded.Add(p.Id); return 0.6; });
+            if (loaded.Count != 2 || loaded[0] != 1 || loaded[1] != 5)
+                throw new Exception($"drained {string.Join(",", loaded)}, expected 1,5 (nearest first, budget after two)");
+            if (Math.Abs(spent - 1.2) > 1e-9) throw new Exception($"spent {spent}");
+            if (EntityLoadPatches.PendingCount != 3 || !EntityLoadPatches.IsHeld(101) || EntityLoadPatches.IsHeld(1))
+                throw new Exception("held set out of step with the drain");
+            if (EntityLoadPatches.StatDeferredFrames != 1 || EntityLoadPatches.StatLoaded != 2)
+                throw new Exception($"stats: deferred {EntityLoadPatches.StatDeferredFrames}, loaded {EntityLoadPatches.StatLoaded}");
+            // a zero budget still moves two per frame
+            loaded.Clear();
+            EntityLoadPatches.Drain(0.0, p => { loaded.Add(p.Id); return 5; });
+            if (loaded.Count != 2) throw new Exception("liveness floor did not hold at zero budget");
+            // a generous budget takes the rest; an empty drain is a no-op
+            loaded.Clear();
+            EntityLoadPatches.Drain(100, p => { loaded.Add(p.Id); return 0.1; });
+            if (loaded.Count != 1 || EntityLoadPatches.PendingCount != 0) throw new Exception("remainder not drained");
+            if (EntityLoadPatches.Drain(100, p => 1) != 0) throw new Exception("empty drain spent time");
+
+            // disabling with no game bound resets; nothing stranded, nothing thrown
+            EntityLoadPatches.HoldForTest(7, 3);
+            EntityLoadPatches.FlushAll();
+            if (EntityLoadPatches.PendingCount != 0) throw new Exception("flush left an entity held");
+
+            // a despawn for a held entity drops it
+            EntityLoadPatches.HoldForTest(8, 1);
+            var despawn = new Packet_Server { EntityDespawn = new Packet_EntityDespawn() };
+            despawn.EntityDespawn.SetEntityId(new long[] { 8 });
+            EntityLoadPatches.DespawnPrefix(despawn);
+            if (EntityLoadPatches.IsHeld(8) || EntityLoadPatches.StatDropped != 1) throw new Exception("despawned entity still held");
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+        });
+
+        Check("tick listeners are wrapped, timed, named, and unwrapped without a trace", () =>
+        {
+            var manager = (Vintagestory.Client.NoObf.ClientEventManager)RuntimeHelpers.GetUninitializedObject(
+                typeof(Vintagestory.Client.NoObf.ClientEventManager));
+            var listRef = AccessTools.FieldRefAccess<Vintagestory.Common.EventManager, List<Vintagestory.Common.GameTickListener>>("GameTickListenersEntity");
+            var list = new List<Vintagestory.Common.GameTickListener>();
+            listRef(manager) = list;
+            int fast = 0;
+            var probe = new TickProbe();
+            Action<float> fastHandler = dt => fast++;
+            Action<float> slowHandler = probe.Slow;
+            list.Add(new Vintagestory.Common.GameTickListener(1, 20, 0, fastHandler, null));
+            list.Add(null); // an unregistered slot - the engine nulls, never removes
+            list.Add(new Vintagestory.Common.GameTickListener(2, 20, 0, slowHandler, null));
+
+            TickProfiler.Reset();
+            TickProfiler.Wrap(manager);
+            if (TickProfiler.StatWrapped != 2 || TickProfiler.StatTotal != 2)
+                throw new Exception($"wrapped {TickProfiler.StatWrapped} of {TickProfiler.StatTotal}");
+            if (ReferenceEquals(list[0].Handler, fastHandler)) throw new Exception("listener 0 was not wrapped");
+            TickProfiler.Wrap(manager);
+            if (list[0].Handler.Target is not TickProfiler.Timed t0 || t0.Inner.Target is TickProfiler.Timed)
+                throw new Exception("a second wrap pass stacked decorators");
+
+            list[0].OnTriggered(100);
+            list[2].OnTriggered(100);
+            if (fast != 1 || probe.Calls != 1) throw new Exception("handlers were not forwarded");
+            var top = TickProfiler.TopOfCurrentFrame();
+            if (top == null || top.Value.name != "TickProbe.Slow" || top.Value.ms < 1.0)
+                throw new Exception($"top listener {top?.name} {top?.ms:F2} ms, expected TickProbe.Slow >= 1 ms");
+            TickProfiler.EndFrame();
+            if (TickProfiler.TopOfCurrentFrame() != null) throw new Exception("EndFrame did not clear the frame ticks");
+            var ranked = TickProfiler.Top(2);
+            if (ranked.Count == 0 || ranked[0].name != "TickProbe.Slow") throw new Exception("smoothed table does not rank the slow listener first");
+
+            string lambdaName = TickProfiler.NameOf(fastHandler);
+            if (lambdaName.Contains("<") || lambdaName.Contains(">")) throw new Exception("mangled lambda name: " + lambdaName);
+
+            TickProfiler.Unwrap(manager);
+            if (!ReferenceEquals(list[0].Handler, fastHandler) || !ReferenceEquals(list[2].Handler.Target, probe))
+                throw new Exception("unwrap did not restore the original delegates");
+            if (TickProfiler.StatWrapped != 0) throw new Exception("StatWrapped after unwrap");
+            TickProfiler.Reset();
+        });
+
+        Check("server entity sync: distance send rate, tracking hysteresis, attribute no-op filter", () =>
+        {
+            EntitySyncPatches.Apply(harmony, null);
+            Type pm = typeof(Vintagestory.Server.PhysicsManager);
+            ForceJit(AccessTools.Method(pm, "ServerTick", new[] { typeof(float) }));
+            ForceJit(AccessTools.Method(pm, "SendPositionsAndAnimations"));
+            ForceJit(AccessTools.Method(pm, "UpdateTrackedEntityState"));
+            ForceJit(AccessTools.Method(pm, "UpdateTrackedEntityLists"));
+            ForceJit(AccessTools.Method(pm, "BuildAttributesPackets"));
+
+            // rate bands
+            if (EntitySyncPatches.SendDivisor(0) != 1 || EntitySyncPatches.SendDivisor(39 * 39) != 1) throw new Exception("near band");
+            if (EntitySyncPatches.SendDivisor(41 * 41) != 2 || EntitySyncPatches.SendDivisor(79 * 79) != 2) throw new Exception("middle band");
+            if (EntitySyncPatches.SendDivisor(81 * 81) != 3 || EntitySyncPatches.SendDivisor(1e9) != 3) throw new Exception("far band");
+            // over any window of `div` consecutive ticks every entity is sent exactly once - negative ids included
+            foreach (int div in new[] { 2, 3 })
+            foreach (long id in new long[] { 0, 1, 7, 12345678901L, -3, -99 })
+            {
+                int sends = 0;
+                for (int tick = 1000; tick < 1000 + div; tick++) if (EntitySyncPatches.ShouldSend(div, tick, id)) sends++;
+                if (sends != 1) throw new Exception($"div {div} id {id}: {sends} sends in {div} ticks");
+            }
+            if (!EntitySyncPatches.ShouldSend(1, 5, 3)) throw new Exception("divisor 1 must always send");
+
+            // hysteresis: inside always; the band only for an already tracked entity; beyond never
+            double rangeSq = 128 * 128;
+            if (!EntitySyncPatches.InTrackingRange(100 * 100, rangeSq, false, 1.15)) throw new Exception("inside the range was refused");
+            if (EntitySyncPatches.InTrackingRange(140 * 140, rangeSq, false, 1.15)) throw new Exception("an untracked entity was admitted through the band");
+            if (!EntitySyncPatches.InTrackingRange(140 * 140, rangeSq, true, 1.15)) throw new Exception("a tracked entity was dropped inside the band");
+            if (EntitySyncPatches.InTrackingRange(150 * 150, rangeSq, true, 1.15)) throw new Exception("a tracked entity was kept beyond the band");
+
+            // the no-op filter against real packets
+            EntitySyncPatches.ResetStats();
+            EntitySyncPatches.Clear();
+            static Packet_EntityAttributeUpdate Make(params (string path, byte[] data)[] attrs)
+            {
+                var arr = new Packet_PartialAttribute[attrs.Length];
+                for (int i = 0; i < arr.Length; i++) arr[i] = new Packet_PartialAttribute { Path = attrs[i].path, Data = attrs[i].data };
+                var p = new Packet_EntityAttributeUpdate { EntityId = 77 };
+                p.SetAttributes(arr);
+                return p;
+            }
+            var first = EntitySyncPatches.Filter(77, Make(("health", new byte[] { 1, 2 }), ("hunger", new byte[] { 9 })));
+            if (first == null || first.AttributesCount != 2) throw new Exception("the first send must go out in full");
+            var second = EntitySyncPatches.Filter(77, Make(("health", new byte[] { 1, 2 }), ("hunger", new byte[] { 10 })));
+            if (second == null || second.AttributesCount != 1 || second.Attributes[0].Path != "hunger")
+                throw new Exception("unchanged path not dropped, or the changed one lost");
+            if (EntitySyncPatches.Filter(77, Make(("health", new byte[] { 1, 2 }))) != null)
+                throw new Exception("an all-unchanged packet must be suppressed");
+            // a full entity packet resets the cache: the same bytes go out again
+            var e = (Vintagestory.API.Common.Entities.Entity)RuntimeHelpers.GetUninitializedObject(typeof(EntityItem));
+            e.EntityId = 77;
+            EntitySyncPatches.InvalidateAfterFullPacket(e);
+            if (EntitySyncPatches.Filter(77, Make(("health", new byte[] { 1, 2 }))) == null)
+                throw new Exception("the cache survived a full entity packet");
+            // a deleted path (null data) is sent once, then skipped
+            if (EntitySyncPatches.Filter(77, Make(("gone", null))) == null) throw new Exception("first delete suppressed");
+            if (EntitySyncPatches.Filter(77, Make(("gone", null))) != null) throw new Exception("repeated delete not suppressed");
+            if (EntitySyncPatches.StatAttrPacketsSuppressed != 2 || EntitySyncPatches.StatAttrPathsSkipped != 3)
+                throw new Exception($"stats: suppressed {EntitySyncPatches.StatAttrPacketsSuppressed}, skipped {EntitySyncPatches.StatAttrPathsSkipped}");
+            EntitySyncPatches.Clear();
+            EntitySyncPatches.ResetStats();
+        });
+
+        Check("attribute updates reach a held entity without promoting it", () =>
+        {
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+            var held = new EntityItem();
+            held.WatchedAttributes.SetInt("health", 1);
+            EntityLoadPatches.HoldForTest(42, 3, held);
+
+            // a partial update, serialised the way the server does: attribute id byte + payload
+            var ms = new System.IO.MemoryStream();
+            var w = new System.IO.BinaryWriter(ms);
+            var attr = new IntAttribute(5);
+            w.Write((byte)attr.GetAttributeId());
+            attr.ToBytes(w);
+            var update = new Packet_EntityAttributeUpdate { EntityId = 42 };
+            update.SetAttributes(new[] { new Packet_PartialAttribute { Path = "health", Data = ms.ToArray() } });
+            EntityLoadPatches.ApplyAttributeUpdate(new Packet_Server { EntityAttributeUpdate = update });
+            if (held.WatchedAttributes.GetInt("health") != 5) throw new Exception("partial update did not reach the held entity");
+            if (!EntityLoadPatches.IsHeld(42)) throw new Exception("an attribute update promoted the entity - the budget would be bypassed");
+            if (EntityLoadPatches.StatUpdatedPending != 1 || EntityLoadPatches.StatPromoted != 0)
+                throw new Exception($"stats: updated {EntityLoadPatches.StatUpdatedPending}, promoted {EntityLoadPatches.StatPromoted}");
+
+            // the bulk packet takes the same path
+            var bulk = new Packet_BulkEntityAttributes();
+            bulk.SetPartialUpdates(new[] { update });
+            EntityLoadPatches.ApplyBulkAttributes(new Packet_Server { BulkEntityAttributes = bulk });
+            if (!EntityLoadPatches.IsHeld(42) || EntityLoadPatches.StatUpdatedPending != 2) throw new Exception("bulk update path");
+
+            // a custom entity packet needs an initialised entity: it takes the held one out of the bins
+            EntityLoadPatches.PromoteEntityPacket(new Packet_Server { EntityPacket = new Packet_EntityPacket { EntityId = 42 } });
+            if (EntityLoadPatches.IsHeld(42)) throw new Exception("a custom entity packet must finish the held entity");
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+        });
+
+        Check("minimap piece uploads are capped per tick by an adaptive budget", () =>
+        {
+            string install = Environment.GetEnvironmentVariable("VS_INSTALL") ?? "/opt/vintagestory";
+            System.Reflection.Assembly.LoadFrom(System.IO.Path.Combine(install, "Mods", "VSEssentials.dll"));
+            MinimapPatches.Apply(harmony);
+            MethodInfo onTick = AccessTools.Method(AccessTools.TypeByName("Vintagestory.GameContent.ChunkMapLayer"), "OnTick", new[] { typeof(float) });
+            ForceJit(onTick);
+            bool sawCall = false, saw200 = false;
+            foreach (CodeInstruction ins in PatchProcessor.GetCurrentInstructions(onTick))
+            {
+                if (ins.operand is MethodInfo mi && mi.Name == nameof(MinimapPatches.PiecesPerTick)) sawCall = true;
+                if (ins.LoadsConstant(MinimapPatches.VanillaCap)) saw200 = true;
+            }
+            if (!sawCall || saw200) throw new Exception($"transpiler: cap call present {sawCall}, constant 200 still present {saw200}");
+
+            // the controller: halve on overrun, double under half the target, hold in between, clamped
+            if (MinimapPatches.Adapt(32, 2.0, 1.0) != 16) throw new Exception("overrun must halve the cap");
+            if (MinimapPatches.Adapt(32, 0.3, 1.0) != 64) throw new Exception("a cheap tick must double the cap");
+            if (MinimapPatches.Adapt(32, 1.0, 1.0) != 32) throw new Exception("in band must hold");
+            if (MinimapPatches.Adapt(MinimapPatches.MinCap, 5.0, 1.0) != MinimapPatches.MinCap) throw new Exception("floor");
+            if (MinimapPatches.Adapt(150, 0.1, 1.0) != MinimapPatches.VanillaCap) throw new Exception("ceiling is vanilla's 200");
+
+            // disabled = exactly vanilla; enabled = the adapted cap; a measured tick moves the cap
+            MinimapPatches.Enabled = false;
+            if (MinimapPatches.PiecesPerTick() != MinimapPatches.VanillaCap) throw new Exception("disabled must return vanilla's 200");
+            MinimapPatches.Enabled = true;
+            MinimapPatches.TargetMs = 1.0;
+            int before = MinimapPatches.Cap;
+            if (MinimapPatches.PiecesPerTick() != before) throw new Exception("enabled must return the adaptive cap");
+            MinimapPatches.TickPrefix(out long t0);
+            MinimapPatches.PiecesPerTick();
+            BusyWait(2.0);
+            MinimapPatches.TickPostfix(t0);
+            if (MinimapPatches.Cap != Math.Max(MinimapPatches.MinCap, before / 2)) throw new Exception($"a 2 ms tick did not halve the cap ({before} -> {MinimapPatches.Cap})");
+            // a tick that dequeued nothing is not measured and does not move the cap
+            int held = MinimapPatches.Cap;
+            MinimapPatches.TickPrefix(out t0);
+            BusyWait(2.0);
+            MinimapPatches.TickPostfix(t0);
+            if (MinimapPatches.Cap != held) throw new Exception("an idle tick adapted the cap");
+            MinimapPatches.ResetStats();
+        });
+
+        Check("minimap pieces compose by direct sub-image upload onto vanilla's rows and columns", () =>
+        {
+            // MinimapPatches.Apply already ran in the cap test (same harmony instance)
+            Type component = AccessTools.TypeByName("Vintagestory.GameContent.MultiChunkMapComponent");
+            MethodInfo finish = AccessTools.Method(component, "FinishSetChunks");
+            ForceJit(finish);
+            bool prefixed = false;
+            var info = Harmony.GetPatchInfo(finish);
+            if (info != null) foreach (var pf in info.Prefixes) if (pf.PatchMethod.DeclaringType == typeof(MinimapPatches)) prefixed = true;
+            if (!prefixed) throw new Exception("FinishSetChunks carries no MinimapPatches prefix");
+
+            // the composition rule: slot i -> column 32*(i%3), row 32*(i/3); nulls skipped; order kept
+            var pieces = new int[9][];
+            pieces[0] = new int[1024]; pieces[4] = new int[1024]; pieces[5] = new int[1024]; pieces[8] = new int[1024];
+            var seen = new List<(int x, int y, int[] p)>();
+            int n = MinimapPatches.Compose(pieces, (x, y, p) => seen.Add((x, y, p)));
+            if (n != 4 || seen.Count != 4) throw new Exception($"composed {n}/{seen.Count} of 4 pieces");
+            var expected = new[] { (0, 0, pieces[0]), (32, 32, pieces[4]), (64, 32, pieces[5]), (64, 64, pieces[8]) };
+            for (int i = 0; i < 4; i++)
+                if (seen[i].x != expected[i].Item1 || seen[i].y != expected[i].Item2 || !ReferenceEquals(seen[i].p, expected[i].Item3))
+                    throw new Exception($"piece {i} landed at ({seen[i].x},{seen[i].y}), expected ({expected[i].Item1},{expected[i].Item2})");
+
+            // the prefix without a GL context: disabled hands over to vanilla, nothing pending
+            // returns the way vanilla's early-out does
+            object comp = RuntimeHelpers.GetUninitializedObject(component);
+            MinimapPatches.DirectUpload = false;
+            if (!MinimapPatches.FinishSetChunksPrefix(comp)) throw new Exception("disabled must run vanilla");
+            MinimapPatches.DirectUpload = true;
+            if (MinimapPatches.FinishSetChunksPrefix(comp)) throw new Exception("no pending pieces must finish without vanilla");
+        });
+
+        Check("the task drain budget cuts a burst in order and hands the rest back once", () =>
+        {
+            int min = MainThreadTaskPatches.MinPerFrame;
+            if (!MainThreadTaskPatches.OverBudget(3.0, 3.5, min, 10)) throw new Exception("over budget with liveness met must cut");
+            if (MainThreadTaskPatches.OverBudget(3.0, 3.5, min - 1, 10)) throw new Exception("liveness: fewer than MinPerFrame ran");
+            if (MainThreadTaskPatches.OverBudget(3.0, 3.5, 100, MainThreadTaskPatches.MaxBacklog + 1)) throw new Exception("a runaway backlog must drain");
+            if (MainThreadTaskPatches.OverBudget(3.0, 3.5, 100, MainThreadTaskPatches.BacklogScale)) throw new Exception("the budget must stretch with the backlog (x2 at BacklogScale)");
+            if (!MainThreadTaskPatches.OverBudget(3.0, 6.5, 100, MainThreadTaskPatches.BacklogScale)) throw new Exception("a stretched budget exceeded must cut");
+            if (MainThreadTaskPatches.OverBudget(0, 100, 100, 10)) throw new Exception("0 = no budget");
+
+            // a burst of 20 tasks at ~0,5 ms under a 2 ms budget: at least MinPerFrame run, the
+            // rest go back in order, exactly once
+            MainThreadTaskPatches.Reset();
+            MainThreadTaskPatches.BudgetMs = 2.0;
+            var order = new List<int>();
+            var q = new Queue<ClientTask>();
+            for (int i = 0; i < 20; i++) { int id = i; q.Enqueue(new ClientTask { Code = "t", Action = () => { order.Add(id); BusyWait(0.5); } }); }
+            int requeued = 0, handedBack = 0;
+            MainThreadTaskPatches.RunTasks(q, () => false, () => { requeued++; handedBack = q.Count; q.Clear(); }, null);
+            if (requeued != 1) throw new Exception($"requeued {requeued} times");
+            if (order.Count < min || order.Count >= 20) throw new Exception($"ran {order.Count} of 20");
+            for (int i = 0; i < order.Count; i++) if (order[i] != i) throw new Exception("order broken");
+            if (handedBack != 20 - order.Count) throw new Exception($"handed back {handedBack}, expected {20 - order.Count}");
+            if (MainThreadTaskPatches.StatBudgetCuts != 1 || MainThreadTaskPatches.StatDeferredTasks != handedBack)
+                throw new Exception($"budget stats {MainThreadTaskPatches.StatBudgetCuts}/{MainThreadTaskPatches.StatDeferredTasks}");
+            // no budget: the whole burst runs in one go
+            MainThreadTaskPatches.BudgetMs = 0;
+            order.Clear();
+            for (int i = 0; i < 20; i++) { int id = i; q.Enqueue(new ClientTask { Code = "t", Action = () => { order.Add(id); BusyWait(0.5); } }); }
+            MainThreadTaskPatches.RunTasks(q, () => false, () => requeued++, null);
+            if (order.Count != 20 || requeued != 1) throw new Exception("without a budget the whole burst must run");
+            MainThreadTaskPatches.BudgetMs = 3.0;
+            MainThreadTaskPatches.Reset();
+        });
+
+        Check("entity before-stage: rate rule, turn spreading, and the loop is patched", () =>
+        {
+            EntityAnimPatches.Apply(harmony);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.SystemRenderEntities), "OnBeforeRender", new[] { typeof(float) }));
+            double farSq = 48 * 48;
+            if (EntityAnimPatches.Divisor(true, true, 10 * 10, farSq) != 1) throw new Exception("a near rendered entity animates every frame");
+            if (EntityAnimPatches.Divisor(true, false, 60 * 60, farSq) != EntityAnimPatches.FarDivisor) throw new Exception("a far rendered entity animates every 2nd frame");
+            if (EntityAnimPatches.Divisor(false, true, 10 * 10, farSq) != EntityAnimPatches.ShadowOnlyDivisor) throw new Exception("shadow-only animates every 3rd, whatever the distance");
+            if (EntityAnimPatches.Divisor(false, false, 10 * 10, farSq) != 1) throw new Exception("invisible: vanilla's own gate decides (dead entities keep animating)");
+            // over any window of `divisor` frames every entity gets exactly one turn
+            for (int divisor = 1; divisor <= 3; divisor++)
+                for (long id = 1; id < 40; id += 7)
+                {
+                    int turns = 0;
+                    for (long f = 100; f < 100 + divisor; f++) if (EntityAnimPatches.IsTurn(f, id, divisor)) turns++;
+                    if (turns != 1) throw new Exception($"id {id} got {turns} turns in {divisor} frames");
+                }
+            // and the turns are spread across frames, not stacked on one
+            int onFrame = 0;
+            for (long id = 0; id < 30; id++) if (EntityAnimPatches.IsTurn(7, id, 3)) onFrame++;
+            if (onFrame != 10) throw new Exception($"{onFrame} of 30 entities on one frame with divisor 3, expected 10");
+            if (EntityAnimPatches.TopOfCurrentFrame() != null) throw new Exception("provider must be silent without a frame");
+            EntityAnimPatches.Reset();
+        });
+
+        Check("server allocation attribution books per thread and suspect, samples to MB/s, and prints", () =>
+        {
+            ServerAllocPatches.Clear();
+            ServerAllocPatches.Apply(harmony);
+            ServerAllocPatches.Enabled = true;
+            foreach (string name in new[] { "Process", "ProcessMainThreadTasks" })
+                ForceJit(AccessTools.Method(typeof(Vintagestory.Server.ServerMain), name));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Server.ServerThread), "Update"));
+            ForceJit(AccessTools.Method(AccessTools.TypeByName("Vintagestory.Server.ServerSystemSupplyChunks"), "runGenerators"));
+            ForceJit(AccessTools.Method(AccessTools.Inner(typeof(Vintagestory.Server.PhysicsManager), "PhysicsOffthreadTasks"), "QueueAsyncTask"));
+
+            // booked through the real pair, keyed by the original method
+            MethodBase tick = AccessTools.Method(typeof(Vintagestory.Server.ServerMain), "Process");
+            ServerAllocPatches.AllocPrefix(out long s0);
+            var junk = new byte[256 * 1024];
+            ServerAllocPatches.AllocPostfix(s0, tick);
+            ServerAllocPatches.Entry tickEntry = null, db = null, helper = null;
+            foreach (var e in ServerAllocPatches.Entries) if (e.Name == "tick") tickEntry = e;
+            if (tickEntry == null || !tickEntry.IsThread) throw new Exception("no thread-level 'tick' entry");
+            if (tickEntry.Bytes < junk.Length || tickEntry.Calls != 1) throw new Exception($"tick booked {tickEntry.Bytes} bytes / {tickEntry.Calls} calls");
+
+            // a thread loop is keyed by its name
+            var thread = (Vintagestory.Server.ServerThread)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.Server.ServerThread));
+            AccessTools.Field(typeof(Vintagestory.Server.ServerThread), "threadName").SetValue(thread, "chunkdbthread");
+            ServerAllocPatches.ThreadPrefix(thread, out var ts);
+            var junk2 = new byte[64 * 1024];
+            ServerAllocPatches.ThreadPostfix(ts);
+            foreach (var e in ServerAllocPatches.Entries) if (e.Name == "chunkdb") db = e;
+            if (db == null || !db.IsThread || db.Bytes < junk2.Length) throw new Exception("chunkdbthread not booked as 'chunkdb'");
+            if (ServerAllocPatches.ThreadLabel("CompressChunks") != "compress") throw new Exception("thread label");
+
+            // the helper wrap books the action's bytes on the helper entry
+            Action a = () => { var j = new byte[32 * 1024]; GC.KeepAlive(j); };
+            ServerAllocPatches.HelperPrefix(ref a);
+            a();
+            foreach (var e in ServerAllocPatches.Entries) if (e.Name == "physik-helper") helper = e;
+            if (helper == null || helper.Bytes < 32 * 1024) throw new Exception("helper action not booked");
+
+            // sampling turns bytes into MB/s; the line prints even when everything is small
+            ServerAllocPatches.Sample(1.0);
+            if (tickEntry.MbPerSecond <= 0 || ServerAllocPatches.ThreadMbPerSecond <= 0) throw new Exception("no rate after sampling");
+            var sb = new System.Text.StringBuilder();
+            ServerAllocPatches.Write(sb, System.Globalization.CultureInfo.InvariantCulture);
+            if (!sb.ToString().Contains("alloc server:")) throw new Exception("report line missing: " + sb);
+            GC.KeepAlive(junk); GC.KeepAlive(junk2);
+            ServerAllocPatches.Enabled = false;
+            ServerAllocPatches.AllocPrefix(out long s1);
+            if (s1 != -1) throw new Exception("disabled prefix must not sample");
+            ServerAllocPatches.Enabled = true;
+            ServerAllocPatches.ResetStats();
+            if (tickEntry.Bytes != 0) throw new Exception("reset must zero the counters");
+        });
+
+        Check("hitch lines name the task drain, the entity load, the tick listener and the entity split", () =>
+        {
+            HitchLog.Reset();
+            HitchLog.TopTickListenerProvider = () => ("ClientSystemEntities.OnGameTick", 7.5);
+            var buckets = new double[HitchLog.BucketCount];
+            buckets[HitchLog.Draussen] = 30;
+            buckets[HitchLog.Tick] = 9;
+            HitchLog.OnFrame(40, 10, 0, buckets, null, 0, 0, 0, 0, 0, 0, 0, 9.1, "readpacket33", 8.2, 2.0);
+            HitchLog.NoteCamera(0, 0, 0, 0, 0);
+            if (!HitchLog.TryGetLast(out var e)) throw new Exception("hitch not booked");
+            string line = HitchLog.FormatEntry(in e).Replace(',', '.');
+            if (!line.Contains("tasks 9.1 (readpacket33 8.2)")) throw new Exception("task attribution missing: " + line);
+            if (!line.Contains("entload 2.0")) throw new Exception("entity load share missing: " + line);
+            if (!line.Contains("tick-listener ClientSystemEntities.OnGameTick 7.5")) throw new Exception("tick listener missing: " + line);
+
+            // a task under a quarter of the drain is not named; the drain figure stays
+            HitchLog.OnFrame(40, 10, 0, buckets, null, 0, 0, 0, 0, 0, 0, 0, 9.1, "readpacket33", 1.5, 0);
+            HitchLog.NoteCamera(0, 0, 0, 0, 0);
+            HitchLog.TryGetLast(out e);
+            line = HitchLog.FormatEntry(in e).Replace(',', '.');
+            if (line.Contains("readpacket33")) throw new Exception("a minor task was named: " + line);
+            if (!line.Contains("tasks 9.1")) throw new Exception("drain figure missing: " + line);
+            if (line.Contains("entload")) throw new Exception("a zero entity load share was printed");
+
+            // the entity split, its top entity only when that is a real share of it
+            HitchLog.EntityFrameProvider = () => (2.0, 9.3, 188, "wolf-eurasian-adult-male", 4.1);
+            HitchLog.OnFrame(40, 10, 0, buckets, null, 0, 0, 0, 0, 0, 0, 0, 0, null, 0, 0);
+            HitchLog.NoteCamera(0, 0, 0, 0, 0);
+            HitchLog.TryGetLast(out e);
+            line = HitchLog.FormatEntry(in e).Replace(',', '.');
+            if (!line.Contains("entities vor-render 2.0 ms. anim 9.3 ms/188 (top wolf-eurasian-adult-male 4.1)"))
+                throw new Exception("entity split missing: " + line);
+            HitchLog.EntityFrameProvider = () => (2.0, 9.3, 188, "wolf-eurasian-adult-male", 0.9);
+            HitchLog.OnFrame(40, 10, 0, buckets, null, 0, 0, 0, 0, 0, 0, 0, 0, null, 0, 0);
+            HitchLog.NoteCamera(0, 0, 0, 0, 0);
+            HitchLog.TryGetLast(out e);
+            line = HitchLog.FormatEntry(in e).Replace(',', '.');
+            if (line.Contains("top wolf")) throw new Exception("a minor entity was named: " + line);
+            if (!line.Contains("anim 9.3 ms/188")) throw new Exception("entity split lost: " + line);
+            HitchLog.EntityFrameProvider = null;
+            HitchLog.TopTickListenerProvider = null;
+            HitchLog.Reset();
         });
 
         Console.WriteLine("\nbehaviour:");
@@ -3999,11 +4482,846 @@ internal static class Program
             ShadowThrottlePatches.NearInterval = 1;
         });
 
+        // ---- 03.09.: the weak-hardware field report (i3-7100U, HD 620, "Optimum" engine build) ----
+
+        Check("measurement brackets survive an engine build with an extra overload, and nest once", () =>
+        {
+            // The tester's engine had a second populateTesselatedChunkPart overload. Harmony's
+            // by-name lookup then throws AmbiguousMatchException - and the old Apply threw it
+            // out of the middle of the group, leaving the brackets before it applied and the
+            // ones after it (JSON alloc, network alloc, swap timing) silently missing.
+            var type = typeof(OverloadedTesselator);
+            const string name = nameof(OverloadedTesselator.Populate);
+            var found = MeasurementPatches.MethodsNamed(type, name);
+            if (found.Count != 2) throw new Exception($"expected 2 overloads on the test type, found {found.Count}");
+
+            var ambiguous = false;
+            try { AccessTools.Method(type, name); }
+            catch (AmbiguousMatchException) { ambiguous = true; }
+            if (!ambiguous) throw new Exception("the plain by-name lookup no longer throws - the test type lost its second overload");
+
+            var patched = MeasurementPatches.PatchEveryOverload(harmony, type, name,
+                new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(MeasurementPatches.PartsAllocPrefix))),
+                new HarmonyMethod(AccessTools.Method(typeof(MeasurementPatches), nameof(MeasurementPatches.PartsAllocPostfix))));
+            if (patched != 2) throw new Exception($"patched {patched} overloads, expected 2");
+            foreach (var m in found) ForceJit(m);
+
+            TesselationStats.Reset();
+            var before = TesselationStats.PartsAllocBytesTotal;
+            OverloadedTesselator.Populate(4);              // the inner overload alone: one 256 KB block
+            var inner = TesselationStats.PartsAllocBytesTotal - before;
+            if (inner < 250_000) throw new Exception($"inner overload booked {inner} bytes, expected ~256 KB");
+
+            before = TesselationStats.PartsAllocBytesTotal;
+            OverloadedTesselator.Populate(4, "via outer");  // outer -> inner: ONE booking covering both
+            var nested = TesselationStats.PartsAllocBytesTotal - before;
+            if (nested < inner) throw new Exception($"the outer call booked {nested} bytes, less than the inner call it contains ({inner})");
+            if (nested >= inner * 1.5) throw new Exception($"a nested overload booked twice: {nested} bytes for a call that allocates {inner} once");
+
+            // a type without the method is a failure, not a silent "applied"
+            var missing = false;
+            try { MeasurementPatches.PatchEveryOverload(harmony, type, "NoSuchMethod", null, null); }
+            catch (InvalidOperationException) { missing = true; }
+            if (!missing) throw new Exception("a missing method must throw so the bracket reports itself as skipped");
+            TesselationStats.Reset();
+        });
+
+        Check("the gpu query ring keeps issuing queries while results are read twice a second", () =>
+        {
+            // The old ring refused to begin a query on a slot whose result was unread; with one
+            // read per half second and one slot per frame it was full after four frames, and
+            // the end handler - the only place the read clock advanced - returned early from
+            // then on. The tester's report carried "gpu 173.73 ms" for a 34 ms frame: the one
+            // world-join frame that got read before the stall, frozen for the session.
+            var ring = new GpuFrameTimer.QueryRing();
+            const int depth = GpuFrameTimer.QueryRing.Depth;
+            int begun = 0, reads = 0;
+            for (var f = 0; f < 3000; f++) // 100 s at 30 fps
+            {
+                if (ring.Begin() < 0) throw new Exception($"frame {f}: no query begun - the ring stalled");
+                begun++;
+                if (ring.Begin() >= 0) throw new Exception("a second begin inside one frame must be refused");
+                var read = ring.End(1.0 / 30);
+                if (read < 0) continue;
+                reads++;
+                var justEnded = (int)((ring.Completed - 1) % depth);
+                var nextBegin = (int)(ring.Completed % depth);
+                if (read == justEnded) throw new Exception("read the query that was ended this very frame - it cannot be finished");
+                if (read == nextBegin) throw new Exception("read the slot the next frame is about to overwrite");
+            }
+            if (begun != 3000) throw new Exception($"{begun} queries over 3000 frames");
+            if (reads < 190 || reads > 210) throw new Exception($"{reads} reads in 100 s, expected ~200 (two a second)");
+            if (ring.End(0.1) >= 0) throw new Exception("end without a begin must be a no-op");
+
+            // counter-check: the old rule, simulated, stalls after Depth frames
+            var pending = new bool[depth];
+            long frame = 0; double accum = 0; var oldBegun = 0;
+            for (var f = 0; f < 3000; f++)
+            {
+                var slot = (int)(frame % depth);
+                if (pending[slot]) continue;
+                oldBegun++;
+                pending[slot] = true; frame++; accum += 1.0 / 30;
+                if (accum < 0.5 || frame < depth) continue;
+                accum = 0;
+                var oldest = (int)((frame - (depth - 1)) % depth);
+                pending[oldest] = false;
+            }
+            if (oldBegun > depth + 2) throw new Exception($"the old rule issued {oldBegun} queries - the stall this test documents is gone from the simulation");
+        });
+
+        Check("thread budgets follow the physical core count the OS reports", () =>
+        {
+            // a 2c/4t laptop: cpu0/cpu2 share core 0, cpu1/cpu3 share core 1
+            var laptop = new (string, string)?[] { ("0", "0"), ("0", "1"), ("0", "0"), ("0", "1") };
+            if (CpuTopology.CountDistinctCores(4, i => laptop[i]) != 2) throw new Exception("2c/4t laptop must count 2 cores");
+            // a 6c/12t desktop in the interleaved order this machine's sysfs uses (cpu0/cpu6 = core 0)
+            if (CpuTopology.CountDistinctCores(12, i => ("0", (i % 6).ToString())) != 6) throw new Exception("6c/12t must count 6");
+            // two sockets reuse core ids - the package must be part of the key
+            if (CpuTopology.CountDistinctCores(4, i => ((i / 2).ToString(), (i % 2).ToString())) != 4) throw new Exception("two sockets collapsed");
+            // a cpu without topology files means unknown, never "fewer cores"
+            if (CpuTopology.CountDistinctCores(4, i => i == 3 ? null : ("0", i.ToString())) != 0) throw new Exception("a missing topology file must read as unknown");
+            // the guess that took the laptop for four cores - fallback only
+            if (CpuTopology.Heuristic(4) != 4 || CpuTopology.Heuristic(12) != 6) throw new Exception("heuristic changed");
+            // the live probe on this machine
+            if (CpuTopology.PhysicalCores < 1 || CpuTopology.PhysicalCores > CpuTopology.LogicalCores)
+                throw new Exception($"live probe: {CpuTopology.PhysicalCores} of {CpuTopology.LogicalCores}");
+            if (System.IO.File.Exists("/sys/devices/system/cpu/cpu0/topology/core_id") && CpuTopology.Source != "sysfs")
+                throw new Exception($"sysfs is there but the probe used '{CpuTopology.Source}'");
+
+            // cull / occlusion helpers: laptop 1/0, six-core desktop 5/4, cap 8, single core 0
+            if (WorkerSet.AutoThreads(1, 2) != 1 || WorkerSet.AutoThreads(2, 2) != 0) throw new Exception("dual core budget");
+            if (WorkerSet.AutoThreads(1, 6) != 5 || WorkerSet.AutoThreads(2, 6) != 4) throw new Exception("six core budget");
+            if (WorkerSet.AutoThreads(1, 32) != 8) throw new Exception("cap");
+            if (WorkerSet.AutoThreads(1, 1) != 0) throw new Exception("single core must get no helpers");
+
+            // worldgen threads: the configured 6 is an upper bound, hardware threads minus two the cap
+            if (KometServerModSystem.EffectiveWorldgenThreads(6, 4) != 2) throw new Exception("4-thread laptop must get 2");
+            if (KometServerModSystem.EffectiveWorldgenThreads(6, 12) != 6) throw new Exception("12-thread desktop keeps 6");
+            if (KometServerModSystem.EffectiveWorldgenThreads(6, 2) != 1) throw new Exception("never below 1 (vanilla)");
+            if (KometServerModSystem.EffectiveWorldgenThreads(2, 12) != 2) throw new Exception("a lower config value wins");
+            if (KometServerModSystem.EffectiveWorldgenThreads(9, 64) != 6) throw new Exception("never above 6 (engine max)");
+        });
+
+        Check("per-second rates fold at the frame boundary, HUD or no HUD", () =>
+        {
+            // The report's gc/alloc/cpu/chunks-per-second rows folded inside the HUD's refresh
+            // cycle - a '.komet report' with the overlay off (every field report) printed zeros
+            // next to hitch lines carrying 40 ms GC pauses.
+            FrameStats.Reset();
+            var folds = 0;
+            Action hook = () => folds++;
+            FrameStats.PeriodicSample += hook;
+            try
+            {
+                long msTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+                long clock = 5_000_000_000L;
+                FrameStats.Advance(clock, 0);
+                for (var i = 0; i < 187; i++) { clock += 16 * msTicks; FrameStats.Advance(clock, 0); } // 2.99 s
+                // the first accounted frame folds at once, then every half second: 1 + 5
+                if (folds < 5 || folds > 7) throw new Exception($"{folds} folds in 3 s, expected about 6");
+                clock += 600 * msTicks; FrameStats.Advance(clock, 0); // a full interval later: due
+                var seen = folds;
+                clock += 100 * msTicks; FrameStats.Advance(clock, 0); // 0.1 s after that fold: too soon
+                if (folds != seen) throw new Exception("folded again inside the interval");
+                clock += 450 * msTicks; FrameStats.Advance(clock, 0); // 0.55 s after it: due
+                if (folds != seen + 1) throw new Exception("did not fold after the interval");
+            }
+            finally
+            {
+                FrameStats.PeriodicSample -= hook;
+                FrameStats.Reset();
+            }
+        });
+
+        Check("the extra shadow map step applies only at the slider's ceiling", () =>
+        {
+            if (ShadowResPatches.StepsFor(6, 1) != 7) throw new Exception("quality 4 + one step must give 7168");
+            if (ShadowResPatches.StepsFor(6, 2) != 8) throw new Exception("quality 4 + two steps must give 8192");
+            if (ShadowResPatches.StepsFor(5, 1) != 5) throw new Exception("quality 3 stays at 5120 - the slider can still go up");
+            if (ShadowResPatches.StepsFor(4, 1) != 4) throw new Exception("quality 0-2 stays at 4096");
+            if (ShadowResPatches.StepsFor(7, 1) != 8) throw new Exception("a hand-edited setting above the slider is still the ceiling");
+            if (ShadowResPatches.StepsFor(6, 0) != 6) throw new Exception("zero steps is vanilla");
+            if (ShadowResPatches.AppliesAt(0) || ShadowResPatches.AppliesAt(2) || ShadowResPatches.AppliesAt(3))
+                throw new Exception("below the ceiling nothing applies");
+            if (!ShadowResPatches.AppliesAt(4) || !ShadowResPatches.AppliesAt(5)) throw new Exception("at the ceiling it applies");
+        });
+
+        Check("a frame that spans the pause menu is not booked as a hitch", () =>
+        {
+            // The tester's log: "ruckler: 5638.5 ms ... draussen 5627.3" eight seconds after
+            // "Client pause state is now on". The menu stood open; nothing stalled.
+            FrameStats.Reset();
+            HitchLog.Reset();
+            HitchLog.MinMs = 15;
+            HitchLog.Factor = 2.0;
+            long msTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+            long clock = 123456789;
+            void Boundary(bool paused) { HitchLog.NotePaused(paused); HitchLog.NoteCamera(0, 0, 0, 0, 0); }
+
+            FrameStats.Advance(clock, 0); Boundary(false);
+            for (var i = 0; i < 40; i++) { clock += 10 * msTicks; FrameStats.Advance(clock, 0); Boundary(false); }
+            if (HitchLog.TotalHitches != 0) throw new Exception("warmup booked a hitch");
+
+            // the menu opens: a 5 s frame that ends paused
+            clock += 5000 * msTicks; FrameStats.Advance(clock, 0); Boundary(true);
+            if (HitchLog.TotalHitches != 0 || HitchLog.CountPaused != 1) throw new Exception($"pause frame: {HitchLog.TotalHitches} hitches, {HitchLog.CountPaused} paused");
+            // the frame that closes the menu begins paused and ends running - menu time too
+            clock += 300 * msTicks; FrameStats.Advance(clock, 0); Boundary(false);
+            if (HitchLog.TotalHitches != 0 || HitchLog.CountPaused != 2) throw new Exception($"closing frame: {HitchLog.TotalHitches} hitches, {HitchLog.CountPaused} paused");
+            // a real stall afterwards still books (the average now carries the 5 s frame at
+            // 1/64 weight, so the threshold sits near 180 ms)
+            clock += 250 * msTicks; FrameStats.Advance(clock, 0); Boundary(false);
+            if (HitchLog.TotalHitches != 1) throw new Exception($"a real stall after the menu must book, got {HitchLog.TotalHitches}");
+            if (!HitchLog.SummaryLine().Contains("2 im pausenmenue")) throw new Exception("the summary must name the dropped frames: " + HitchLog.SummaryLine());
+
+            HitchLog.Reset();
+            FrameStats.Reset();
+        });
+
+        Check("client worker threads and pool tasks book their allocation by name", () =>
+        {
+            // The 03.09. report left 79 of 216 MB/s as "rest". A bracket around
+            // ClientThread.Update keyed by the thread's name, and a wrapper around every
+            // TyronThreadPool task keyed by its caller, give that rest a name.
+            ClientAllocPatches.Clear();
+            ClientAllocPatches.Enabled = true;
+            ClientAllocPatches.Apply(harmony);
+            var clientThread = AccessTools.TypeByName("Vintagestory.Client.NoObf.ClientThread");
+            ForceJit(AccessTools.Method(clientThread, "Update"));
+            ForceJit(AccessTools.Method(typeof(TyronThreadPool), nameof(TyronThreadPool.QueueTask), [typeof(Action), typeof(string)]));
+
+            // the thread bracket, driven directly with a real ClientThread instance
+            var instance = Activator.CreateInstance(clientThread,
+                new object[] { null, "relight", Array.Empty<Vintagestory.Client.NoObf.ClientSystem>(), default(System.Threading.CancellationToken) });
+            ClientAllocPatches.ThreadPrefix(instance, out var state);
+            AllocSink = new byte[256 * 1024];
+            ClientAllocPatches.ThreadPostfix(state);
+            ClientAllocPatches.Entry relight = null;
+            foreach (var e in ClientAllocPatches.Entries) if (e.Name == "relight" && e.IsThread) relight = e;
+            if (relight == null || relight.Bytes < 250_000 || relight.Calls != 1)
+                throw new Exception($"relight thread booked {relight?.Bytes} bytes / {relight?.Calls} calls");
+            if (ClientAllocPatches.ThreadLabel("tesselateterrain") != "tess" || ClientAllocPatches.ThreadLabel("networkproc") != "netz")
+                throw new Exception("thread labels");
+
+            // the pool wrapper, end to end through the real pool
+            using var done = new System.Threading.ManualResetEventSlim(false);
+            TyronThreadPool.QueueTask(() => { AllocSink = new byte[256 * 1024]; done.Set(); }, "kometverify");
+            if (!done.Wait(5000)) throw new Exception("pool task never ran");
+            System.Threading.Thread.Sleep(20); // the booking happens after the task's own Set()
+            var pool = ClientAllocPatches.PoolEntry("kometverify");
+            if (pool.IsThread || pool.Bytes < 250_000 || pool.Calls != 1)
+                throw new Exception($"pool caller booked {pool.Bytes} bytes / {pool.Calls} calls");
+
+            // rates fold per entry, and the report line names both kinds
+            // 256 KB over a tenth of a second = 2,5 MB/s, blended 0,4 -> 1 MB/s, above the
+            // report line's 0,5 MB/s floor
+            ClientAllocPatches.Sample(0.1);
+            if (relight.MbPerSecond < 0.9 || pool.MbPerSecond < 0.9) throw new Exception($"rates did not fold: {relight.MbPerSecond} / {pool.MbPerSecond}");
+            var sb = new System.Text.StringBuilder();
+            ClientAllocPatches.Write(sb, System.Globalization.CultureInfo.InvariantCulture);
+            var line = sb.ToString();
+            if (!line.Contains("alloc client-threads:") || !line.Contains("threadpool") || !line.Contains("kometverify"))
+                throw new Exception("report line: " + line);
+
+            // off = the action goes through untouched and nothing books
+            ClientAllocPatches.Enabled = false;
+            var before = pool.Bytes;
+            done.Reset();
+            TyronThreadPool.QueueTask(() => { AllocSink = new byte[256 * 1024]; done.Set(); }, "kometverify");
+            if (!done.Wait(5000)) throw new Exception("pool task never ran (off)");
+            System.Threading.Thread.Sleep(20);
+            if (pool.Bytes != before) throw new Exception("booked while off");
+            ClientAllocPatches.Enabled = true;
+            ClientAllocPatches.Clear();
+        });
+
+        Check("the frame accounting reads what each ephemeral collection promoted", () =>
+        {
+            // The pause is paid for survivors. The per-frame collection-count delta already
+            // exists; on a frame that crossed a collection the GC's own memory info is read
+            // once, so the report can say "befoerdert N MB/s" next to "alloc M MB/s".
+            FrameStats.Reset();
+            long msTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+            long clock = 42_000_000_000L;
+            int G0() => GC.CollectionCount(0);
+            int G1() => GC.CollectionCount(1);
+            int G2() => GC.CollectionCount(2);
+            FrameStats.Advance(clock, 0, G0(), G1(), G2());
+            var seen0 = FrameStats.GcInfosSeen;
+            // a frame with no collection reads nothing
+            clock += 10 * msTicks; FrameStats.Advance(clock, 0, G0(), G1(), G2());
+            if (FrameStats.GcInfosSeen != seen0) throw new Exception("read gc info without a collection");
+            // survivors: keep a live array across a forced gen0 collection
+            var keep = new byte[64 * 1024];
+            GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+            clock += 10 * msTicks; FrameStats.Advance(clock, 0, G0(), G1(), G2());
+            if (FrameStats.GcInfosSeen != seen0 + 1) throw new Exception($"collection not seen: {FrameStats.GcInfosSeen} vs {seen0}");
+            if (FrameStats.LastGcGeneration < 0 || FrameStats.LastGcGeneration > 1) throw new Exception("generation " + FrameStats.LastGcGeneration);
+            if (FrameStats.GcHeapMb <= 0) throw new Exception("heap size missing");
+            GC.KeepAlive(keep);
+            // the rates fold on the next sample
+            clock += 600 * msTicks; FrameStats.Advance(clock, 0, G0(), G1(), G2());
+            FrameStats.Reset();
+        });
+
+        Check("measurement brackets enclose foreign prefixes and postfixes on the same method", () =>
+        {
+            // SheyderMod relights wide shapes in a prefix/postfix pair on AddJsonModelDataToMesh,
+            // a method komet only measures. With both sides at normal priority the bracket
+            // closed before the foreign postfix ran and that work leaked into "rest". The
+            // brackets now sit at the outer priorities; Harmony orders prefixes AND postfixes
+            // by descending priority, so First runs first among prefixes and Last runs last
+            // among postfixes - pinned here against the real Harmony, with the equal-priority
+            // order as the counter-check.
+            var target = AccessTools.Method(typeof(Program), nameof(BracketTarget));
+            var other = new Harmony("other.mod2");
+            try
+            {
+                other.Patch(target,
+                    prefix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(TheirBracketPrefix))),
+                    postfix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(TheirBracketPostfix))));
+                harmony.Patch(target,
+                    prefix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(OurBracketPrefix))) { priority = MeasurementPatches.OuterPrefixPriority },
+                    postfix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(OurBracketPostfix))) { priority = MeasurementPatches.OuterPostfixPriority });
+                BracketLog.Clear();
+                BracketTarget();
+                var order = string.Join(",", BracketLog);
+                if (order != "komet-prefix,other-prefix,original,other-postfix,komet-postfix")
+                    throw new Exception("order: " + order);
+
+                harmony.Unpatch(target, HarmonyPatchType.All, "komet.verify");
+                harmony.Patch(target,
+                    prefix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(OurBracketPrefix))),
+                    postfix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(OurBracketPostfix))));
+                BracketLog.Clear();
+                BracketTarget();
+                if (string.Join(",", BracketLog) == order)
+                    throw new Exception("equal priority must not already give the outer order: " + order);
+            }
+            finally
+            {
+                other.UnpatchAll("other.mod2");
+                harmony.Unpatch(target, HarmonyPatchType.All, "komet.verify");
+            }
+        });
+
+        Check("task codes name the packet ids from the engine's own table", () =>
+        {
+            TaskCodes.Reset();
+            if (TaskCodes.Describe("readpacket58") != "readpacket58=ExchangeBlock") throw new Exception(TaskCodes.Describe("readpacket58"));
+            if (TaskCodes.Describe("readpacket6") != "readpacket6=LevelFinalize") throw new Exception(TaskCodes.Describe("readpacket6"));
+            if (TaskCodes.Describe("loadchunk") != "loadchunk" || TaskCodes.Describe("readpacket99999") != "readpacket99999" || TaskCodes.Describe(null) != null)
+                throw new Exception("unknown codes must pass through");
+            // the drain books under the described name, so hitch line and report agree
+            var worstMs = MainThreadTaskPatches.StatWorstMs;
+            var worstCode = MainThreadTaskPatches.StatWorstCode;
+            MainThreadTaskPatches.StatWorstMs = 0;
+            MainThreadTaskPatches.Note("readpacket58", System.Diagnostics.Stopwatch.Frequency);
+            if (MainThreadTaskPatches.StatWorstCode != "readpacket58=ExchangeBlock") throw new Exception("booked as " + MainThreadTaskPatches.StatWorstCode);
+            MainThreadTaskPatches.StatWorstMs = worstMs;
+            MainThreadTaskPatches.StatWorstCode = worstCode;
+        });
+
+        Check("the gpu utilisation reader parses sysfs and picks the first busy-capable card", () =>
+        {
+            if (!GpuBusy.TryParse("13\n", out var p) || p != 13) throw new Exception("parse");
+            if (GpuBusy.TryParse("101", out _) || GpuBusy.TryParse("-1", out _) || GpuBusy.TryParse("x", out _) || GpuBusy.TryParse(null, out _))
+                throw new Exception("out of range must be rejected");
+            var root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "komet-drm-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                System.IO.Directory.CreateDirectory(System.IO.Path.Combine(root, "card0", "device"));   // no busy file (intel, nvidia)
+                System.IO.Directory.CreateDirectory(System.IO.Path.Combine(root, "card1-DP-1", "device")); // a connector, not a card
+                System.IO.File.WriteAllText(System.IO.Path.Combine(root, "card1-DP-1", "device", "gpu_busy_percent"), "99");
+                System.IO.Directory.CreateDirectory(System.IO.Path.Combine(root, "card1", "device"));
+                var busy = System.IO.Path.Combine(root, "card1", "device", "gpu_busy_percent");
+                System.IO.File.WriteAllText(busy, "42\n");
+                if (GpuBusy.Probe(root) != busy) throw new Exception("picked " + GpuBusy.Probe(root));
+                if (GpuBusy.Probe(System.IO.Path.Combine(root, "nowhere")) != null) throw new Exception("a missing root must yield nothing");
+
+                GpuBusy.DrmRoot = root;
+                GpuBusy.ForgetProbe();
+                // without a figure the old span rule stands: 10 ms of GPU span in a 10,5 ms frame
+                if (GpuBusy.Available || GpuBusy.IsLimited(5, 10) || !GpuBusy.IsLimited(10, 10.5))
+                    throw new Exception("without a figure the span rule must stand");
+                GpuBusy.Sample();
+                if (!GpuBusy.Available || GpuBusy.Percent != 42 || GpuBusy.Source != "amdgpu" || GpuBusy.Samples != 1)
+                    throw new Exception($"sample: {GpuBusy.Percent} {GpuBusy.Source} {GpuBusy.Samples}");
+                // with a figure, the figure decides: the same 10-in-10,5 span at 42 % busy is a CPU-bound frame
+                if (GpuBusy.IsLimited(10, 10.5)) throw new Exception("42 % busy is not GPU-limited");
+                System.IO.File.WriteAllText(busy, "95");
+                GpuBusy.Sample();
+                if (!GpuBusy.IsLimited(2, 10)) throw new Exception("95 % busy is GPU-limited whatever the span says");
+                // a file that stops making sense switches the row off instead of lying
+                System.IO.File.WriteAllText(busy, "garbage");
+                for (var i = 0; i < 3; i++) GpuBusy.Sample();
+                if (GpuBusy.Available) throw new Exception("three bad reads must disable the reader");
+            }
+            finally
+            {
+                GpuBusy.DrmRoot = GpuBusy.DefaultDrmRoot;
+                GpuBusy.ForgetProbe();
+                try { System.IO.Directory.Delete(root, true); } catch { /* temp */ }
+            }
+        });
+
+        Check("the allocation sampler books by thread name and type", () =>
+        {
+            // The runtime's own GCAllocationTick events, received in-process: one per ~100 KB,
+            // with the OS thread id and the type. The thread id becomes a name through what
+            // the OS knows (Linux comm, 15 characters), so the report says "kv-alloc 96 MB/s"
+            // and "Byte[] 96 MB/s" for a thread named kv-alloc allocating byte arrays.
+            if (AllocSampler.ShortType("System.Int32[]") != "Int32[]"
+                || AllocSampler.ShortType("System.Collections.Generic.List`1[System.Int32]") != "List`1[System.Int32]"
+                || AllocSampler.ShortType(null) != "?")
+                throw new Exception("type shortening");
+            if (AllocSampler.Label("tesselateterrai", 1) != "tess" || AllocSampler.Label("networkproc", 1) != "netz"
+                || AllocSampler.Label("komet-cull-3", 1) != "komet-cull" || AllocSampler.Label(".NET TP Worker", 1) != "tp-worker"
+                || AllocSampler.Label(null, 77) != "#77" || AllocSampler.Label("SunBake", 1) != "SunBake")
+                throw new Exception("thread labels");
+
+            AllocSampler.Clear();
+            AllocSampler.Start();
+            if (!AllocSampler.Enabled) throw new Exception("listener did not start: " + AllocSampler.Failure);
+            try
+            {
+                const long total = 48L * 1024 * 1024;
+                // The thread stays alive until its events are booked: the name comes from the
+                // OS, and the OS forgets a thread the moment it exits, while the events are
+                // dispatched a little later. A thread that dies before its ticks are read is
+                // booked by id, which is what the "#tid" label means in a report.
+                using var release = new System.Threading.ManualResetEventSlim(false);
+                var t = new System.Threading.Thread(() =>
+                {
+                    long done = 0;
+                    while (done < total) { AllocSink = new byte[48 * 1024]; done += 48 * 1024; }
+                    release.Wait(10000);
+                }) { Name = "kv-alloc", IsBackground = true };
+                t.Start();
+                var deadline = DateTime.UtcNow.AddSeconds(5);
+                while (AllocSampler.BytesForThread("kv-alloc") < total / 2 && DateTime.UtcNow < deadline)
+                    System.Threading.Thread.Sleep(50);
+                var booked = AllocSampler.BytesForThread("kv-alloc");
+                release.Set();
+                t.Join();
+                if (booked < total / 2)
+                {
+                    var seen = new System.Text.StringBuilder();
+                    foreach (var (tid, name, bytes) in AllocSampler.Threads()) seen.Append($" {tid}:{name}={bytes / 1024}KB");
+                    throw new Exception($"kv-alloc booked {booked} of {total} bytes ({AllocSampler.Samples} samples, {AllocSampler.SampledBytes} bytes sampled, failure: {AllocSampler.Failure ?? "-"}); threads:{seen}");
+                }
+                var bytesType = AllocSampler.BytesForType("Byte[]");
+                if (bytesType < total / 2) throw new Exception($"Byte[] booked {bytesType}");
+                AllocSampler.Sample(0.5);
+                var sb = new System.Text.StringBuilder();
+                AllocSampler.Write(sb, System.Globalization.CultureInfo.InvariantCulture);
+                var line = sb.ToString();
+                if (!line.Contains("alloc-stichprobe") || !line.Contains("kv-alloc") || !line.Contains("Byte[]"))
+                    throw new Exception("report line: " + line);
+            }
+            finally
+            {
+                AllocSampler.Stop();
+                AllocSampler.Clear();
+            }
+        });
+
+        Check("mesh pool creation is booked into the frame's upload figure", () =>
+        {
+            if (MeasurementPatches.SkippedBrackets.Exists(b => b.Contains("pool"))) throw new Exception("the pool bracket did not apply");
+            ForceJit(AccessTools.Method(typeof(MeshDataPool), "AllocateNewPool"));
+            FrameStats.Reset();
+            HitchLog.Reset();
+            HitchLog.MinMs = 15;
+            HitchLog.Factor = 2.0;
+            string logged = null;
+            HitchLog.Log = line => logged = line;
+            try
+            {
+                long msTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+                long clock = 987654321;
+                void Boundary() { HitchLog.NotePaused(false); HitchLog.NoteCamera(0, 0, 0, 0, 0); }
+                FrameStats.Advance(clock, 0); Boundary();
+                for (var i = 0; i < 40; i++) { clock += 10 * msTicks; FrameStats.Advance(clock, 0); Boundary(); }
+                // one pool creation of ~12 ms inside a 14 ms upload, in a 60 ms frame
+                MeasurementPatches.PoolAllocPrefix(out var t0);
+                System.Threading.Thread.Sleep(12);
+                MeasurementPatches.PoolAllocPostfix(t0);
+                if (FrameStats.StatPoolAllocs != 1 || FrameStats.StatPoolAllocMs < 10 || FrameStats.MaxPoolAllocMs < 10)
+                    throw new Exception($"booked {FrameStats.StatPoolAllocs} pools, {FrameStats.StatPoolAllocMs} ms");
+                FrameStats.AddUploadMs(14);
+                clock += 60 * msTicks; FrameStats.Advance(clock, 0); Boundary();
+                if (HitchLog.TotalHitches != 1) throw new Exception($"{HitchLog.TotalHitches} hitches");
+                if (logged == null || !logged.Contains("upload 14") || !logged.Contains("1 neue pools 1"))
+                    throw new Exception("hitch line: " + logged);
+                // the next frame starts clean: a plain 60 ms frame names no pool
+                logged = null;
+                clock += 60 * msTicks; FrameStats.Advance(clock, 0); Boundary();
+                if (logged == null || logged.Contains("neue pools")) throw new Exception("second frame: " + logged);
+            }
+            finally
+            {
+                HitchLog.Log = null;
+                HitchLog.Reset();
+                FrameStats.Reset();
+            }
+            if (FrameStats.StatPoolAllocs != 0) throw new Exception("reset must clear the pool counters");
+        });
+
+        Check("block packet source sampling names the sender", () =>
+        {
+            PacketSourcePatches.Apply(harmony);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Server.ServerMain), "SendSetBlock",
+                [typeof(int), typeof(int), typeof(int), typeof(int), typeof(int), typeof(bool)]));
+            // the picking rule: the send plumbing, the accessors and the patch machinery are
+            // skipped, the first real caller wins
+            var frames = new List<(string, string)>
+            {
+                (null, "DMD<something>"),
+                ("PacketSourcePatches", "Note"),
+                ("ServerMain", "SendSetBlock"),
+                ("ServerWorldMap", "SendExchangeBlock"),
+                ("BlockAccessorRelaxed", "ExchangeBlock"),
+                ("BlockShapeFromAttributes", "OnServerGameTick"),
+                ("ServerSystemBlockSimulation", "OnServerTick"),
+            };
+            if (PacketSourcePatches.PickSource(frames) != "BlockShapeFromAttributes.OnServerGameTick")
+                throw new Exception("picked " + PacketSourcePatches.PickSource(frames));
+            // end to end: a storm from one method ranks that method first
+            PacketSourcePatches.ResetStats();
+            PacketSourcePatches.Enabled = true;
+            SnowMeltStorm(160);
+            if (PacketSourcePatches.StatExchange != 160 || PacketSourcePatches.StatSet != 0)
+                throw new Exception($"counted {PacketSourcePatches.StatExchange}/{PacketSourcePatches.StatSet}");
+            var ranking = PacketSourcePatches.Ranking(3);
+            if (ranking.Count == 0 || ranking[0].source != "Program.SnowMeltStorm" || ranking[0].share < 99)
+                throw new Exception("ranking: " + (ranking.Count > 0 ? ranking[0].source + " " + ranking[0].share : "empty"));
+            var sb = new System.Text.StringBuilder();
+            PacketSourcePatches.Write(sb, System.Globalization.CultureInfo.InvariantCulture);
+            if (!sb.ToString().Contains("exchange 160") || !sb.ToString().Contains("Program.SnowMeltStorm")) throw new Exception(sb.ToString());
+            // the capture budget: a storm buys at most MaxCapturesPerSecond stack walks a second
+            PacketSourcePatches.ResetStats();
+            long t0 = System.Diagnostics.Stopwatch.Frequency * 200;
+            int allowed = 0;
+            for (int i = 0; i < 200; i++) if (PacketSourcePatches.BucketAllows(t0)) allowed++;
+            if (allowed != PacketSourcePatches.MaxCapturesPerSecond) throw new Exception($"cap: {allowed}");
+            if (!PacketSourcePatches.BucketAllows(t0 + System.Diagnostics.Stopwatch.Frequency)) throw new Exception("the bucket did not refill");
+            PacketSourcePatches.ResetStats();
+        });
+
+        Check("gpu stage stamps: one set per frame, skipped stages read as zero, sets read once a second", () =>
+        {
+            // The frame span said "near the wall"; the stamps say which pass. Same ring rule
+            // as the elapsed query: a slot per frame, overwrite on wrap, a three-frames-old
+            // set read on a fixed cadence - here once a second, because every stamped stage
+            // is one returning GL call.
+            var ring = new GpuFrameTimer.StageRing();
+            int reads = 0;
+            for (var f = 0; f < 600; f++) // 10 s at 60 fps
+            {
+                if (ring.Stamp((int)EnumRenderStage.Opaque) >= 0) throw new Exception("a stamp outside a frame must be refused");
+                var slot = ring.BeginFrame();
+                if (slot != f % GpuFrameTimer.StageRing.Depth) throw new Exception($"frame {f} got slot {slot}");
+                if (ring.Stamp((int)EnumRenderStage.Opaque) != slot || ring.Stamp((int)EnumRenderStage.Ortho) != slot)
+                    throw new Exception("stamps inside the frame must land in its slot");
+                if (ring.Stamp(GpuFrameTimer.EndSlot) >= 0) throw new Exception("the end slot is not a stage");
+                var read = ring.EndFrame(1.0 / 60);
+                if (read < 0) continue;
+                reads++;
+                var stamped = ring.Stamped[read];
+                if (!stamped[(int)EnumRenderStage.Before] || !stamped[(int)EnumRenderStage.Opaque] || !stamped[GpuFrameTimer.EndSlot]
+                    || stamped[(int)EnumRenderStage.ShadowFar])
+                    throw new Exception("the read set must carry exactly the frame's stamps");
+                if (ring.EndFrame(1.0 / 60) >= 0) throw new Exception("a second end inside one frame must be refused");
+            }
+            if (reads < 9 || reads > 10) throw new Exception($"{reads} reads in 10 s, expected one a second");
+
+            // the interval rule: a stamped stage runs to the next stamped one, the last to the
+            // end stamp, an unstamped stage is zero, and the stages sum to the frame's span
+            var ts = new long[GpuFrameTimer.StageSlots];
+            var st = new bool[GpuFrameTimer.StageSlots];
+            void At(EnumRenderStage stage, long ns) { ts[(int)stage] = ns; st[(int)stage] = true; }
+            At(EnumRenderStage.Before, 1000);
+            At(EnumRenderStage.ShadowNear, 1600);      // far cascade skipped this frame
+            At(EnumRenderStage.Opaque, 2500);
+            At(EnumRenderStage.Ortho, 9000);
+            ts[GpuFrameTimer.EndSlot] = 9300; st[GpuFrameTimer.EndSlot] = true;
+            var ns = new long[FrameStats.StageCount];
+            GpuFrameTimer.Intervals(ts, st, ns);
+            if (ns[(int)EnumRenderStage.Before] != 600 || ns[(int)EnumRenderStage.ShadowNear] != 900
+                || ns[(int)EnumRenderStage.Opaque] != 6500 || ns[(int)EnumRenderStage.Ortho] != 300
+                || ns[(int)EnumRenderStage.ShadowFar] != 0 || ns[(int)EnumRenderStage.OIT] != 0)
+                throw new Exception($"intervals: before {ns[0]}, near {ns[(int)EnumRenderStage.ShadowNear]}, opaque {ns[(int)EnumRenderStage.Opaque]}, ortho {ns[(int)EnumRenderStage.Ortho]}");
+            long sum = 0; foreach (var v in ns) sum += v;
+            if (sum != 8300) throw new Exception($"stages must sum to the span, got {sum}");
+            // a frame without an end stamp leaves its last stage open - zero, not garbage
+            st[GpuFrameTimer.EndSlot] = false;
+            GpuFrameTimer.Intervals(ts, st, ns);
+            if (ns[(int)EnumRenderStage.Ortho] != 0) throw new Exception("no end stamp, no last interval");
+            // the stage hook is wired where the CPU stage clock starts, and is harmless off
+            GpuFrameTimer.Enabled = false;
+            GpuFrameTimer.StageBegin(EnumRenderStage.Before);
+            GpuFrameTimer.Reset();
+        });
+
+        Check("an ortho-heavy hitch names the open dialogs", () =>
+        {
+            // "ortho 2645,2 | gc 879,6" standing still with nothing in the log beside it:
+            // the GUI cost has to carry the name of the dialog that was open.
+            FrameStats.Reset();
+            HitchLog.Reset();
+            HitchLog.MinMs = 15;
+            HitchLog.Factor = 2.0;
+            string logged = null;
+            HitchLog.Log = line => logged = line;
+            try
+            {
+                long msTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+                long clock = 555555555;
+                void Boundary(string dialogs)
+                {
+                    HitchLog.NotePaused(false);
+                    if (HitchLog.PendingWantsDialogs) HitchLog.NoteDialogs(dialogs);
+                    HitchLog.NoteCamera(0, 0, 0, 0, 0);
+                }
+                FrameStats.Advance(clock, 0); Boundary("GuiDialogWorldMap");
+                for (var i = 0; i < 40; i++) { clock += 10 * msTicks; FrameStats.Advance(clock, 0); Boundary("GuiDialogWorldMap"); }
+                if (HitchLog.PendingWantsDialogs) throw new Exception("nothing pending, nothing wanted");
+                // an ortho frame: 60 ms, of which 50 in the GUI stage
+                FrameStats.AddStageTicks((int)EnumRenderStage.Ortho, 50 * msTicks);
+                clock += 60 * msTicks; FrameStats.Advance(clock, 0);
+                if (!HitchLog.PendingWantsDialogs) throw new Exception("an ortho hitch must want its dialogs");
+                Boundary("GuiDialogWorldMap,GuiDialogHandbook");
+                if (HitchLog.TotalHitches != 1 || logged == null || !logged.Contains("| dialoge GuiDialogWorldMap,GuiDialogHandbook"))
+                    throw new Exception("hitch line: " + logged);
+                // an opaque hitch with the same dialogs open says nothing about them
+                logged = null;
+                FrameStats.AddStageTicks((int)EnumRenderStage.Opaque, 50 * msTicks);
+                clock += 60 * msTicks; FrameStats.Advance(clock, 0);
+                if (HitchLog.PendingWantsDialogs) throw new Exception("an opaque hitch must not ask for dialogs");
+                Boundary("GuiDialogWorldMap");
+                if (logged == null || logged.Contains("dialoge")) throw new Exception("second line: " + logged);
+            }
+            finally
+            {
+                HitchLog.Log = null;
+                HitchLog.Reset();
+                FrameStats.Reset();
+            }
+        });
+
+        Check("the patch guard names foreign patches on komet's targets and on komet's own code", () =>
+        {
+            // Three foreign patches, three different verdicts: a cancelling prefix on a method
+            // komet only measures (mittel), a transpiler on a method komet transpiles (hoch),
+            // a postfix on komet's own code (hoch). Each is reported once; a rescan without
+            // change reports nothing; unpatching empties the list.
+            PatchGuard.Reset();
+            var warnings = new List<string>();
+            PatchGuard.Warn = warnings.Add;
+            PatchGuard.Scan();
+            if (PatchGuard.Findings.Count != 0)
+                throw new Exception("the harness's own id must count as komet's: " + PatchGuard.Format(PatchGuard.Findings[0]));
+
+            var other = new Harmony("other.mod");
+            // a method komet only MEASURES (relight prefix/postfix) - on TriggerRenderStage komet
+            // itself has a cancelling prefix (the shadow throttle), which the guard rightly
+            // rates 'hoch' against another cancelling prefix
+            var stage = AccessTools.Method(typeof(Vintagestory.Client.NoObf.TerrainIlluminator), "SunRelightChunk",
+                [typeof(Vintagestory.Client.NoObf.ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)]);
+            var renderFrame = AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientPlatformWindows), "window_RenderFrame");
+            var ownCode = AccessTools.Method(typeof(WorkerSet), nameof(WorkerSet.AutoThreads), [typeof(int)]);
+            try
+            {
+                other.Patch(stage, prefix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(ForeignCancellingPrefix))) { priority = HarmonyLib.Priority.High });
+                other.Patch(renderFrame, transpiler: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(ForeignTranspiler))));
+                other.Patch(ownCode, postfix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(ForeignPostfix))));
+
+                var fresh = PatchGuard.Scan();
+                if (fresh != 3 || PatchGuard.Findings.Count != 3)
+                    throw new Exception($"{fresh} new / {PatchGuard.Findings.Count} findings, expected 3/3");
+                if (warnings.Count != 3) throw new Exception($"{warnings.Count} warnings logged, expected one per finding");
+
+                PatchGuard.Finding Of(string target)
+                {
+                    foreach (var f in PatchGuard.Findings) if (f.Target == target) return f;
+                    throw new Exception("no finding for " + target);
+                }
+                var pre = Of("TerrainIlluminator.SunRelightChunk");
+                if (pre.Owner != "other.mod" || pre.Kind != "prefix(abbrechend)" || !pre.CanSkipOriginal || pre.Priority != HarmonyLib.Priority.High)
+                    throw new Exception("cancelling prefix misdescribed: " + PatchGuard.Format(pre));
+                if (pre.Severity != PatchGuard.Severity.Mittel || !pre.Ours.Contains("postfix"))
+                    throw new Exception("a cancelling prefix on a measured method is 'mittel': " + PatchGuard.Format(pre));
+                // the measurement prefix sits at Priority.First, so even a foreign High prefix runs after it
+                if (pre.RunsBeforeOurs) throw new Exception("a foreign Priority.High prefix must be ordered AFTER komet's Priority.First measurement prefix");
+
+                var tr = Of("ClientPlatformWindows.window_RenderFrame");
+                if (tr.Kind != "transpiler" || tr.Severity != PatchGuard.Severity.Hoch || !tr.Ours.Contains("transpiler"))
+                    throw new Exception("transpiler collision misdescribed: " + PatchGuard.Format(tr));
+
+                var own = Of("WorkerSet.AutoThreads");
+                if (!own.OnKometCode || own.Severity != PatchGuard.Severity.Hoch || own.Kind != "postfix")
+                    throw new Exception("patch on komet code misdescribed: " + PatchGuard.Format(own));
+
+                if (PatchGuard.Scan() != 0) throw new Exception("an unchanged registry reported new findings");
+                if (warnings.Count != 3) throw new Exception("a rescan logged again");
+                var report = PatchGuard.ReportLines();
+                if (!report.Contains("patch-kollisionen: 3 (2 hoch, 1 mittel, 0 info)"))
+                    throw new Exception("report summary wrong:\n" + report);
+
+                // the classification rule on its own: a cancelling prefix against komet's own
+                // cancelling prefix is the dangerous case, a plain postfix is information
+                var f1 = new PatchGuard.Finding { Kind = "prefix(abbrechend)", RunsBeforeOurs = true };
+                PatchGuard.Classify(f1, ourPrefixCanSkip: true, ourTranspiler: false);
+                if (f1.Severity != PatchGuard.Severity.Hoch || !f1.Why.Contains("VOR")) throw new Exception("two cancelling prefixes must be 'hoch' and say who runs first");
+                var f2 = new PatchGuard.Finding { Kind = "postfix" };
+                PatchGuard.Classify(f2, ourPrefixCanSkip: true, ourTranspiler: true);
+                if (f2.Severity != PatchGuard.Severity.Info) throw new Exception("a foreign postfix is information");
+                var f3 = new PatchGuard.Finding { Kind = "transpiler" };
+                PatchGuard.Classify(f3, ourPrefixCanSkip: false, ourTranspiler: false);
+                if (f3.Severity != PatchGuard.Severity.Mittel) throw new Exception("a transpiler under komet's prefix/postfix is 'mittel'");
+
+                // A plain foreign postfix on a method komet only MEASURES is information: it
+                // goes to the notification log, never the warning log (SheyderMod's wide-shape
+                // relight on AddJsonModelDataToMesh landed in "Captured 2 issues during
+                // startup" for nothing), and the line says so.
+                var notes = new List<string>();
+                PatchGuard.Notify = notes.Add;
+                var json = AccessTools.Method(typeof(Vintagestory.Client.NoObf.JsonTesselator), "AddJsonModelDataToMesh",
+                    [typeof(MeshData), typeof(int), typeof(Vintagestory.Client.NoObf.TCTCache), typeof(IMeshPoolSupplier),
+                     typeof(float[]), typeof(Vintagestory.Client.NoObf.IJsonTesselatorHooks), typeof(int)]);
+                other.Patch(json, postfix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(ForeignPostfix))));
+                if (PatchGuard.Scan() != 1) throw new Exception("the measurement-only target must report once");
+                var info = Of("JsonTesselator.AddJsonModelDataToMesh");
+                if (info.Severity != PatchGuard.Severity.Info || !info.MeasurementOnly || !info.Ours.Contains("prefix+postfix"))
+                    throw new Exception("measurement-only finding misdescribed: " + PatchGuard.Format(info));
+                if (warnings.Count != 3) throw new Exception("an info finding must not warn");
+                if (notes.Count != 1 || !notes[0].Contains("messklammer") || !notes[0].Contains("nichts zu entscheiden"))
+                    throw new Exception("info must be notified, naming the bracket: " + string.Join(" | ", notes));
+                // a method komet also CHANGES is not measurement-only: SunRelightChunk carries the
+                // window prebuilder's postfix next to the timing bracket. The swap transpiler on
+                // window_RenderFrame IS a bracket (it wraps SwapBuffers in a clock), so that one is.
+                if (pre.MeasurementOnly) throw new Exception("SunRelightChunk has the prebuilder's postfix, not measurement-only");
+                var tr2 = Of("ClientPlatformWindows.window_RenderFrame");
+                if (!tr2.MeasurementOnly) throw new Exception("the swap clock transpiler is a measurement bracket");
+                if (!PatchGuard.ReportLines().Contains("patch-kollisionen: 4 (2 hoch, 1 mittel, 1 info)"))
+                    throw new Exception("report summary wrong:\n" + PatchGuard.ReportLines());
+            }
+            finally
+            {
+                other.UnpatchAll("other.mod");
+                PatchGuard.Warn = null;
+                PatchGuard.Notify = null;
+            }
+            PatchGuard.Scan();
+            if (PatchGuard.Findings.Count != 0) throw new Exception("after unpatching nothing may remain: " + PatchGuard.ReportLines());
+            PatchGuard.Reset();
+        });
+
+        if (!fingerprintMode)
+        Check("the engine fingerprint matches the game on disk (else: ./build.sh fingerprint)", () =>
+        {
+            // Last, because every earlier check has applied its patches by now - the set the
+            // mod hashes at world start is the set this suite patched.
+            if (!EngineFingerprint.Generated)
+                throw new Exception("src/EngineFingerprint.g.cs is the bootstrap stub - run ./build.sh fingerprint");
+            if (EngineFingerprint.GameVersion != Vintagestory.API.Config.GameVersion.ShortGameVersion)
+                throw new Exception($"fingerprint is for {EngineFingerprint.GameVersion}, the game is {Vintagestory.API.Config.GameVersion.ShortGameVersion} - run ./build.sh fingerprint");
+
+            var targets = GameTargets();
+            if (targets.Count < 40) throw new Exception($"only {targets.Count} patched engine methods found - the suite did not apply its patches?");
+            var table = new Dictionary<string, string>();
+            foreach (var (key, hash) in EngineFingerprint.Methods) table[key] = hash;
+            var missing = new List<string>();
+            var changed = new List<string>();
+            foreach (var m in targets)
+            {
+                var key = PatchGuard.KeyOf(m);
+                if (!table.TryGetValue(key, out var want)) { missing.Add(PatchGuard.ShortName(m)); continue; }
+                if (PatchGuard.FingerprintOf(m) != want) changed.Add(PatchGuard.ShortName(m));
+            }
+            if (missing.Count > 0 || changed.Count > 0)
+                throw new Exception($"{missing.Count} patched methods without fingerprint ({string.Join(", ", missing.GetRange(0, Math.Min(5, missing.Count)))}), "
+                    + $"{changed.Count} changed ({string.Join(", ", changed.GetRange(0, Math.Min(5, changed.Count)))}) - run ./build.sh fingerprint");
+
+            // hashing is stable and tells methods apart
+            var a = PatchGuard.FingerprintOf(targets[0]);
+            if (a == null || a != PatchGuard.FingerprintOf(targets[0])) throw new Exception("fingerprint is not stable");
+            if (a == PatchGuard.FingerprintOf(targets[1])) throw new Exception("two different methods hash the same");
+
+            // the runtime path: same table, same methods, no drift, and the mutation counter-check
+            var notes = new List<string>();
+            PatchGuard.Notify = notes.Add;
+            PatchGuard.Warn = notes.Add;
+            try
+            {
+                PatchGuard.CheckEngine("test");
+                if (PatchGuard.Drifts.Count != 0 || PatchGuard.ForeignAssemblies.Count != 0 || PatchGuard.MethodsChecked < 40)
+                    throw new Exception("live engine check disagrees with the file: " + PatchGuard.EngineSummary);
+                if (!PatchGuard.EngineSummary.Contains("unveraendert")) throw new Exception("all-clear summary wrong: " + PatchGuard.EngineSummary);
+
+                var idx = -1;
+                for (var i = 0; i < EngineFingerprint.Methods.Length; i++)
+                    if (EngineFingerprint.Methods[i].key == PatchGuard.KeyOf(targets[0])) { idx = i; break; }
+                if (idx < 0) throw new Exception("first target not in the table");
+                var saved = EngineFingerprint.Methods[idx];
+                EngineFingerprint.Methods[idx] = (saved.key, "00000000deadbeef");
+                try
+                {
+                    PatchGuard.CheckEngine("test");
+                    if (PatchGuard.Drifts.Count != 1 || PatchGuard.Drifts[0].Target != PatchGuard.ShortName(targets[0]))
+                        throw new Exception("a changed method must be named: " + PatchGuard.EngineSummary);
+                    if (!PatchGuard.EngineSummary.Contains("VERAENDERT")) throw new Exception("drift summary wrong: " + PatchGuard.EngineSummary);
+                }
+                finally
+                {
+                    EngineFingerprint.Methods[idx] = saved;
+                }
+            }
+            finally
+            {
+                PatchGuard.Notify = null;
+                PatchGuard.Warn = null;
+                PatchGuard.Reset();
+            }
+        });
+
+        if (fingerprintMode)
+        {
+            if (failures > 0)
+            {
+                Console.WriteLine($"\n{failures} check(s) failed - the patch set is incomplete, fingerprint NOT written");
+                return 1;
+            }
+            var n = WriteFingerprint(fingerprintPath);
+            Console.WriteLine($"\nwrote {fingerprintPath}: {n} patched engine methods, game {Vintagestory.API.Config.GameVersion.ShortGameVersion}");
+            return 0;
+        }
+
         Console.WriteLine(failures == 0 ? "\nall checks passed" : $"\n{failures} check(s) failed");
         return failures == 0 ? 0 : 1;
     }
 
     /// <summary>Records that it was called, so dispatch order and count can be checked.</summary>
+    /// <summary>A named, slow tick listener: gives the tick profiler a method to name.</summary>
+    private sealed class TickProbe
+    {
+        public int Calls;
+        public void Slow(float dt)
+        {
+            Calls++;
+            BusyWait(1.5);
+        }
+    }
+
+    /// <summary>Burns the given milliseconds on the calling thread - a measurable task.</summary>
+    private static void BusyWait(double ms)
+    {
+        long until = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(ms / 1000.0 * System.Diagnostics.Stopwatch.Frequency);
+        while (System.Diagnostics.Stopwatch.GetTimestamp() < until) { }
+    }
+
     private sealed class RecordingRenderer : IRenderer
     {
         private readonly List<string> log;
@@ -4231,6 +5549,116 @@ internal static class Program
         Mat4d.LookAt(view, new double[] { 0, 140, 0 }, new double[] { 100, 130, 0 }, new double[] { 0, 1, 0 });
         culler.CalcFrustumEquations(new BlockPos(0, 140, 0, 0), proj, view);
         return culler;
+    }
+
+    /// <summary>
+    /// Stands in for an engine build whose ChunkTesselator carries two overloads of
+    /// populateTesselatedChunkPart, one routed through the other. NoInlining, so Harmony's
+    /// detour on the inner overload is what the outer one calls.
+    /// </summary>
+    private static class OverloadedTesselator
+    {
+        public static byte[] Sink;
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        public static int Populate(int parts)
+        {
+            Sink = new byte[256 * 1024]; // large-object heap: allocated outright, no allocation-context slack
+            return parts;
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        public static int Populate(int parts, string via)
+        {
+            return Populate(parts) + (via?.Length ?? 0) * 0;
+        }
+    }
+
+    public static byte[] AllocSink;
+
+    // ---- patch guard fixtures ----
+    public static bool ForeignCancellingPrefix() => true;
+    public static void ForeignPostfix() { }
+    public static IEnumerable<CodeInstruction> ForeignTranspiler(IEnumerable<CodeInstruction> instructions) => instructions;
+
+    // ---- bracket order fixture -------------------------------------------------------------
+    public static readonly List<string> BracketLog = new();
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void BracketTarget() => BracketLog.Add("original");
+    public static void OurBracketPrefix() => BracketLog.Add("komet-prefix");
+    public static void OurBracketPostfix() => BracketLog.Add("komet-postfix");
+    public static void TheirBracketPrefix() => BracketLog.Add("other-prefix");
+    public static void TheirBracketPostfix() => BracketLog.Add("other-postfix");
+
+    /// <summary>Stands in for a server-side sender of single-block packets.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void SnowMeltStorm(int n)
+    {
+        for (var i = 0; i < n; i++) PacketSourcePatches.SendPrefix(true);
+    }
+
+    private static bool IsGameAssembly(System.Reflection.Assembly asm)
+    {
+        if (asm == null || asm == typeof(Program).Assembly) return false;
+        var name = asm.GetName().Name ?? "";
+        return name.StartsWith("Vintagestory", StringComparison.Ordinal) || name.StartsWith("VS", StringComparison.Ordinal);
+    }
+
+    /// <summary>Every engine method a komet id has patched in this process, in key order.</summary>
+    private static List<MethodBase> GameTargets()
+    {
+        var list = new List<MethodBase>();
+        foreach (var m in Harmony.GetAllPatchedMethods())
+        {
+            if (!IsGameAssembly(m.DeclaringType?.Assembly)) continue;
+            var info = Harmony.GetPatchInfo(m);
+            if (info == null) continue;
+            var ours = false;
+            foreach (var o in info.Owners) if (PatchGuard.IsOwn(o)) { ours = true; break; }
+            if (ours) list.Add(m);
+        }
+        list.Sort((x, y) => string.CompareOrdinal(PatchGuard.KeyOf(x), PatchGuard.KeyOf(y)));
+        return list;
+    }
+
+    /// <summary>
+    /// Writes src/EngineFingerprint.g.cs: the game version, the module ids of the assemblies
+    /// the targets live in, and one (key, hash) per patched engine method. Generated from the
+    /// live assemblies the suite just patched, so it cannot drift from what verify tested.
+    /// </summary>
+    private static int WriteFingerprint(string path)
+    {
+        var targets = GameTargets();
+        var assemblies = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        var sb = new System.Text.StringBuilder(16384);
+        sb.Append("// <auto-generated>\n");
+        sb.Append("// Written by KometVerify fingerprint (./build.sh fingerprint). Do not edit.\n");
+        sb.Append("// One entry per engine method the patches touch: FNV-1a over opcodes and resolved\n");
+        sb.Append("// operands (PatchGuard.FingerprintOf). The mod compares these at world start.\n");
+        sb.Append("// </auto-generated>\n");
+        sb.Append("namespace Komet;\n\n");
+        sb.Append("internal static class EngineFingerprint\n{\n");
+        sb.Append("    public const bool Generated = true;\n");
+        sb.Append("    public const string GameVersion = \"").Append(Vintagestory.API.Config.GameVersion.ShortGameVersion).Append("\";\n");
+        var rows = new List<string>(targets.Count);
+        foreach (var m in targets)
+        {
+            var hash = PatchGuard.FingerprintOf(m);
+            if (hash == null) continue;
+            var asm = m.DeclaringType.Assembly;
+            assemblies[asm.GetName().Name] = asm.ManifestModule.ModuleVersionId.ToString("D");
+            rows.Add("        (\"" + PatchGuard.KeyOf(m).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\", \"" + hash + "\"),\n");
+        }
+        sb.Append("    public static readonly (string name, string mvid)[] Assemblies =\n    {\n");
+        foreach (var kv in assemblies) sb.Append("        (\"").Append(kv.Key).Append("\", \"").Append(kv.Value).Append("\"),\n");
+        sb.Append("    };\n");
+        sb.Append("    public static readonly (string key, string hash)[] Methods =\n    {\n");
+        foreach (var r in rows) sb.Append(r);
+        sb.Append("    };\n}\n");
+        var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
+        System.IO.File.WriteAllText(path, sb.ToString());
+        return rows.Count;
     }
 
     /// <summary>Minimal concrete AnimatorBase so the ctor patch and OnFrame can be exercised.</summary>
