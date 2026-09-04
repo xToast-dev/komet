@@ -198,19 +198,29 @@ EOF
     # the repository: writing it into a tracked file would change the commit and with it the
     # checksum. So moddb/ holds the template and the finished text is written here, next to
     # the files it describes.
-    CHANGELOG="moddb/changelog-${VERSION}.html"
-    if [[ -f "$CHANGELOG" ]]; then
+    CHANGELOG=""
+    for candidate in "moddb/changelog-${VERSION}.html" "moddb/changelog-${VERSION}.md"; do
+      [[ -f "$candidate" ]] && CHANGELOG="$candidate"
+    done
+    if [[ -n "$CHANGELOG" ]]; then
       sed -e "s|{{SHA256_KOMET}}|$(cut -d' ' -f1 < "dist/$ZIP.sha256")|g" \
           -e "s|{{SHA256_BASELINE}}|$(cut -d' ' -f1 < "dist/$B_ZIP.sha256")|g" \
           -e "s|{{COMMIT}}|$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)|g" \
-          "$CHANGELOG" > "dist/changelog-${VERSION}.html"
+          "$CHANGELOG" > "dist/$(basename "$CHANGELOG")"
+      FILLED="dist/$(basename "$CHANGELOG")"
+    else
+      FILLED=""
     fi
 
     echo
     echo "== sha256 (for the ModDB page) =="
     cat "dist/$ZIP.sha256" "dist/$B_ZIP.sha256"
-    [[ -f "dist/changelog-${VERSION}.html" ]] \
-      && echo "changelog with those checksums filled in: dist/changelog-${VERSION}.html"
+    if [[ -n "$FILLED" ]]; then
+      echo "changelog with those checksums filled in: $FILLED"
+    else
+      # Silence here would mean uploading a page whose checksum belongs to an older build.
+      echo "note: no moddb/changelog-${VERSION}.{html,md} - nothing to fill the checksums into"
+    fi
     ;;
   deploy)
     # Die Mod hiess bis 1.51.8 VsPerf - eine liegengebliebene alte DLL wuerde doppelt laden.
