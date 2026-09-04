@@ -15,13 +15,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../src/FastCuller.cs" />
-    <Compile Include="../src/WorkerSet.cs" />
-    <Compile Include="../src/CpuTopology.cs" />
-    <Compile Include="../src/CullVerifier.cs" />
-    <Compile Include="../src/RayTraversal.cs" />
-    <Compile Include="../shared/FrameStats.cs" />
-    <Compile Include="../shared/HitchLog.cs" />
+    <Compile Include="../Culling/FastCuller.cs" />
+    <Compile Include="../Runtime/WorkerSet.cs" />
+    <Compile Include="../Runtime/CpuTopology.cs" />
+    <Compile Include="../Culling/CullVerifier.cs" />
+    <Compile Include="../Culling/RayTraversal.cs" />
+    <Compile Include="../Measure/FrameStats.cs" />
+    <Compile Include="../Measure/HitchLog.cs" />
   </ItemGroup>
 
   <ItemGroup>

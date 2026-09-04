@@ -1,8 +1,8 @@
 using System;
 using HarmonyLib;
+using Komet.Measure;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Komet.Measure;
 
 namespace KometBaseline;
 

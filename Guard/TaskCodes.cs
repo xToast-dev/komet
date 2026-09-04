@@ -5,7 +5,7 @@ using System.Globalization;
 using System.Reflection;
 using HarmonyLib;
 
-namespace Komet;
+namespace Komet.Guard;
 
 /// <summary>
 /// Gives the main-thread task codes a readable name. The engine labels a packet's handler

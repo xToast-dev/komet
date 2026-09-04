@@ -4,13 +4,16 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet;
+using Komet.Culling;
+using Komet.Guard;
+using Komet.Measure;
+using Komet.Patches;
+using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
-using Komet;
-using Komet.Patches;
-using Komet.Measure;
 
 // Applies the real Harmony patches to the real game assemblies outside the game and checks
 // that (a) each patch applies, (b) the patched IL actually JITs, (c) behaviour is unchanged.
@@ -57,7 +60,7 @@ internal static class Program
         // engine methods into the source file the mod compiles in. The staleness check below
         // is skipped in this mode - it is the thing being regenerated.
         var fingerprintMode = argv.Length > 1 && argv[1] == "fingerprint";
-        var fingerprintPath = argv.Length > 2 ? argv[2] : "src/EngineFingerprint.g.cs";
+        var fingerprintPath = argv.Length > 2 ? argv[2] : "Guard/EngineFingerprint.cs";
 
         // The strict tests compare byte-identical against vanilla; gap bridging deviates on
         // purpose and has its own test, which flips this on locally and restores it.
@@ -426,16 +429,16 @@ internal static class Program
 
             // the HUD tail ranks the same data: the spike's stage first
             string tail = DebugHud.WorstFrameTail();
-            if (tail == null || !tail.StartsWith("schatten 30"))
+            if (tail == null || !tail.StartsWith("shadow 30"))
                 throw new Exception($"HUD tail '{tail}' does not lead with the spike");
             if (!tail.Contains("gc 6"))
                 throw new Exception($"HUD tail '{tail}' lost the GC pause");
             // the outside bucket splits into swap and the rest - both must carry their share,
             // and neither may double-count the other
             if (!tail.Contains("tick 8"))
-                throw new Exception($"HUD tail '{tail}' should rank tick (8) over swap (4) and draussen (6)");
-            if (!tail.Contains("draussen 6"))
-                throw new Exception($"HUD tail '{tail}' - draussen must be outside minus swap (6), not the whole outside");
+                throw new Exception($"HUD tail '{tail}' should rank tick (8) over swap (4) and outside (6)");
+            if (!tail.Contains("outside 6"))
+                throw new Exception($"HUD tail '{tail}' - outside must be outside minus swap (6), not the whole thing");
 
             // a later, bigger spike replaces the snapshot even inside the same peak window
             Frame(60, 45, 1, 2, 0);
@@ -606,7 +609,7 @@ internal static class Program
 
             // the report is chat-bound: VTML parses angle brackets, so none may appear
             string report = HitchLog.BuildReport();
-            if (!report.Contains("beim drehen") || !report.Contains("opaque"))
+            if (!report.Contains("while turning") || !report.Contains("opaque"))
                 throw new Exception("report is missing its aggregates");
             if (report.Contains("<") || report.Contains(">"))
                 throw new Exception("VTML-unsafe angle bracket in the report");
@@ -1009,6 +1012,7 @@ internal static class Program
             // rest go back in order, exactly once
             MainThreadTaskPatches.Reset();
             MainThreadTaskPatches.BudgetMs = 2.0;
+            MainThreadTaskPatches.WorldReady = true;
             var order = new List<int>();
             var q = new Queue<ClientTask>();
             for (int i = 0; i < 20; i++) { int id = i; q.Enqueue(new ClientTask { Code = "t", Action = () => { order.Add(id); BusyWait(0.5); } }); }
@@ -1026,6 +1030,33 @@ internal static class Program
             for (int i = 0; i < 20; i++) { int id = i; q.Enqueue(new ClientTask { Code = "t", Action = () => { order.Add(id); BusyWait(0.5); } }); }
             MainThreadTaskPatches.RunTasks(q, () => false, () => requeued++, null);
             if (order.Count != 20 || requeued != 1) throw new Exception("without a budget the whole burst must run");
+            MainThreadTaskPatches.BudgetMs = 3.0;
+            MainThreadTaskPatches.Reset();
+            MainThreadTaskPatches.WorldReady = false;
+        });
+
+        Check("the drain is unbudgeted until LevelFinalize (a join must not render half-built)", () =>
+        {
+            // 1.2.0-pre.2: the join queue was spread over frames, so a registered renderer
+            // (WeatherSystemClient) ran a frame before the LevelFinalize task built its state.
+            MainThreadTaskPatches.Reset();
+            MainThreadTaskPatches.BudgetMs = 2.0;
+            MainThreadTaskPatches.WorldReady = false;
+            var ran = 0;
+            var q = new Queue<ClientTask>();
+            for (int i = 0; i < 20; i++) q.Enqueue(new ClientTask { Code = "readpacket6", Action = () => { ran++; BusyWait(0.5); } });
+            int requeued = 0;
+            MainThreadTaskPatches.RunTasks(q, () => false, () => { requeued++; q.Clear(); }, null);
+            if (ran != 20 || requeued != 0 || MainThreadTaskPatches.StatBudgetCuts != 0)
+                throw new Exception($"join drain cut short: ran {ran}, requeued {requeued}, cuts {MainThreadTaskPatches.StatBudgetCuts}");
+
+            // and it starts budgeting once the world is up, then goes back to vanilla on leave
+            MainThreadTaskPatches.WorldReady = true;
+            for (int i = 0; i < 20; i++) q.Enqueue(new ClientTask { Code = "t", Action = () => BusyWait(0.5) });
+            MainThreadTaskPatches.RunTasks(q, () => false, () => { requeued++; q.Clear(); }, null);
+            if (requeued != 1) throw new Exception("a world that is up must budget its drain");
+            MainThreadTaskPatches.Detach();
+            if (MainThreadTaskPatches.WorldReady) throw new Exception("world leave must clear WorldReady");
             MainThreadTaskPatches.BudgetMs = 3.0;
             MainThreadTaskPatches.Reset();
         });
@@ -1335,7 +1366,7 @@ internal static class Program
             string text = DebugHud.Compose("test", 1234, 1536, 64 * 1048576, 120, 0.07f, 41024, null);
             string[] lines = text.Split('\n');
             if (lines.Length < 20) throw new Exception($"only {lines.Length} lines");
-            foreach (string needle in new[] { "fps", "game tick", "opaque", "schatten", "draw calls", "terrain vram", "sichtweite" })
+            foreach (string needle in new[] { "fps", "game tick", "opaque", "shadow", "draw calls", "terrain vram", "view distance" })
                 if (!text.Contains(needle)) throw new Exception($"missing '{needle}'");
             // every line must be non-empty - blank lines were the original complaint
             foreach (string line in lines)
@@ -3265,11 +3296,11 @@ internal static class Program
 
             string rep2 = StressTest.BuildReport(split, plan, sys);
             // a: swap 3.5 vs (1+1.5)/2 = 1.25 -> +2.25; 4.5 vs (2+2.5)/2 = 2.25 -> +2.25
-            string wantSplit = "[swap +" + 2.25.ToString("F2", ci) + ", schatten -" + 0.4.ToString("F2", ci) + "]";
+            string wantSplit = "[swap +" + 2.25.ToString("F2", ci) + ", shadow -" + 0.4.ToString("F2", ci) + "]";
             if (!rep2.Contains(wantSplit))
                 throw new Exception($"swap/shadow split wrong (want '{wantSplit}'):\n{rep2}");
             // b costs nothing anywhere - the split must not invent a delta from the drift
-            string wantQuiet = "[swap +" + 0.0.ToString("F2", ci) + ", schatten +" + 0.0.ToString("F2", ci) + "]";
+            string wantQuiet = "[swap +" + 0.0.ToString("F2", ci) + ", shadow +" + 0.0.ToString("F2", ci) + "]";
             if (!rep2.Contains(wantQuiet))
                 throw new Exception($"drift leaked into b's split (want '{wantQuiet}'):\n{rep2}");
 
@@ -3289,7 +3320,7 @@ internal static class Program
                 StressTest.Tick(tf, costing ? 3.0 : 1.0, 0.5);
             }
             if (StressTest.Running) { StressTest.Stop("test"); throw new Exception("split run did not finish"); }
-            string wantRun = "[swap +" + 2.0.ToString("F2", ci) + ", schatten +" + 0.0.ToString("F2", ci) + "]";
+            string wantRun = "[swap +" + 2.0.ToString("F2", ci) + ", shadow +" + 0.0.ToString("F2", ci) + "]";
             if (splitReport == null || !splitReport.Contains(wantRun))
                 throw new Exception($"live swap accounting wrong (want '{wantRun}'):\n{splitReport}");
 
@@ -3436,6 +3467,22 @@ internal static class Program
                 throw new Exception("refused although the budget is not spent");
             if (EntityTessPatches.ShouldTesselate(spentMs: 2.1, allowedCount: 1, budgetMs: 2))
                 throw new Exception("allowed although the budget is spent");
+
+            // The window is reset by the frame boundary and by nothing else. Should that event
+            // ever stop arriving while the patch is applied, the spent milliseconds would stay
+            // above the budget forever and EVERY entity shape would be skipped from then on -
+            // "all animals are invisible". A window this old therefore counts as no window.
+            long second = System.Diagnostics.Stopwatch.Frequency;
+            long staleTicks = (long)(EntityTessPatches.StaleAfterMs / 1000.0 * second) + second / 100;
+            if (!EntityTessPatches.WindowStale(second, 0))
+                throw new Exception("no boundary seen yet must count as stale");
+            if (EntityTessPatches.WindowStale(second + second / 100, second))
+                throw new Exception("a boundary 10 ms ago is a live window");
+            if (!EntityTessPatches.WindowStale(second + staleTicks, second))
+                throw new Exception("a window without a boundary must reopen itself, never block for good");
+            if (!EntityLoadPatches.DrainStale(second, 0) || EntityLoadPatches.DrainStale(second + second / 100, second)
+                || !EntityLoadPatches.DrainStale(second + staleTicks, second))
+                throw new Exception("the entity load drain needs the same fallback: held entities must not strand");
 
             // the patch really lands on VSEssentials' renderer, and only on the base method -
             // EntityPlayerShapeRenderer overrides TesselateShape() without calling base, which
@@ -5149,38 +5196,58 @@ internal static class Program
                     throw new Exception("no finding for " + target);
                 }
                 var pre = Of("TerrainIlluminator.SunRelightChunk");
-                if (pre.Owner != "other.mod" || pre.Kind != "prefix(abbrechend)" || !pre.CanSkipOriginal || pre.Priority != HarmonyLib.Priority.High)
+                if (pre.Owner != "other.mod" || pre.Kind != "prefix(cancelling)" || !pre.CanSkipOriginal || pre.Priority != HarmonyLib.Priority.High)
                     throw new Exception("cancelling prefix misdescribed: " + PatchGuard.Format(pre));
-                if (pre.Severity != PatchGuard.Severity.Mittel || !pre.Ours.Contains("postfix"))
+                if (pre.Severity != PatchGuard.Severity.Medium || !pre.Ours.Contains("postfix"))
                     throw new Exception("a cancelling prefix on a measured method is 'mittel': " + PatchGuard.Format(pre));
                 // the measurement prefix sits at Priority.First, so even a foreign High prefix runs after it
                 if (pre.RunsBeforeOurs) throw new Exception("a foreign Priority.High prefix must be ordered AFTER komet's Priority.First measurement prefix");
 
                 var tr = Of("ClientPlatformWindows.window_RenderFrame");
-                if (tr.Kind != "transpiler" || tr.Severity != PatchGuard.Severity.Hoch || !tr.Ours.Contains("transpiler"))
+                if (tr.Kind != "transpiler" || tr.Severity != PatchGuard.Severity.High || !tr.Ours.Contains("transpiler"))
                     throw new Exception("transpiler collision misdescribed: " + PatchGuard.Format(tr));
 
                 var own = Of("WorkerSet.AutoThreads");
-                if (!own.OnKometCode || own.Severity != PatchGuard.Severity.Hoch || own.Kind != "postfix")
+                if (!own.OnKometCode || own.Severity != PatchGuard.Severity.High || own.Kind != "postfix")
                     throw new Exception("patch on komet code misdescribed: " + PatchGuard.Format(own));
 
                 if (PatchGuard.Scan() != 0) throw new Exception("an unchanged registry reported new findings");
                 if (warnings.Count != 3) throw new Exception("a rescan logged again");
                 var report = PatchGuard.ReportLines();
-                if (!report.Contains("patch-kollisionen: 3 (2 hoch, 1 mittel, 0 info)"))
+                if (!report.Contains("patch collisions: 3 (2 high, 1 medium, 0 info)"))
                     throw new Exception("report summary wrong:\n" + report);
 
                 // the classification rule on its own: a cancelling prefix against komet's own
                 // cancelling prefix is the dangerous case, a plain postfix is information
-                var f1 = new PatchGuard.Finding { Kind = "prefix(abbrechend)", RunsBeforeOurs = true };
+                var f1 = new PatchGuard.Finding { Kind = "prefix(cancelling)", RunsBeforeOurs = true };
                 PatchGuard.Classify(f1, ourPrefixCanSkip: true, ourTranspiler: false);
-                if (f1.Severity != PatchGuard.Severity.Hoch || !f1.Why.Contains("VOR")) throw new Exception("two cancelling prefixes must be 'hoch' and say who runs first");
+                if (f1.Severity != PatchGuard.Severity.High || !f1.Why.Contains("BEFORE")) throw new Exception("two cancelling prefixes must be 'high' and say who runs first");
                 var f2 = new PatchGuard.Finding { Kind = "postfix" };
-                PatchGuard.Classify(f2, ourPrefixCanSkip: true, ourTranspiler: true);
-                if (f2.Severity != PatchGuard.Severity.Info) throw new Exception("a foreign postfix is information");
+                PatchGuard.Classify(f2, ourPrefixCanSkip: false, ourTranspiler: true);
+                if (f2.Severity != PatchGuard.Severity.Info) throw new Exception("a foreign postfix next to a patch that keeps the original is information");
                 var f3 = new PatchGuard.Finding { Kind = "transpiler" };
                 PatchGuard.Classify(f3, ourPrefixCanSkip: false, ourTranspiler: false);
-                if (f3.Severity != PatchGuard.Severity.Mittel) throw new Exception("a transpiler under komet's prefix/postfix is 'mittel'");
+                if (f3.Severity != PatchGuard.Severity.Medium) throw new Exception("a transpiler under komet's prefix/postfix is 'medium'");
+
+                // Where komet REPLACES the method (transcription: prefix returns false), the
+                // other mod's patch quietly stops meaning anything - the shape behind field
+                // reports of the "entities are invisible with this mod" kind.
+                var f4 = new PatchGuard.Finding { Kind = "transpiler" };
+                PatchGuard.Classify(f4, ourPrefixCanSkip: true, ourTranspiler: false);
+                if (f4.Severity != PatchGuard.Severity.High || !f4.Why.Contains("never runs"))
+                    throw new Exception("a transpiler under a cancelling komet prefix is dead code: " + f4.Why);
+                var f5 = new PatchGuard.Finding { Kind = "prefix", RunsBeforeOurs = false };
+                PatchGuard.Classify(f5, ourPrefixCanSkip: true, ourTranspiler: false);
+                if (f5.Severity != PatchGuard.Severity.High || !f5.Why.Contains("AFTER"))
+                    throw new Exception("a prefix ordered behind a cancelling one never runs: " + f5.Why);
+                var f6 = new PatchGuard.Finding { Kind = "prefix", RunsBeforeOurs = true };
+                PatchGuard.Classify(f6, ourPrefixCanSkip: true, ourTranspiler: false);
+                if (f6.Severity != PatchGuard.Severity.Info)
+                    throw new Exception("a prefix that runs BEFORE komet's still runs - information");
+                var f7 = new PatchGuard.Finding { Kind = "postfix" };
+                PatchGuard.Classify(f7, ourPrefixCanSkip: true, ourTranspiler: false);
+                if (f7.Severity != PatchGuard.Severity.Medium || !f7.Why.Contains("transcription"))
+                    throw new Exception("a postfix on a replaced method sees the transcription: " + f7.Why);
 
                 // A plain foreign postfix on a method komet only MEASURES is information: it
                 // goes to the notification log, never the warning log (SheyderMod's wide-shape
@@ -5197,7 +5264,7 @@ internal static class Program
                 if (info.Severity != PatchGuard.Severity.Info || !info.MeasurementOnly || !info.Ours.Contains("prefix+postfix"))
                     throw new Exception("measurement-only finding misdescribed: " + PatchGuard.Format(info));
                 if (warnings.Count != 3) throw new Exception("an info finding must not warn");
-                if (notes.Count != 1 || !notes[0].Contains("messklammer") || !notes[0].Contains("nichts zu entscheiden"))
+                if (notes.Count != 1 || !notes[0].Contains("measurement bracket") || !notes[0].Contains("nothing to decide"))
                     throw new Exception("info must be notified, naming the bracket: " + string.Join(" | ", notes));
                 // a method komet also CHANGES is not measurement-only: SunRelightChunk carries the
                 // window prebuilder's postfix next to the timing bracket. The swap transpiler on
@@ -5205,7 +5272,7 @@ internal static class Program
                 if (pre.MeasurementOnly) throw new Exception("SunRelightChunk has the prebuilder's postfix, not measurement-only");
                 var tr2 = Of("ClientPlatformWindows.window_RenderFrame");
                 if (!tr2.MeasurementOnly) throw new Exception("the swap clock transpiler is a measurement bracket");
-                if (!PatchGuard.ReportLines().Contains("patch-kollisionen: 4 (2 hoch, 1 mittel, 1 info)"))
+                if (!PatchGuard.ReportLines().Contains("patch collisions: 4 (2 high, 1 medium, 1 info)"))
                     throw new Exception("report summary wrong:\n" + PatchGuard.ReportLines());
             }
             finally
@@ -5220,12 +5287,85 @@ internal static class Program
         });
 
         if (!fingerprintMode)
+        Check("every UI string has a key, and both language files carry exactly those keys", () =>
+        {
+            // The set of keys is read from the SOURCE, not from what this run happened to
+            // print: a HUD row that only appears with a GPU timer attached would otherwise
+            // never be checked. Loc.T("key", "english") and Loc.Hud("label") are the only
+            // two ways text reaches a player, so those two shapes are the whole vocabulary.
+            string root = System.IO.Directory.Exists("Measure") ? "." : "..";
+            var used = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var dir in new[] { "", "Measure", "Patches", "Runtime", "Culling", "Guard" })
+            {
+                var path = System.IO.Path.Combine(root, dir);
+                if (!System.IO.Directory.Exists(path)) continue;
+                foreach (var file in System.IO.Directory.GetFiles(path, "*.cs"))
+                {
+                    var text = System.IO.File.ReadAllText(file);
+                    foreach (System.Text.RegularExpressions.Match m in
+                             System.Text.RegularExpressions.Regex.Matches(text, @"Loc\.T\(\s*""([^""]+)""\s*,\s*""((?:[^""\\]|\\.)*)"""))
+                        used[m.Groups[1].Value] = m.Groups[2].Value;
+                    foreach (System.Text.RegularExpressions.Match m in
+                             System.Text.RegularExpressions.Regex.Matches(text, @"Loc\.Hud\(\s*""((?:[^""\\]|\\.)*)""\s*\)"))
+                        used["komet:hud-" + m.Groups[1].Value.Replace(' ', '-')] = m.Groups[1].Value;
+                }
+            }
+            if (used.Count < 100) throw new Exception($"only {used.Count} UI keys found in the source - wrong working directory?");
+
+            var langDir = System.IO.Path.Combine(root, "assets", "komet", "lang");
+            foreach (var lang in new[] { "en", "de" })
+            {
+                var path = System.IO.Path.Combine(langDir, lang + ".json");
+                if (!System.IO.File.Exists(path)) throw new Exception("missing language file " + path);
+                var text = System.IO.File.ReadAllText(path);
+                var have = new HashSet<string>(StringComparer.Ordinal);
+                foreach (System.Text.RegularExpressions.Match m in
+                         System.Text.RegularExpressions.Regex.Matches(text, @"""(komet:[^""]+)""\s*:"))
+                    have.Add(m.Groups[1].Value);
+
+                var missing = new List<string>();
+                foreach (var k in used.Keys) if (!have.Contains(k)) missing.Add(k);
+                var extra = new List<string>();
+                foreach (var k in have) if (!used.ContainsKey(k)) extra.Add(k);
+                missing.Sort(); extra.Sort();
+                if (missing.Count > 0)
+                    throw new Exception($"{lang}.json is missing {missing.Count} key(s): {string.Join(", ", missing.GetRange(0, Math.Min(5, missing.Count)))}");
+                if (extra.Count > 0)
+                    throw new Exception($"{lang}.json has {extra.Count} key(s) nothing prints: {string.Join(", ", extra.GetRange(0, Math.Min(5, extra.Count)))}");
+            }
+
+            // A placeholder the code fills but a translation drops (or invents) would throw at
+            // string.Format time, i.e. in the middle of a frame. Counted here instead.
+            var de = System.IO.File.ReadAllText(System.IO.Path.Combine(langDir, "de.json"));
+            int Holes(string t)
+            {
+                var n = 0;
+                foreach (System.Text.RegularExpressions.Match h in
+                         System.Text.RegularExpressions.Regex.Matches(t, @"\{(\d+)")) n = Math.Max(n, int.Parse(h.Groups[1].Value) + 1);
+                return n;
+            }
+            foreach (var kv in used)
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(de,
+                    @"""" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"""\s*:\s*""((?:[^""\\]|\\.)*)""");
+                if (!m.Success) continue;
+                if (Holes(m.Groups[1].Value) != Holes(kv.Value))
+                    throw new Exception($"de.json '{kv.Key}' has {Holes(m.Groups[1].Value)} placeholders, the code passes {Holes(kv.Value)}");
+            }
+
+            // And the fallback itself: with no game around, Loc must hand back the English
+            // text rather than a raw key - that is what keeps verify and the baseline mod
+            // readable, and an unknown language file from blanking the HUD.
+            if (Loc.T("komet:does-not-exist", "english fallback") != "english fallback")
+                throw new Exception("Loc must fall back to the English text when there is no translation");
+        });
+
         Check("the engine fingerprint matches the game on disk (else: ./build.sh fingerprint)", () =>
         {
             // Last, because every earlier check has applied its patches by now - the set the
             // mod hashes at world start is the set this suite patched.
             if (!EngineFingerprint.Generated)
-                throw new Exception("src/EngineFingerprint.g.cs is the bootstrap stub - run ./build.sh fingerprint");
+                throw new Exception("Guard/EngineFingerprint.cs is the bootstrap stub - run ./build.sh fingerprint");
             if (EngineFingerprint.GameVersion != Vintagestory.API.Config.GameVersion.ShortGameVersion)
                 throw new Exception($"fingerprint is for {EngineFingerprint.GameVersion}, the game is {Vintagestory.API.Config.GameVersion.ShortGameVersion} - run ./build.sh fingerprint");
 
@@ -5622,7 +5762,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// Writes src/EngineFingerprint.g.cs: the game version, the module ids of the assemblies
+    /// Writes Guard/EngineFingerprint.cs: the game version, the module ids of the assemblies
     /// the targets live in, and one (key, hash) per patched engine method. Generated from the
     /// live assemblies the suite just patched, so it cannot drift from what verify tested.
     /// </summary>
@@ -5636,7 +5776,7 @@ internal static class Program
         sb.Append("// One entry per engine method the patches touch: FNV-1a over opcodes and resolved\n");
         sb.Append("// operands (PatchGuard.FingerprintOf). The mod compares these at world start.\n");
         sb.Append("// </auto-generated>\n");
-        sb.Append("namespace Komet;\n\n");
+        sb.Append("namespace Komet.Guard;\n\n");
         sb.Append("internal static class EngineFingerprint\n{\n");
         sb.Append("    public const bool Generated = true;\n");
         sb.Append("    public const string GameVersion = \"").Append(Vintagestory.API.Config.GameVersion.ShortGameVersion).Append("\";\n");

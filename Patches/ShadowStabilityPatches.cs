@@ -1,7 +1,5 @@
 using System;
-using System.Reflection;
 using HarmonyLib;
-using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
 
 

@@ -5,7 +5,7 @@
 #   ./build.sh bench      just the throughput benchmark
 #   ./build.sh preview    print the HUD text without starting the game
 #   ./build.sh config     regenerate dist/komet.json from the real config class
-#   ./build.sh fingerprint  regenerate src/EngineFingerprint.g.cs (IL hashes of every engine
+#   ./build.sh fingerprint  regenerate Guard/EngineFingerprint.cs (IL hashes of every engine
 #                           method the patches touch, against VS_INSTALL) - after a game update
 #   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB
 set -euo pipefail
@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 
 VS_INSTALL="${VS_INSTALL:-/opt/vintagestory}"
 VS_DATA="${VS_DATA:-$HOME/.config/VintagestoryData}"
-BASELINE="baseline"
+BASELINE="KometBaseline"
 # Mod and baseline get the same build stamp from one clock read, so a side by side
 # comparison cannot end up with two builds that look a minute apart. An inherited value
 # wins so the release target and its inner check run agree on one stamp too.
@@ -36,7 +36,7 @@ case "${1:-check}" in
     # Runs the whole check suite first (that is what applies every patch), then hashes the
     # patched engine methods. A failing check means an incomplete patch set - nothing is written.
     dotnet build verify -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
-    exec dotnet verify/bin/Release/net10.0/KometVerify.dll fingerprint "${2:-src/EngineFingerprint.g.cs}"
+    exec dotnet verify/bin/Release/net10.0/KometVerify.dll fingerprint "${2:-Guard/EngineFingerprint.cs}"
     ;;
   release)
     # A release candidate is whatever survived the full check suite - build, verify, bench.
@@ -45,9 +45,9 @@ case "${1:-check}" in
     # modinfo.json is generated from AssemblyInfo.cs, never hand written: the attribute is
     # what the running mod reports as its version (HUD title), so the zip metadata cannot
     # disagree with the binary. The csproj Version must match too, or the two are drifting.
-    VERSION="$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' src/AssemblyInfo.cs)"
+    VERSION="$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' AssemblyInfo.cs)"
     CSPROJ_VERSION="$(sed -n 's|.*<Version>\(.*\)</Version>.*|\1|p' Komet.csproj)"
-    DESCRIPTION="$(sed -n 's/.*Description = "\([^"]*\)".*/\1/p' src/AssemblyInfo.cs)"
+    DESCRIPTION="$(sed -n 's/.*Description = "\([^"]*\)".*/\1/p' AssemblyInfo.cs)"
     if [[ -z "$VERSION" || "$VERSION" != "$CSPROJ_VERSION" ]]; then
       echo "FEHLER: Versionsdrift - AssemblyInfo.cs sagt '$VERSION', Komet.csproj sagt '$CSPROJ_VERSION'" >&2
       exit 1
@@ -58,6 +58,9 @@ case "${1:-check}" in
     mkdir -p "$STAGE"
     cp bin/Release/Komet.dll "$STAGE/"
     cp modicon.png "$STAGE/"
+    # assets/komet/lang/{en,de}.json - the HUD and the .komet replies in the player's
+    # language. Logs stay English whatever is in here (see Measure/Loc.cs).
+    cp -r assets "$STAGE/"
     cat > "$STAGE/modinfo.json" <<EOF
 {
   "type": "code",
@@ -73,15 +76,15 @@ case "${1:-check}" in
 }
 EOF
     ZIP="Komet_v${VERSION}.zip"
-    (cd "$STAGE" && bsdtar -a -cf "../$ZIP" modinfo.json modicon.png Komet.dll)
+    (cd "$STAGE" && bsdtar -a -cf "../$ZIP" modinfo.json modicon.png Komet.dll assets)
     rm -rf "$STAGE"
 
     # The baseline ships as its own zip: it must be a SEPARATE mod entry so the mod
     # manager can disable Komet and enable the baseline independently - the whole
     # measuring-stick workflow depends on that. Same drift assert as the main mod.
-    B_VERSION="$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' baseline/src/AssemblyInfo.cs)"
-    B_CSPROJ_VERSION="$(sed -n 's|.*<Version>\(.*\)</Version>.*|\1|p' baseline/KometBaseline.csproj)"
-    B_DESCRIPTION="$(sed -n 's/.*Description = "\([^"]*\)".*/\1/p' baseline/src/AssemblyInfo.cs)"
+    B_VERSION="$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' KometBaseline/AssemblyInfo.cs)"
+    B_CSPROJ_VERSION="$(sed -n 's|.*<Version>\(.*\)</Version>.*|\1|p' KometBaseline/KometBaseline.csproj)"
+    B_DESCRIPTION="$(sed -n 's/.*Description = "\([^"]*\)".*/\1/p' KometBaseline/AssemblyInfo.cs)"
     if [[ -z "$B_VERSION" || "$B_VERSION" != "$B_CSPROJ_VERSION" ]]; then
       echo "FEHLER: Versionsdrift Baseline - AssemblyInfo sagt '$B_VERSION', csproj sagt '$B_CSPROJ_VERSION'" >&2
       exit 1
@@ -89,7 +92,7 @@ EOF
     STAGE="dist/release-stage"
     rm -rf "$STAGE"
     mkdir -p "$STAGE"
-    cp baseline/bin/Release/KometBaseline.dll "$STAGE/"
+    cp KometBaseline/bin/Release/KometBaseline.dll "$STAGE/"
     cp modicon.png "$STAGE/"
     cat > "$STAGE/modinfo.json" <<EOF
 {

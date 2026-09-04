@@ -6,11 +6,10 @@ using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
 using Vintagestory.API.Common;
-using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Builds the tesselator's 34x34x34 neighbourhood window for the NEXT queued chunk on a

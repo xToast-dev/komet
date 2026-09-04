@@ -5,7 +5,7 @@ using System.Reflection;
 using System.Text;
 using HarmonyLib;
 
-namespace Komet;
+namespace Komet.Guard;
 
 /// <summary>
 /// Notices when somebody else is on the same methods - and when the engine underneath is not
@@ -32,7 +32,7 @@ namespace Komet;
 /// </summary>
 public static class PatchGuard
 {
-    public enum Severity { Info = 0, Mittel = 1, Hoch = 2 }
+    public enum Severity { Info = 0, Medium = 1, High = 2 }
 
     public sealed class Finding
     {
@@ -45,9 +45,9 @@ public static class PatchGuard
         public bool CanSkipOriginal;
         /// <summary>The target is a method of this mod, not of the engine.</summary>
         public bool OnKometCode;
-        /// <summary>What Komet has on the same method ("prefix(abbrechend)+postfix", "transpiler").</summary>
+        /// <summary>What Komet has on the same method ("prefix(cancelling)+postfix", "transpiler").</summary>
         public string Ours;
-        /// <summary>Everything Komet has on this method is a measurement bracket (shared/MeasurementPatches):
+        /// <summary>Everything Komet has on this method is a measurement bracket (Measure/MeasurementPatches):
         /// timing or allocation reads that change nothing - a foreign patch next to one is information.</summary>
         public bool MeasurementOnly;
         /// <summary>For prefixes: whether the foreign one runs before Komet's.</summary>
@@ -159,7 +159,7 @@ public static class PatchGuard
                 prefixPriority = p.priority;
                 prefixIndex = p.index;
             }
-            parts.Add(skip ? "prefix(abbrechend)" : "prefix");
+            parts.Add(skip ? "prefix(cancelling)" : "prefix");
         }
         var post = false; var fin = false;
         foreach (var p in info.Postfixes) if (IsOwn(p.owner)) { Count(p); post = true; }
@@ -184,7 +184,7 @@ public static class PatchGuard
             {
                 Target = ShortName(method),
                 Owner = p.owner ?? "?",
-                Kind = canSkip ? "prefix(abbrechend)" : kind,
+                Kind = canSkip ? "prefix(cancelling)" : kind,
                 Priority = p.priority,
                 CanSkipOriginal = canSkip,
                 OnKometCode = onOurCode,
@@ -204,51 +204,78 @@ public static class PatchGuard
     {
         if (f.OnKometCode)
         {
-            f.Severity = Severity.Hoch;
-            f.Why = "fremder patch auf komet-code: was diese methode tut, entscheidet nicht mehr komet";
+            f.Severity = Severity.High;
+            f.Why = "foreign patch on komet code: what this method does is no longer komet's decision";
             return;
         }
         switch (f.Kind)
         {
             case "transpiler":
-                f.Severity = ourTranspiler ? Severity.Hoch : Severity.Mittel;
-                f.Why = ourTranspiler
-                    ? "beide schreiben dieselbe IL um; harmony fuehrt komets transpiler bei jedem patch-vorgang der anderen mod erneut aus, ein formwechsel wirft dort"
-                    : "die IL unter komets prefix/postfix ist nicht mehr vanilla";
-                return;
-            case "prefix(abbrechend)":
                 if (ourPrefixCanSkip)
                 {
-                    f.Severity = Severity.Hoch;
-                    f.Why = (f.RunsBeforeOurs ? "laeuft VOR komets prefix" : "laeuft NACH komets prefix")
-                            + " - beide koennen das original abbrechen, die prioritaet entscheidet, wessen version laeuft";
+                    // The transcription case: komets prefix returns false, so the original -
+                    // and every transpiler on it - never runs. The other mod's change is gone
+                    // without an exception and without a log line of its own. This is the
+                    // shape behind "entities are invisible since I installed this mod".
+                    f.Severity = Severity.High;
+                    f.Why = "komet's prefix replaces the original, this IL rewrite never runs";
+                    return;
+                }
+                f.Severity = ourTranspiler ? Severity.High : Severity.Medium;
+                f.Why = ourTranspiler
+                    ? "both rewrite the same IL; harmony re-runs komet's transpiler on every patch call of the other mod, and a changed shape throws in there"
+                    : "the IL under komet's prefix/postfix is no longer vanilla";
+                return;
+            case "prefix(cancelling)":
+                if (ourPrefixCanSkip)
+                {
+                    f.Severity = Severity.High;
+                    f.Why = (f.RunsBeforeOurs ? "runs BEFORE komet's prefix" : "runs AFTER komet's prefix")
+                            + " - both can cancel the original, priority decides whose version runs";
                 }
                 else
                 {
-                    f.Severity = Severity.Mittel;
-                    f.Why = "kann das original ueberspringen; komets messung bucht dann einen uebersprungenen aufruf";
+                    f.Severity = Severity.Medium;
+                    f.Why = "can skip the original; komet's measurement then books a call that never happened";
                 }
                 return;
             case "prefix":
+                // harmony stops calling prefixes as soon as one returns false, so a foreign
+                // prefix ordered behind komet's cancelling prefix does not run at all
+                if (ourPrefixCanSkip && !f.RunsBeforeOurs)
+                {
+                    f.Severity = Severity.High;
+                    f.Why = "runs AFTER komet's cancelling prefix - harmony does not call it at all then";
+                    return;
+                }
                 f.Severity = Severity.Info;
-                f.Why = f.RunsBeforeOurs ? "laeuft vor komets prefix, bricht nicht ab" : "bricht nicht ab";
+                f.Why = f.RunsBeforeOurs ? "runs before komet's prefix, does not cancel" : "does not cancel";
                 if (f.MeasurementOnly) f.Why += MeasurementNote;
                 return;
             default:
+                // postfixes still run when a prefix cancels - but on the result of komets
+                // transcription, not on the one the original would have produced
+                if (ourPrefixCanSkip)
+                {
+                    f.Severity = Severity.Medium;
+                    f.Why = "komet's prefix replaces the original; this " + f.Kind
+                            + " sees the result of the transcription, not the original's";
+                    return;
+                }
                 f.Severity = Severity.Info;
-                f.Why = "laeuft nach dem original, unabhaengig von komet";
+                f.Why = "runs after the original, independently of komet";
                 if (f.MeasurementOnly) f.Why += MeasurementNote;
                 return;
         }
     }
 
-    private const string MeasurementNote = " - komet misst hier nur (zeit/allokation), nichts zu entscheiden";
+    private const string MeasurementNote = " - komet only measures here (time/allocation), nothing to decide";
 
     internal static string Format(Finding f)
         => string.Format(CultureInfo.InvariantCulture,
-            "patch-kollision {0}: {1} - '{2}' {3} (prio {4}) neben {5}: {6}",
+            "patch collision {0}: {1} - '{2}' {3} (prio {4}) next to {5}: {6}",
             f.Severity.ToString().ToUpperInvariant(), f.Target, f.Owner, f.Kind, f.Priority,
-            f.MeasurementOnly ? "komets messklammer (" + f.Ours + ")" : "komet " + f.Ours, f.Why);
+            f.MeasurementOnly ? "komet's measurement bracket (" + f.Ours + ")" : "komet " + f.Ours, f.Why);
 
     public static int CountAt(Severity s)
     {
@@ -358,7 +385,7 @@ public static class PatchGuard
 
         if (!HasGeneratedFingerprint())
         {
-            EngineSummary = "engine: " + liveVersionText + " - kein fingerabdruck einkompiliert (./build.sh fingerprint)";
+            EngineSummary = "engine: " + liveVersionText + " - no fingerprint compiled in (./build.sh fingerprint)";
             Notify?.Invoke(EngineSummary);
             return;
         }
@@ -407,7 +434,7 @@ public static class PatchGuard
               .Append(" weichen vom verifizierten build ").Append(EngineFingerprint.GameVersion).Append(" ab");
         if (Drifts.Count == 0)
         {
-            sb.Append(", alle ").Append(MethodsChecked).Append(" gepatchten methoden unveraendert");
+            sb.Append(", all ").Append(MethodsChecked).Append(" gepatchten methoden unveraendert");
             if (ForeignAssemblies.Count > 0) sb.Append(" (komets patches treffen bekannten code)");
         }
         else
@@ -418,9 +445,9 @@ public static class PatchGuard
                 if (i > 0) sb.Append(", ");
                 sb.Append(Drifts[i].Target);
             }
-            sb.Append(" - komets transpiler und 1:1-transkriptionen dort laufen gegen fremden code, das ist nicht verifiziert");
+            sb.Append(" - komet's transpilers and 1:1 transcriptions there run against foreign code, which is not verified");
         }
-        if (MethodsUnverified > 0) sb.Append(" (").Append(MethodsUnverified).Append(" ohne fingerabdruck)");
+        if (MethodsUnverified > 0) sb.Append(" (").Append(MethodsUnverified).Append(" without a fingerprint)");
         EngineSummary = sb.ToString();
         if (Drifts.Count > 0) Warn?.Invoke(EngineSummary);
         else Notify?.Invoke(EngineSummary);
@@ -435,16 +462,16 @@ public static class PatchGuard
         if (EngineChecked && EngineSummary != null) sb.Append(EngineSummary).Append('\n');
         if (Scans == 0)
         {
-            sb.Append("patch-kollisionen: noch nicht geprueft\n");
+            sb.Append("patch collisions: not checked yet\n");
             return sb.ToString();
         }
         if (Findings.Count == 0)
         {
-            sb.Append("patch-kollisionen: keine (fremde patches auf komets methoden oder komet-code)\n");
+            sb.Append("patch collisions: none (foreign patches on komet's methods or komet's own code)\n");
             return sb.ToString();
         }
-        sb.AppendFormat(CultureInfo.InvariantCulture, "patch-kollisionen: {0} ({1} hoch, {2} mittel, {3} info)\n",
-            Findings.Count, CountAt(Severity.Hoch), CountAt(Severity.Mittel), CountAt(Severity.Info));
+        sb.AppendFormat(CultureInfo.InvariantCulture, "patch collisions: {0} ({1} high, {2} medium, {3} info)\n",
+            Findings.Count, CountAt(Severity.High), CountAt(Severity.Medium), CountAt(Severity.Info));
         foreach (var f in Findings) sb.Append("  ").Append(Format(f)).Append('\n');
         return sb.ToString();
     }

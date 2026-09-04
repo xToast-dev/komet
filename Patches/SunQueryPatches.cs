@@ -1,8 +1,6 @@
 using System;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.Client.NoObf;
-using Vintagestory.API.Client;
 
 
 // Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's

@@ -62,6 +62,10 @@ public static class MeasurementPatches
         harmony.Patch(stage,
             prefix: OuterPrefix(nameof(StagePrefix)),
             postfix: OuterPostfix(nameof(StagePostfix)));
+        // From here FrameBoundary fires once per frame. Features that budget themselves per
+        // frame ask for this before they arm: a budget whose reset never comes does not
+        // degrade to "slower", it degrades to "never" (see EntityTessPatches).
+        FrameBoundaryLive = true;
 
         // EventManager.TriggerGameTick is the client's whole game tick; ClientEventManager does
         // not override it, so the base method is what runs.
@@ -314,6 +318,13 @@ public static class MeasurementPatches
 
     /// <summary>Raised on the frame boundary so a consumer can fold up its per-frame totals.</summary>
     public static Action FrameBoundary;
+
+    /// <summary>
+    /// Whether the render-stage bracket is on the method, i.e. whether <see cref="FrameBoundary"/>
+    /// actually fires. False means <see cref="Apply"/> never got that far - and every per-frame
+    /// budget in this mod has to stay on vanilla, because its window would never reopen.
+    /// </summary>
+    public static bool FrameBoundaryLive { get; private set; }
 
     public static void StagePrefix(EnumRenderStage stage, out long __state)
     {

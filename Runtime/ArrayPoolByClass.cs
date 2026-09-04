@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Power-of-two size classes of arrays, held for reuse under a byte budget. Rent copies the

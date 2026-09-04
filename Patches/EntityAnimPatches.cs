@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using HarmonyLib;
-using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.Client.NoObf;
 
@@ -218,12 +217,12 @@ public static class EntityAnimPatches
 
     public static void Write(StringBuilder sb, System.Globalization.CultureInfo ci)
     {
-        sb.AppendFormat(ci, "entity-before: vor-render {0:F2} ms ({1:F0} sichtbar), anim {2:F2} ms ({3:F0} je frame, {4:N0} uebersprungen)",
+        sb.AppendFormat(ci, "entity before: pre-render {0:F2} ms ({1:F0} visible), anim {2:F2} ms ({3:F0} per frame, {4:N0} skipped)",
             AvgBeforeMs, AvgRendered, AvgAnimMs, AvgAnimated, StatSkipped);
         if (StatWorstMs >= 1.0)
-            sb.AppendFormat(ci, ", teuerste {0:F1} ms ({1})", StatWorstMs, StatWorstName ?? "?");
-        if (!LodEnabled) sb.Append(" (anim-lod AUS)");
-        if (!Enabled) sb.Append(" (AUS)");
+            sb.AppendFormat(ci, ", most expensive {0:F1} ms ({1})", StatWorstMs, StatWorstName ?? "?");
+        if (!LodEnabled) sb.Append(" (anim lod OFF)");
+        if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 

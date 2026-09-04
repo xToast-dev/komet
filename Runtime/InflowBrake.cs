@@ -1,9 +1,9 @@
 using System;
+using Komet.Measure;
 using Vintagestory.Client;
 using Vintagestory.Server;
-using Komet.Measure;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Matches how fast the integrated server hands out chunks to how fast this client can

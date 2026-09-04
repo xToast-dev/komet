@@ -1,6 +1,5 @@
 using System;
 using System.Diagnostics;
-using System.Reflection;
 using HarmonyLib;
 
 
@@ -43,6 +42,11 @@ public static class EntityTessPatches
     /// <summary>Tesselations that ran / were pushed to a later frame, since start.</summary>
     public static long StatAllowed, StatDeferred;
 
+    /// <summary>Windows that had to reopen themselves because no frame boundary arrived
+    /// (see <see cref="StaleAfterMs"/>). Anything but 0 while the client renders means the
+    /// boundary is not firing - the report says so instead of hiding it.</summary>
+    public static long StatStaleResets;
+
     /// <summary>
     /// The single most expensive TesselateShape call seen, and whose entity it was.
     ///
@@ -56,6 +60,21 @@ public static class EntityTessPatches
 
     private static double spentThisFrameMs;
     private static int allowedThisFrame;
+    private static long lastBoundaryTs;
+
+    /// <summary>
+    /// How long the window may go without a frame boundary before it reopens itself.
+    ///
+    /// The budget is only ever reset by <see cref="OnFrameBoundary"/>. If that event stops
+    /// coming while the patch stays applied, the spent milliseconds never fall back below the
+    /// budget and EVERY further TesselateShape is skipped - permanently, for every animated
+    /// entity in the world, which reads as "all animals are invisible". A budget that loses
+    /// its reset has to degrade to vanilla, not to "never", so a window this old counts as no
+    /// window at all. Frames are milliseconds apart; a quarter second is far outside anything
+    /// a running client produces, and while none are being drawn an unbudgeted tesselation
+    /// costs nothing anyway.
+    /// </summary>
+    public const double StaleAfterMs = 250.0;
 
     public static void Apply(Harmony harmony, double budgetMs)
     {
@@ -78,7 +97,13 @@ public static class EntityTessPatches
     {
         spentThisFrameMs = 0;
         allowedThisFrame = 0;
+        lastBoundaryTs = Stopwatch.GetTimestamp();
     }
+
+    /// <summary>The staleness rule, pure: no boundary within <see cref="StaleAfterMs"/> means
+    /// the window is not being reset at all. Zero (none seen yet) counts as stale.</summary>
+    internal static bool WindowStale(long nowTs, long lastTs)
+        => lastTs == 0 || (nowTs - lastTs) * 1000.0 / Stopwatch.Frequency > StaleAfterMs;
 
     /// <summary>
     /// The rule, pure so it can be checked directly: the first tesselation of a frame always
@@ -92,6 +117,17 @@ public static class EntityTessPatches
     {
         __state = 0;
         if (!Enabled || BudgetMs <= 0) return true;
+
+        // no boundary in a quarter second: the reset is gone, so the window reopens here
+        // rather than blocking every tesselation from now on
+        var now = Stopwatch.GetTimestamp();
+        if (WindowStale(now, lastBoundaryTs))
+        {
+            spentThisFrameMs = 0;
+            allowedThisFrame = 0;
+            lastBoundaryTs = now;
+            StatStaleResets++;
+        }
 
         if (!ShouldTesselate(spentThisFrameMs, allowedThisFrame, BudgetMs))
         {
@@ -128,7 +164,7 @@ public static class EntityTessPatches
 
     public static void ResetStats()
     {
-        StatAllowed = StatDeferred = 0;
+        StatAllowed = StatDeferred = StatStaleResets = 0;
         StatWorstMs = 0;
         StatWorstName = null;
     }

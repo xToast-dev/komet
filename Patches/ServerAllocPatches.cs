@@ -236,7 +236,7 @@ public static class ServerAllocPatches
                 sb.AppendFormat(ci, "{0} {1:F0}", subs[i].Name, subs[i].MbPerSecond);
             }
         }
-        if (!Enabled) sb.Append(" (AUS)");
+        if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 

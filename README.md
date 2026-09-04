@@ -57,11 +57,16 @@ byte-identical results to vanilla before measuring throughput.
 ## Project structure
 
 ```
-src/               the mod: mod system, config, commands, optimisations
-src/Patches/       Harmony entry points, one file per subsystem
-shared/            measurement code (HUD, frame stats, hitch log) — compiled into
+KometModSystem.cs  loading, config, the .komet command
+Culling/           visibility: frustum sweep, occlusion pass, ray traversal
+Runtime/           threads, budgets, pools, samplers under the patches
+Guard/             self-check: foreign patches, engine fingerprint, task codes
+Patches/           Harmony entry points, one file per subsystem
+assets/komet/lang/ en.json, de.json - the HUD and the .komet replies in the
+                   player's language; logs and reports stay English
+Measure/           measurement code (HUD, frame stats, hitch log) — compiled into
                    both mods so their numbers mean exactly the same thing
-baseline/          KometBaseline: the same HUD with none of the optimisations,
+KometBaseline/          KometBaseline: the same HUD with none of the optimisations,
                    a measuring stick for vanilla; stands down when Komet is active
 verify/            patch + behaviour checks against the real game assemblies
 bench/             equivalence + throughput benchmark

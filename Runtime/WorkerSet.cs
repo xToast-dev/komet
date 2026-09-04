@@ -2,7 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Work handed to a <see cref="WorkerSet"/>. One call per contiguous slice of the index range,
@@ -73,6 +73,7 @@ public sealed class WorkerSet
     /// </summary>
     public long StatContendedInline;
 
+    /// <param name="name">Thread name prefix, so a profiler and the HUD can tell the sets apart.</param>
     /// <param name="niceness">
     /// Unix nice increment for these workers, 0 to leave them at the process default. Only ever
     /// raised - lowering nice needs privileges, raising it never does.

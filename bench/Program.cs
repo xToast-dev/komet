@@ -3,10 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
+using Komet.Culling;
 using Vintagestory.API.Client;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
-using Komet;
 
 // Standalone harness: builds a synthetic chunk-mesh pool of the size a real
 // viewDistance=1536 client keeps around, then checks that FastCuller produces

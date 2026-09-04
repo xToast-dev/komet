@@ -7,7 +7,7 @@ using Vintagestory.Client.NoObf;
 // own parameter spellings). A naming cleanup that renames them makes the patch throw at Patch()
 // time and the feature silently run vanilla - so naming inspections are suppressed here.
 // ReSharper disable InconsistentNaming
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// The one home for the ClientMain tesselation-queue field refs. Three classes used to

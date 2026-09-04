@@ -4,7 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// An automated in-game measurement run: flips one system at a time, samples every frame,
@@ -72,8 +72,8 @@ public static class StressTest
 
     public static string Start(List<Phase> plan, double secPerSlice, int roundCount, Action<string> reportSink)
     {
-        if (Running) return "Stresstest laeuft bereits - '.komet stress stop' bricht ab.";
-        if (plan == null || plan.Count == 0) return "keine Systeme definiert";
+        if (Running) return "a stress test is already running - '.komet stress stop' aborts it.";
+        if (plan == null || plan.Count == 0) return "no systems defined";
 
         systems = plan;
         secondsPerSlice = Math.Clamp(secPerSlice, 1, 30);
@@ -86,9 +86,9 @@ public static class StressTest
         Running = true;
 
         var total = schedule.Length * secondsPerSlice;
-        return $"Stresstest gestartet: {plan.Count} Systeme x {rounds} Runden, verschraenkt mit Baselines "
+        return $"stress test started: {plan.Count} systems x {rounds} rounds, interleaved with baselines "
              + $"({schedule.Length} Scheiben a {secondsPerSlice:0.#}s = ~{total:0}s). Bewegung ist ok - "
-             + "Drift wird durch die Nachbar-Baselines herausgerechnet. '.komet stress stop' bricht ab.";
+             + "drift is cancelled out by the neighbouring baselines. '.komet stress stop' aborts.";
     }
 
     /// <summary>B, S1, B, S2, ... per round, one closing baseline - every test slice ends up
@@ -110,7 +110,7 @@ public static class StressTest
 
     public static string Stop(string reason)
     {
-        if (!Running) return "kein Stresstest aktiv";
+        if (!Running) return "no stress test running";
         var current = CurrentSystem();
         if (current >= 0) SafeExit(systems[current]);
         Running = false;
@@ -118,7 +118,7 @@ public static class StressTest
         systems = null;
         slices = null;
         schedule = null;
-        return "Stresstest abgebrochen (" + reason + ") - alle Systeme zurueck auf Konfiguration.";
+        return "Stresstest abgebrochen (" + reason + ") - every system back to its configured state.";
     }
 
     private static int CurrentSystem()
@@ -160,7 +160,7 @@ public static class StressTest
             if (entering >= 0)
             {
                 try { systems[entering].Enter?.Invoke(); }
-                catch (Exception) { Stop("System '" + systems[entering].Name + "' liess sich nicht aktivieren"); return; }
+                catch (Exception) { Stop("System '" + systems[entering].Name + "' could not be enabled"); return; }
             }
 
             slices.Add(new Slice { System = entering });
@@ -211,12 +211,12 @@ public static class StressTest
         }
         var baseMean = baseCount > 0 ? baseSum / baseCount : 0;
 
-        sb.AppendFormat(ci, "stresstest fertig - baseline im mittel {0:F2} ms ({1:F0} fps)",
+        sb.AppendFormat(ci, "stress test finished - baseline averaging {0:F2} ms ({1:F0} fps)",
             baseMean, baseMean > 0 ? 1000 / baseMean : 0);
         if (firstBase > 0 && Math.Abs(lastBase - firstBase) > baseMean * 0.15)
             // no angle brackets in chat-bound text: the game chat parses VTML markup, and a
             // single stray 'greater than' derails its parser into repeating error spam
-            sb.AppendFormat(ci, ", szene wanderte von {0:F1} auf {1:F1} ms (durch nachbar-baselines herausgerechnet)",
+            sb.AppendFormat(ci, ", the scene drifted from {0:F1} to {1:F1} ms (cancelled out by the neighbouring baselines)",
                 firstBase, lastBase);
         sb.Append('\n');
 
@@ -244,24 +244,24 @@ public static class StressTest
 
             if (n == 0)
             {
-                sb.Append(sys[sysIdx].Name).Append(": keine verwertbare scheibe\n");
+                sb.Append(sys[sysIdx].Name).Append(": no usable slice\n");
                 continue;
             }
 
             var mean = sum / n;
             var spread = (max - min) / 2;
             sb.AppendFormat(ci, "{0}: delta {1}{2:F2} ms", sys[sysIdx].Name, mean >= 0 ? "+" : "", mean);
-            if (n > 1) sb.AppendFormat(ci, " (+-{0:F2} ueber {1} runden)", spread, n);
-            sb.AppendFormat(ci, " [swap {0}{1:F2}, schatten {2}{3:F2}]",
+            if (n > 1) sb.AppendFormat(ci, " (+-{0:F2} over {1} rounds)", spread, n);
+            sb.AppendFormat(ci, " [swap {0}{1:F2}, shadow {2}{3:F2}]",
                 swapSum / n >= 0 ? "+" : "", swapSum / n, shadowSum / n >= 0 ? "+" : "", shadowSum / n);
             sb.AppendFormat(ci, ", worst {0:F1}\n", worst);
         }
 
-        sb.Append("lesart: positive delta bei 'X aus' = so viel spart X hier; bei 'X an' = so viel kostet X.\n");
-        sb.Append("deltas sind je runde gegen die beiden NACHBAR-baselines gerechnet - drift kuerzt sich raus;\n");
-        sb.Append("+- ist die halbe spannweite zwischen den runden: deltas kleiner als ihr +- sind rauschen.\n");
-        sb.Append("swap/schatten in eckigen klammern teilen den delta auf: swap = treiber- oder GPU-gegendruck,\n");
-        sb.Append("schatten = die beiden schatten-stages auf der CPU. rest = CPU woanders.");
+        sb.Append("reading: a positive delta on 'X off' = that is what X saves here; on 'X on' = that is what X costs.\n");
+        sb.Append("deltas are computed per round against the two NEIGHBOURING baselines - drift cancels out;\n");
+        sb.Append("+- is the half spread between the rounds: deltas smaller than their +- are noise.\n");
+        sb.Append("swap/shadow in square brackets split the delta: swap = driver or GPU back-pressure,\n");
+        sb.Append("shadow = the two shadow stages on the CPU. rest = CPU elsewhere.");
         return sb.ToString();
     }
 }

@@ -1,5 +1,4 @@
 using System;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
@@ -43,11 +42,6 @@ public static class ShadowPatches
 
     /// <summary>What the config asked for, so a live toggle can return to it.</summary>
     public static double ConfiguredMultiplier = 1.0;
-
-    private const double FloatingPointEpsilon = 1e-9;
-
-    private static bool NearlyEqual(double left, double right, double epsilon = FloatingPointEpsilon)
-        => Math.Abs(left - right) <= epsilon;
 
     // All three patches are applied unconditionally and gated here at runtime. They are the
     // only things in this mod that change how shadows look, and until 1.37.0 they were the
