@@ -42,13 +42,13 @@ jobs:
     steps:
       # The build stamp and every timestamp in the zip come from the commit, so the tag step
       # and the packer both need real git data, not a shallow snapshot.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
 
@@ -98,7 +98,7 @@ jobs:
           cat dist/*.sha256
 
       - name: Upload mod
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: komet
           path: |
@@ -107,7 +107,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload baseline mod
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: komet-baseline
           path: |
@@ -115,21 +115,29 @@ jobs:
             dist/KometBaseline_v*.zip.sha256
           if-no-files-found: error
 
-  # Publishes what the build job produced. A draft, so nothing goes public until it has been
-  # looked at, and the checksums are in the body: the number on the ModDB page and the number
-  # on the release are then the same, and both can be recomputed from the tagged commit.
+  # Everything that is built lands under Releases, but not as the same kind of thing:
+  #
+  #   main            -> a DRAFT tagged v<version>. The real release; a human looks at it and
+  #                      presses publish. An existing tag is never moved - a version is
+  #                      published once.
+  #   nightly, buildtest, manual run
+  #                   -> a PRERELEASE tagged preview-<sha>, visible in the tab right away and
+  #                      never marked "latest". One per commit, so a preview and the sha256 in
+  #                      its notes belong together permanently.
+  #
+  # Pull requests publish nothing (a fork must not be able to tag this repository).
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: komet*
           merge-multiple: true
@@ -137,39 +145,55 @@ jobs:
 
       # AssemblyInfo.cs is what the running mod reports; build.sh already refused to pack if
       # the csproj disagreed with it, so either is authoritative by now.
-      - name: Read the version
-        id: version
+      - name: Work out what this is
+        id: what
         run: |
           version=$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' AssemblyInfo.cs)
           [[ -n "$version" ]] || { echo "no version in AssemblyInfo.cs"; exit 1; }
+          sha=$(git rev-parse --short=7 HEAD)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          # 1.2.0-pre.2 is not a release; anything without a dash is
-          [[ "$version" == *-* ]] && echo "prerelease=true" >> "$GITHUB_OUTPUT" \
-                                  || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
 
-      # An existing tag is left alone: a version is published once. Bump the version in
-      # AssemblyInfo.cs + Komet.csproj to publish again.
+          if [[ '${{ github.ref }}' == 'refs/heads/main' ]]; then
+            echo "preview=false"                >> "$GITHUB_OUTPUT"
+            echo "tag=v$version"                >> "$GITHUB_OUTPUT"
+            echo "name=Komet $version"          >> "$GITHUB_OUTPUT"
+            echo "draft=true"                   >> "$GITHUB_OUTPUT"
+            # 1.2.0-pre.2 is not a release; anything without a dash is
+            [[ "$version" == *-* ]] && echo "prerelease=true"  >> "$GITHUB_OUTPUT" \
+                                    || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "preview=true"                          >> "$GITHUB_OUTPUT"
+            echo "tag=preview-$sha"                      >> "$GITHUB_OUTPUT"
+            echo "name=Komet $version preview ($sha)"    >> "$GITHUB_OUTPUT"
+            echo "draft=false"                           >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"                       >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Tag the commit
         run: |
-          tag='${{ steps.version.outputs.tag }}'
+          tag='${{ steps.what.outputs.tag }}'
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             echo "$tag exists already - not moving it"
             exit 0
           fi
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git tag -a "$tag" -m "Komet $tag"
+          git tag -a "$tag" -m "Komet ${{ steps.what.outputs.tag }}"
           git push origin "$tag"
 
       - name: Build the release notes
-        id: notes
         run: |
           {
-            echo 'Built from `${{ github.sha }}`.'
+            if [[ '${{ steps.what.outputs.preview }}' == 'true' ]]; then
+              echo 'Preview build from `${{ github.ref_name }}`, commit `${{ github.sha }}`.'
+              echo 'Not a release: it has passed the checks, nothing more.'
+            else
+              echo 'Built from `${{ github.sha }}`.'
+            fi
             echo
-            echo 'The build is reproducible: check out the tag and run `./build.sh release`'
-            echo 'to get files with exactly these checksums.'
+            echo 'The build is reproducible: check out `${{ steps.what.outputs.tag }}` and run'
+            echo '`./build.sh release` to get files with exactly these checksums.'
             echo
             echo '```'
             cat dist/*.sha256
@@ -177,13 +201,15 @@ jobs:
           } > notes.md
           cat notes.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Komet ${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.what.outputs.tag }}
+          name: ${{ steps.what.outputs.name }}
           body_path: notes.md
-          draft: true
-          prerelease: ${{ steps.version.outputs.prerelease }}
+          draft: ${{ steps.what.outputs.draft }}
+          prerelease: ${{ steps.what.outputs.prerelease }}
+          # a preview must never displace the real release at the top of the tab
+          make_latest: ${{ steps.what.outputs.preview == 'true' && 'false' || 'legacy' }}
           files: |
             dist/*.zip
             dist/*.sha256
