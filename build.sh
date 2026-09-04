@@ -7,7 +7,10 @@
 #   ./build.sh config     regenerate dist/komet.json from the real config class
 #   ./build.sh fingerprint  regenerate Guard/EngineFingerprint.cs (IL hashes of every engine
 #                           method the patches touch, against VS_INSTALL) - after a game update
-#   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB
+#   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB,
+#                           each zip with a .sha256 next to it to publish alongside it
+# Environment: VS_INSTALL points at the game (default /opt/vintagestory), KOMET_SKIP_BENCH=1
+# leaves out the throughput benchmark (CI: it gates nothing and dominates the runtime).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,6 +21,40 @@ BASELINE="KometBaseline"
 # comparison cannot end up with two builds that look a minute apart. An inherited value
 # wins so the release target and its inner check run agree on one stamp too.
 KOMET_BUILD="${KOMET_BUILD:-$(date +%y%m%d.%H%M)}"
+
+# Deterministic zip. bsdtar (and Info-ZIP) write an extended-timestamp extra field that
+# carries the file's ctime, which nothing can set - two runs of the same source produced two
+# different archives because of it. Python's zipfile writes exactly what is asked for:
+# entries in the given order, one fixed timestamp, fixed permissions, no extra fields.
+# Arguments: <stage dir> <zip> <epoch> <entry> [entry ...]
+pack_zip() {
+  python3 - "$@" <<'PY'
+import os, sys, time, zipfile
+
+stage, out, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+stamp = time.gmtime(epoch)[:6]
+
+def files(root, entry):
+    path = os.path.join(root, entry)
+    if os.path.isfile(path):
+        yield entry
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames.sort()
+        for name in sorted(filenames):
+            yield os.path.relpath(os.path.join(dirpath, name), root)
+
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for entry in sys.argv[4:]:
+        for rel in files(stage, entry):
+            info = zipfile.ZipInfo(rel.replace(os.sep, "/"), date_time=stamp)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3          # unix, so the mode below is read back as one
+            info.external_attr = 0o644 << 16
+            with open(os.path.join(stage, rel), "rb") as f:
+                z.writestr(info, f.read())
+PY
+}
 
 case "${1:-check}" in
   bench)
@@ -39,6 +76,28 @@ case "${1:-check}" in
     exec dotnet verify/bin/Release/net10.0/KometVerify.dll fingerprint "${2:-Guard/EngineFingerprint.cs}"
     ;;
   release)
+    # Reproducible: the same commit must produce the same bytes, so the sha256 printed at the
+    # end can be recomputed by anyone from the same source. Two things have to stop moving.
+    #
+    # The build stamp, which normally is the minute of the build (that is what a dev build
+    # wants), becomes the minute of the COMMIT - in UTC, so it does not depend on who builds
+    # it where. A published artefact identifies its source, not its build machine.
+    if git rev-parse --git-dir >/dev/null 2>&1; then
+      KOMET_BUILD="${KOMET_BUILD_OVERRIDE:-$(TZ=UTC git log -1 --format=%cd --date=format-local:%y%m%d.%H%M)}"
+      SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+      if [[ -n "$(git status --porcelain)" ]]; then
+        echo "WARNUNG: Arbeitsverzeichnis nicht sauber - der sha256 gehoert dann zu keinem Commit" >&2
+      fi
+    else
+      # no repository around (a source drop): fall back to the clock and say so
+      SOURCE_DATE_EPOCH="$(date +%s)"
+      echo "WARNUNG: kein git-Repo - Build ist nicht reproduzierbar" >&2
+    fi
+    export SOURCE_DATE_EPOCH
+    # ... and the compilation itself: no pdb path in the debug directory, normalised source
+    # paths (see the KometReproducible block in the csproj files).
+    export KOMET_REPRODUCIBLE=true
+
     # A release candidate is whatever survived the full check suite - build, verify, bench.
     KOMET_BUILD="$KOMET_BUILD" "$0" check
 
@@ -76,7 +135,10 @@ case "${1:-check}" in
 }
 EOF
     ZIP="Komet_v${VERSION}.zip"
-    (cd "$STAGE" && bsdtar -a -cf "../$ZIP" modinfo.json modicon.png Komet.dll assets)
+    # zip stores a modification time per entry, so the staged copies would carry the moment
+    # they were copied. Pinned to the commit's timestamp, in UTC, and the entries are listed
+    # in a fixed order - that is what makes two runs produce the same archive.
+    pack_zip "$STAGE" "dist/$ZIP" "$SOURCE_DATE_EPOCH" modinfo.json modicon.png Komet.dll assets
     rm -rf "$STAGE"
 
     # The baseline ships as its own zip: it must be a SEPARATE mod entry so the mod
@@ -109,13 +171,25 @@ EOF
 }
 EOF
     B_ZIP="KometBaseline_v${B_VERSION}.zip"
-    (cd "$STAGE" && bsdtar -a -cf "../$B_ZIP" modinfo.json modicon.png KometBaseline.dll)
+    pack_zip "$STAGE" "dist/$B_ZIP" "$SOURCE_DATE_EPOCH" modinfo.json modicon.png KometBaseline.dll
     rm -rf "$STAGE"
+
+    # One checksum per published file, written next to it and printed here. It is meant to
+    # go on the ModDB page so a downloader can prove that the zip they got is the zip that
+    # was uploaded - the only thing a hash can honestly promise.
+    #
+    # It identifies the COMMIT: build stamp, compilation and archive timestamps are all
+    # derived from it, so anyone who checks out the same commit and runs this target gets the
+    # same bytes and the same number. A dirty working tree breaks that and says so above.
+    (cd dist && sha256sum "$ZIP" > "$ZIP.sha256" && sha256sum "$B_ZIP" > "$B_ZIP.sha256")
 
     echo
     echo "== release candidate: dist/$ZIP + dist/$B_ZIP (v$VERSION b$KOMET_BUILD) =="
-    bsdtar -tvf "dist/$ZIP"
-    bsdtar -tvf "dist/$B_ZIP"
+    python3 -m zipfile -l "dist/$ZIP"
+    python3 -m zipfile -l "dist/$B_ZIP"
+    echo
+    echo "== sha256 (for the ModDB page) =="
+    cat "dist/$ZIP.sha256" "dist/$B_ZIP.sha256"
     ;;
   deploy)
     # Die Mod hiess bis 1.51.8 VsPerf - eine liegengebliebene alte DLL wuerde doppelt laden.
@@ -126,15 +200,21 @@ EOF
     ;;
   *)
     echo "== building both mods (b$KOMET_BUILD) =="
-    dotnet build -c Release -v q --nologo -p:KometBuild="$KOMET_BUILD" -p:VsInstall="$VS_INSTALL"
-    dotnet build "$BASELINE" -c Release -v q --nologo -p:KometBuild="$KOMET_BUILD" -p:VsInstall="$VS_INSTALL"
+    REPRO="-p:KometReproducible=${KOMET_REPRODUCIBLE:-false}"
+    dotnet build -c Release -v q --nologo -p:KometBuild="$KOMET_BUILD" -p:VsInstall="$VS_INSTALL" $REPRO
+    dotnet build "$BASELINE" -c Release -v q --nologo -p:KometBuild="$KOMET_BUILD" -p:VsInstall="$VS_INSTALL" $REPRO
     echo
     echo "== patch + behaviour checks =="
     dotnet build verify -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
     dotnet verify/bin/Release/net10.0/KometVerify.dll
-    echo
-    echo "== equivalence + throughput =="
-    dotnet build bench -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
-    dotnet bench/bin/Release/net10.0/KometBench.dll
+    # The benchmark measures throughput, it does not gate anything (it has no failing
+    # exit code). On a shared CI runner its numbers are noise and it is by far the longest
+    # step, so KOMET_SKIP_BENCH=1 leaves it out there - the checks above are the gate.
+    if [[ "${KOMET_SKIP_BENCH:-0}" != "1" ]]; then
+      echo
+      echo "== equivalence + throughput =="
+      dotnet build bench -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
+      dotnet bench/bin/Release/net10.0/KometBench.dll
+    fi
     ;;
 esac

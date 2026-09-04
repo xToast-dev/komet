@@ -19,6 +19,21 @@
     <VsData Condition="'$(VsData)' == ''">$(HOME)/.config/VintagestoryData</VsData>
   </PropertyGroup>
 
+  <!-- Reproducible release: the same commit must produce the same bytes, so the sha256 on the
+       download page can be recomputed by anyone. Only the release path sets this - a normal
+       build keeps its pdb, and with it the line numbers in a local stack trace.
+       DebugType none removes the debug directory, which otherwise carries the absolute path of
+       the pdb and therefore the checkout directory; PathMap and ContinuousIntegrationBuild
+       normalise what is left of the build path. -->
+  <PropertyGroup Condition="'$(KometReproducible)' == 'true'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <PathMap>$(MSBuildThisFileDirectory)=/komet/</PathMap>
+  </PropertyGroup>
+
+
   <ItemGroup>
     <!-- the measurement code is literally the same files the optimising mod uses, so the two
          mods cannot drift apart and their numbers stay comparable -->

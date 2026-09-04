@@ -1,0 +1,216 @@
+name: build
+
+# The gate is the verify suite: it applies every real Harmony patch to the real game
+# assemblies, forces JIT compilation and checks behaviour - without starting the game.
+# A transpiler that no longer matches the engine fails here instead of in someone's world.
+on:
+  push:
+    # buildtest is the branch this workflow is being tried out on - remove it once it has
+    # proven itself. workflow_dispatch is no help until the file reaches the default branch:
+    # GitHub only offers "Run workflow" for workflows that exist on main.
+    branches: [main, nightly, buildtest]
+    paths-ignore: ['docs/**', 'moddb/**', 'README.md']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: 'Also run the throughput benchmark (slow, measures nothing useful on a shared runner)'
+        type: boolean
+        default: false
+
+# A second push onto the same branch makes the first run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      # The game assemblies the projects compile against, in the layout the .csproj files
+      # expect (see .github/vintagestory/README.md). They are not on a public feed, so they
+      # live in the repository.
+      VS_INSTALL: ${{ github.workspace }}/.github/vintagestory
+      # No benchmark unless it was asked for: it gates nothing (no failing exit code) and is
+      # by far the longest step.
+      KOMET_SKIP_BENCH: ${{ inputs.run_bench && '0' || '1' }}
+
+    steps:
+      # The build stamp and every timestamp in the zip come from the commit, so the tag step
+      # and the packer both need real git data, not a shallow snapshot.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Fails with the missing file names rather than with a wall of CS0246 "type or
+      # namespace not found" from the first reference that could not be resolved.
+      - name: Check the game assemblies are present
+        run: |
+          missing=()
+          for f in VintagestoryAPI.dll VintagestoryLib.dll \
+                   Lib/0Harmony.dll Lib/cairo-sharp.dll Lib/Newtonsoft.Json.dll \
+                   Lib/OpenTK.Core.dll Lib/OpenTK.Graphics.dll Lib/OpenTK.Mathematics.dll \
+                   Lib/OpenTK.Windowing.Common.dll Lib/OpenTK.Windowing.Desktop.dll \
+                   Lib/OpenTK.Windowing.GraphicsLibraryFramework.dll \
+                   Lib/protobuf-net.dll Lib/SkiaSharp.dll \
+                   Lib/Mono.Cecil.dll Lib/MonoMod.Utils.dll Lib/MonoMod.Core.dll \
+                   Lib/MonoMod.Backports.dll Lib/MonoMod.ILHelpers.dll Lib/MonoMod.Iced.dll \
+                   Mods/VSEssentials.dll Mods/VSSurvivalMod.dll; do
+            [[ -f "$VS_INSTALL/$f" ]] || missing+=("$f")
+          done
+          if (( ${#missing[@]} )); then
+            printf 'missing in .github/vintagestory:\n'
+            printf '  %s\n' "${missing[@]}"
+            printf 'see .github/vintagestory/README.md for the expected layout\n'
+            exit 1
+          fi
+          echo "all 21 game assemblies present"
+
+      # build.sh is the single source of truth for what a release is: it builds both mods,
+      # runs the checks, and only then packs the zips (with a modinfo.json generated from
+      # AssemblyInfo.cs, so the zip metadata can never disagree with the binary).
+      - name: Build, verify and pack
+        run: ./build.sh release
+
+      # Into the run summary, so the checksum of a build can be read (and pasted onto the
+      # ModDB page) without downloading the artifact first. Note what the number identifies:
+      # the dll carries a build stamp down to the minute, so this is the hash of THIS zip,
+      # not of "version x.y.z" - publish the hash of the file that is actually uploaded.
+      - name: Report checksums
+        run: |
+          {
+            echo '### sha256'
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat dist/*.sha256
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v7
+        with:
+          name: komet
+          path: |
+            dist/Komet_v*.zip
+            dist/Komet_v*.zip.sha256
+          if-no-files-found: error
+
+      - name: Upload baseline mod
+        uses: actions/upload-artifact@v7
+        with:
+          name: komet-baseline
+          path: |
+            dist/KometBaseline_v*.zip
+            dist/KometBaseline_v*.zip.sha256
+          if-no-files-found: error
+
+  # Everything that is built lands under Releases, but not as the same kind of thing:
+  #
+  #   main            -> a DRAFT tagged v<version>. The real release; a human looks at it and
+  #                      presses publish. An existing tag is never moved - a version is
+  #                      published once.
+  #   nightly, buildtest, manual run
+  #                   -> a PRERELEASE tagged preview-<sha>, visible in the tab right away and
+  #                      never marked "latest". One per commit, so a preview and the sha256 in
+  #                      its notes belong together permanently.
+  #
+  # Pull requests publish nothing (a fork must not be able to tag this repository).
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: komet*
+          merge-multiple: true
+          path: dist
+
+      # AssemblyInfo.cs is what the running mod reports; build.sh already refused to pack if
+      # the csproj disagreed with it, so either is authoritative by now.
+      - name: Work out what this is
+        id: what
+        run: |
+          version=$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' AssemblyInfo.cs)
+          [[ -n "$version" ]] || { echo "no version in AssemblyInfo.cs"; exit 1; }
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+
+          if [[ '${{ github.ref }}' == 'refs/heads/main' ]]; then
+            echo "preview=false"                >> "$GITHUB_OUTPUT"
+            echo "tag=v$version"                >> "$GITHUB_OUTPUT"
+            echo "name=Komet $version"          >> "$GITHUB_OUTPUT"
+            echo "draft=true"                   >> "$GITHUB_OUTPUT"
+            # 1.2.0-pre.2 is not a release; anything without a dash is
+            [[ "$version" == *-* ]] && echo "prerelease=true"  >> "$GITHUB_OUTPUT" \
+                                    || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "preview=true"                          >> "$GITHUB_OUTPUT"
+            echo "tag=preview-$sha"                      >> "$GITHUB_OUTPUT"
+            echo "name=Komet $version preview ($sha)"    >> "$GITHUB_OUTPUT"
+            echo "draft=false"                           >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"                       >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag the commit
+        run: |
+          tag='${{ steps.what.outputs.tag }}'
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag exists already - not moving it"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$tag" -m "Komet ${{ steps.what.outputs.tag }}"
+          git push origin "$tag"
+
+      - name: Build the release notes
+        run: |
+          {
+            if [[ '${{ steps.what.outputs.preview }}' == 'true' ]]; then
+              echo 'Preview build from `${{ github.ref_name }}`, commit `${{ github.sha }}`.'
+              echo 'Not a release: it has passed the checks, nothing more.'
+            else
+              echo 'Built from `${{ github.sha }}`.'
+            fi
+            echo
+            echo 'The build is reproducible: check out `${{ steps.what.outputs.tag }}` and run'
+            echo '`./build.sh release` to get files with exactly these checksums.'
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.what.outputs.tag }}
+          name: ${{ steps.what.outputs.name }}
+          body_path: notes.md
+          draft: ${{ steps.what.outputs.draft }}
+          prerelease: ${{ steps.what.outputs.prerelease }}
+          # a preview must never displace the real release at the top of the tab
+          make_latest: ${{ steps.what.outputs.preview == 'true' && 'false' || 'legacy' }}
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true

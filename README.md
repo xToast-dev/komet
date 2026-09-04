@@ -13,7 +13,9 @@ no assets are replaced; remove the mod and the game is untouched.
 ## Installation (players)
 
 Download the release zip from the ModDB page and drop it into your `Mods` folder —
-that's it. In game:
+that's it. The page lists a SHA-256 for the file; `sha256sum Komet_v<version>.zip`
+(PowerShell: `Get-FileHash`) proves that what you downloaded is what was uploaded.
+In game:
 
 ```
 F7               toggle the performance HUD
@@ -30,7 +32,7 @@ F7               toggle the performance HUD
 | .NET SDK 10.0 | `dotnet --version` |
 | Vintage Story 1.22.x | the game assemblies are the compile references; 1.22.7 is the verified reference |
 | Linux + bash | `build.sh`, the verify harness (`/proc`) and the bench target Linux; on other platforms `dotnet build` of the individual projects works with `-p:VsInstall=<game dir>` |
-| `bsdtar` (libarchive) | only for `./build.sh release` |
+| `python3` | only for `./build.sh release` (packs the zips reproducibly) |
 
 The game location defaults to `/opt/vintagestory` and can be overridden everywhere
 via the environment variable `VS_INSTALL` (or the MSBuild property `VsInstall`).
@@ -46,6 +48,8 @@ Nothing else outside this repository is required.
 ./build.sh preview    # print the HUD text without starting the game
 ./build.sh config     # regenerate dist/komet.json from the real config class
 ./build.sh release    # full checks, then pack dist/Komet_v<version>.zip for ModDB
+                      # (+ a .sha256 next to each zip, to publish on the download page;
+                      #  reproducible: the same commit produces the same bytes)
 ```
 
 `./build.sh` with no argument is the full check suite; a release candidate is

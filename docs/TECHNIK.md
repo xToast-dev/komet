@@ -2299,6 +2299,53 @@ Nicht übersetzt und mit Absicht: die Bucket-Namen in `WorstFrameTail` (`shadow`
 Dieselbe Funktion füttert HUD **und** Report, und das Vokabular der Ruckler-Zeilen muss über
 beide gleich lauten, sonst reden Log und Bildschirm über verschiedene Dinge.
 
+## Reproduzierbare Releases (05.09.)
+
+Der sha256 auf der ModDB-Seite ist nur dann eine Zusage, wenn ihn jemand nachrechnen kann.
+`./build.sh release` erzeugt deshalb aus demselben Commit dieselben Bytes — geprüft mit zwei
+Läufen und zusätzlich mit einem frischen Clone an einem anderen Pfad, alle drei identisch.
+
+Drei Dinge mussten dafür stillstehen, und alle drei waren erst nach dem Messen sichtbar:
+
+1. **Der Build-Stempel.** Er war „die Minute, in der gebaut wurde"; im Release-Pfad ist er
+   jetzt die Minute des **Commits** (UTC). Für einen Dev-Build bleibt es die Uhr — dort ist
+   die Frage ja „welchen Stand habe ich gerade laufen?".
+2. **Die Kompilierung.** Roslyn ist von Haus aus deterministisch, aber das Debug-Directory der
+   DLL trägt den absoluten Pfad der PDB, und der unterscheidet sich zwischen zwei Checkouts.
+   `KometReproducible=true` (nur im Release-Pfad) setzt `DebugType=none`, `PathMap` und
+   `ContinuousIntegrationBuild` — der Dev-Build behält seine PDB und damit Zeilennummern im
+   Stacktrace. Nebenbefund beim Messen: die SDK hängt die Commit-SHA an die
+   `InformationalVersion`, sobald in einem Repo gebaut wird — das erklärte den ersten
+   scheinbaren Pfad-Unterschied und ist genau das, was `KometVersion.StampFrom` kürzt.
+3. **Das Archiv.** Weder `bsdtar` noch Info-ZIP kommen infrage: beide schreiben ein
+   Extended-Timestamp-Extrafeld, das die **ctime** enthält, und die kann kein `touch` setzen —
+   zwei Läufe ergaben deshalb zwei Archive, die sich in genau 8 Bytes unterschieden. Das ZIP
+   entsteht jetzt mit Pythons `zipfile`: feste Reihenfolge, ein Zeitstempel (der des Commits),
+   feste Rechte, keine Extrafelder. Damit fällt auch die `libarchive-tools`-Abhängigkeit im
+   Workflow weg.
+
+Ein schmutziges Arbeitsverzeichnis macht die Zusage kaputt, weil der Hash dann zu keinem
+Commit gehört — `build.sh` sagt das in dem Fall vor dem Bauen.
+
+## Was unter Releases landet (05.09.)
+
+Zwei Sorten, weil sie zwei verschiedene Versprechen sind:
+
+| Auslöser | Tag | Form |
+|---|---|---|
+| Push auf `main` | `v<version>` | **Entwurf**, jemand schaut drauf und drückt veröffentlichen |
+| Push auf `nightly`/`buildtest`, manueller Lauf | `preview-<sha>` | **Prerelease**, sofort sichtbar, nie „latest" |
+| Pull Request | — | nichts (ein Fork darf dieses Repo nicht taggen) |
+
+Ein vorhandener Tag wird nie verschoben: eine Version wird einmal veröffentlicht, und ein
+Preview-Tag trägt den Commit, gehört also für immer zu genau diesen Bytes und zu dem sha256 in
+seinen Release-Notes. Genau deshalb steht in den Notes auch, wie man ihn nachrechnet — der
+Build ist reproduzierbar (siehe oben), die Zahl ist also überprüfbar und nicht nur behauptet.
+
+Die Actions laufen auf **node24**: `checkout@v7`, `setup-dotnet@v6`, `upload-artifact@v7`,
+`download-artifact@v8`, `action-gh-release@v3`. Die jeweils vorigen Majors hingen noch an
+node20; die Versionen sind gegen die `action.yml` der Actions geprüft, nicht geraten.
+
 ## Projektstruktur
 
 Ein Ordner ist ein Namespace, ohne Ausnahme: `Culling/` → `Komet.Culling`, `Measure/` →
