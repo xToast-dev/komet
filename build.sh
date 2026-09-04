@@ -22,10 +22,17 @@ BASELINE="KometBaseline"
 # wins so the release target and its inner check run agree on one stamp too.
 KOMET_BUILD="${KOMET_BUILD:-$(date +%y%m%d.%H%M)}"
 
-# Deterministic zip. bsdtar (and Info-ZIP) write an extended-timestamp extra field that
-# carries the file's ctime, which nothing can set - two runs of the same source produced two
-# different archives because of it. Python's zipfile writes exactly what is asked for:
-# entries in the given order, one fixed timestamp, fixed permissions, no extra fields.
+# Deterministic zip. Three things had to stop moving, each one measured rather than assumed:
+#
+#   1. bsdtar (and Info-ZIP) write an extended-timestamp extra field carrying the file's ctime,
+#      which nothing can set - two runs of the same source differed in exactly 8 bytes.
+#      Python's zipfile writes only what it is asked for.
+#   2. The entry timestamps, pinned to the commit (see the release target).
+#   3. The compression. Identical data does NOT give identical deflate streams: the runner has
+#      stock zlib, an Arch machine has zlib-ng, and the archives differed in every entry while
+#      every entry's CONTENT was identical. Deflate output is not specified, so the only way to
+#      make the container itself reproducible is to not compress at all. That costs about
+#      2.5x download size (179 -> 447 KB) and buys a checksum anyone can recompute.
 # Arguments: <stage dir> <zip> <epoch> <entry> [entry ...]
 pack_zip() {
   python3 - "$@" <<'PY'
@@ -44,11 +51,11 @@ def files(root, entry):
         for name in sorted(filenames):
             yield os.path.relpath(os.path.join(dirpath, name), root)
 
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
     for entry in sys.argv[4:]:
         for rel in files(stage, entry):
             info = zipfile.ZipInfo(rel.replace(os.sep, "/"), date_time=stamp)
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED
             info.create_system = 3          # unix, so the mode below is read back as one
             info.external_attr = 0o644 << 16
             with open(os.path.join(stage, rel), "rb") as f:

@@ -169,19 +169,28 @@ jobs:
             echo "prerelease=true"                       >> "$GITHUB_OUTPUT"
           fi
 
+      # A version is published once. If the tag is already there, the release that belongs to
+      # it was built from another commit, and quietly replacing its files would leave a release
+      # whose tag points somewhere else than its contents came from. Nothing is published then;
+      # bump the version to publish again. (Previews carry the commit in their tag, so they
+      # never land here.)
       - name: Tag the commit
+        id: tag
         run: |
           tag='${{ steps.what.outputs.tag }}'
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "$tag exists already - not moving it"
+            echo "$tag exists already - not moving it, and not replacing its release"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag -a "$tag" -m "Komet ${{ steps.what.outputs.tag }}"
           git push origin "$tag"
 
       - name: Build the release notes
+        if: steps.tag.outputs.publish == 'true'
         run: |
           {
             if [[ '${{ steps.what.outputs.preview }}' == 'true' ]]; then
@@ -201,6 +210,7 @@ jobs:
           cat notes.md
 
       - uses: softprops/action-gh-release@v3
+        if: steps.tag.outputs.publish == 'true'
         with:
           tag_name: ${{ steps.what.outputs.tag }}
           name: ${{ steps.what.outputs.name }}
@@ -213,3 +223,24 @@ jobs:
             dist/*.zip
             dist/*.sha256
           fail_on_unmatched_files: true
+
+      # One preview per commit means the tab would grow without end. The newest few are the
+      # only ones anybody wants - an older preview of the same branch has been superseded by
+      # definition. Tags go with them, so nothing is left pointing at a release that is gone.
+      # Version tags (v*) are never touched.
+      - name: Prune old previews
+        if: steps.what.outputs.preview == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: 3
+        run: |
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("preview-"))]
+                  | sort_by(.createdAt) | reverse | .[].tagName' \
+            | tail -n "+$((KEEP + 1))" \
+            | while read -r tag; do
+                [[ -n "$tag" ]] || continue
+                echo "deleting $tag"
+                gh release delete "$tag" --cleanup-tag --yes
+              done
+          echo "kept the newest $KEEP preview(s)"

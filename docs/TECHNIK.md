@@ -2334,11 +2334,12 @@ liefen. `global.json` nagelt die Version deshalb fest (`rollForward: disable`), 
 Workflow gibt bewusst keine eigene `dotnet-version` an, damit genau eine Stelle entscheidet.
 **Und die zlib gehört auch dazu.** Nach dem Pinning war die DLL bytegleich (beide 395.776,
 gleicher Hash), das ZIP aber nicht: jeder Eintrag inhaltlich identisch, jeder Deflate-Strom
-anders — Arch liefert `zlib-ng`, der Runner Standard-zlib, und die beiden erzeugen aus
-denselben Daten verschiedene Ströme. Damit gilt die Zusage heute für den **Inhalt** des
-Archivs, nicht für seine Hülle. Der Hash auf der Downloadseite ist der der veröffentlichten
-Datei; wer nachbaut, bekommt dieselbe DLL, aber möglicherweise ein anders gepacktes ZIP.
-Unkomprimiert zu packen würde auch die Hülle festnageln und kostet 179 KB → 447 KB.
+anders — Arch liefert `zlib-ng`, der Runner Standard-zlib, und beide erzeugen aus denselben
+Daten verschiedene Ströme. Deflate-Ausgabe ist nicht spezifiziert, es gibt also keinen
+Parameter, der das geradezieht. Das Archiv wird deshalb **unkomprimiert** gepackt
+(`ZIP_STORED`): 179 KB → 447 KB Download, dafür ein Hash, den jeder auf jeder Maschine
+nachrechnen kann. Für eine Mod, deren Zweck die Überprüfbarkeit ihrer Aussagen ist, war das
+der bessere Tausch.
 
 ## Was unter Releases landet (05.09.)
 
