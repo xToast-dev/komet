@@ -5,7 +5,10 @@ name: build
 # A transpiler that no longer matches the engine fails here instead of in someone's world.
 on:
   push:
-    branches: [main, nightly]
+    # buildtest is the branch this workflow is being tried out on - remove it once it has
+    # proven itself. workflow_dispatch is no help until the file reaches the default branch:
+    # GitHub only offers "Run workflow" for workflows that exist on main.
+    branches: [main, nightly, buildtest]
     paths-ignore: ['docs/**', 'moddb/**', 'README.md']
   pull_request:
   workflow_dispatch:
