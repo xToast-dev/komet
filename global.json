@@ -1,0 +1,13 @@
+{
+  "$comment": [
+    "Pinned so a release build is reproducible: the compiler is part of the input, and two",
+    "SDK patch levels produce different assemblies (measured: 395264 vs 395776 bytes for the",
+    "same commit). CI installs exactly this version from here - the workflow deliberately",
+    "passes no dotnet-version of its own, so there is one place that decides.",
+    "Raising it is a normal change; it just has to be a deliberate one."
+  ],
+  "sdk": {
+    "version": "10.0.111",
+    "rollForward": "disable"
+  }
+}

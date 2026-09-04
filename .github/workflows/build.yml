@@ -47,10 +47,10 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # No version here on purpose: global.json pins it, so the runner and a developer's
+      # machine compile with the same SDK - which is what makes the release reproducible.
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: '10.0.x'
 
       # Fails with the missing file names rather than with a wall of CS0246 "type or
       # namespace not found" from the first reference that could not be resolved.

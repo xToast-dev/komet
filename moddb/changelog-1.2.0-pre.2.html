@@ -40,10 +40,13 @@
 {{SHA256_BASELINE}}  KometBaseline_v1.1.0.zip</pre>
 <p>Check it with <code>sha256sum Komet_v1.2.0-pre.2.zip</code> (Linux) or
 <code>Get-FileHash Komet_v1.2.0-pre.2.zip</code> (Windows PowerShell).</p>
-<p>The same numbers are published on GitHub, so this page is not the only place that
-asserts them: <a href="https://github.com/xToast-dev/komet/releases">github.com/xToast-dev/komet/releases</a>
-carries them in the release notes, produced by the build job rather than typed in by hand.
-And because the build is reproducible, you can check out that release's tag
-(<code>{{COMMIT}}</code>) and run <code>./build.sh release</code> to obtain files with exactly
-these checksums &mdash; a hash you can reproduce says something a hash you can only compare
-does not.</p>
+<p>This page is not the only place that asserts them.
+<a href="https://github.com/xToast-dev/komet/releases">github.com/xToast-dev/komet/releases</a>
+carries the same numbers in the release notes and as <code>.sha256</code> files next to the
+downloads, written by the build job rather than typed in by hand &mdash; so the checksum here
+and the checksum there have to agree, and neither was produced by whoever wrote this page.</p>
+<p>Beyond comparing, you can reproduce them: the release build is deterministic. Check out
+<code>{{COMMIT}}</code> and run <code>./build.sh release</code>, and the files come out with
+exactly these checksums. The compiler is part of that &mdash; a different SDK patch level
+produces a different assembly &mdash; which is why the version is pinned in
+<code>global.json</code> rather than left to whichever machine builds.</p>
