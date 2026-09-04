@@ -13,7 +13,9 @@ no assets are replaced; remove the mod and the game is untouched.
 ## Installation (players)
 
 Download the release zip from the ModDB page and drop it into your `Mods` folder —
-that's it. In game:
+that's it. The page lists a SHA-256 for the file; `sha256sum Komet_v<version>.zip`
+(PowerShell: `Get-FileHash`) proves that what you downloaded is what was uploaded.
+In game:
 
 ```
 F7               toggle the performance HUD
@@ -46,6 +48,7 @@ Nothing else outside this repository is required.
 ./build.sh preview    # print the HUD text without starting the game
 ./build.sh config     # regenerate dist/komet.json from the real config class
 ./build.sh release    # full checks, then pack dist/Komet_v<version>.zip for ModDB
+                      # (+ a .sha256 next to each zip, to publish on the download page)
 ```
 
 `./build.sh` with no argument is the full check suite; a release candidate is
