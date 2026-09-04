@@ -20,6 +20,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,7 +37,12 @@ jobs:
       KOMET_SKIP_BENCH: ${{ inputs.run_bench && '0' || '1' }}
 
     steps:
+      # The build stamp and every timestamp in the zip come from the commit, so the tag step
+      # and the packer both need real git data, not a shallow snapshot.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -64,10 +72,6 @@ jobs:
             exit 1
           fi
           echo "all 21 game assemblies present"
-
-      # bsdtar writes the mod zips in build.sh; the runner image does not always carry it.
-      - name: Install bsdtar
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools
 
       # build.sh is the single source of truth for what a release is: it builds both mods,
       # runs the checks, and only then packs the zips (with a modinfo.json generated from
@@ -107,3 +111,77 @@ jobs:
             dist/KometBaseline_v*.zip
             dist/KometBaseline_v*.zip.sha256
           if-no-files-found: error
+
+  # Publishes what the build job produced. A draft, so nothing goes public until it has been
+  # looked at, and the checksums are in the body: the number on the ModDB page and the number
+  # on the release are then the same, and both can be recomputed from the tagged commit.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: komet*
+          merge-multiple: true
+          path: dist
+
+      # AssemblyInfo.cs is what the running mod reports; build.sh already refused to pack if
+      # the csproj disagreed with it, so either is authoritative by now.
+      - name: Read the version
+        id: version
+        run: |
+          version=$(sed -n 's/.*Version = "\([^"]*\)".*/\1/p' AssemblyInfo.cs)
+          [[ -n "$version" ]] || { echo "no version in AssemblyInfo.cs"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          # 1.2.0-pre.2 is not a release; anything without a dash is
+          [[ "$version" == *-* ]] && echo "prerelease=true" >> "$GITHUB_OUTPUT" \
+                                  || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+
+      # An existing tag is left alone: a version is published once. Bump the version in
+      # AssemblyInfo.cs + Komet.csproj to publish again.
+      - name: Tag the commit
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag exists already - not moving it"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$tag" -m "Komet $tag"
+          git push origin "$tag"
+
+      - name: Build the release notes
+        id: notes
+        run: |
+          {
+            echo 'Built from `${{ github.sha }}`.'
+            echo
+            echo 'The build is reproducible: check out the tag and run `./build.sh release`'
+            echo 'to get files with exactly these checksums.'
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Komet ${{ steps.version.outputs.version }}
+          body_path: notes.md
+          draft: true
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true
