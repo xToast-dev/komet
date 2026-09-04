@@ -8,6 +8,8 @@
 #   ./build.sh fingerprint  regenerate Guard/EngineFingerprint.cs (IL hashes of every engine
 #                           method the patches touch, against VS_INSTALL) - after a game update
 #   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB
+# Environment: VS_INSTALL points at the game (default /opt/vintagestory), KOMET_SKIP_BENCH=1
+# leaves out the throughput benchmark (CI: it gates nothing and dominates the runtime).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -132,9 +134,14 @@ EOF
     echo "== patch + behaviour checks =="
     dotnet build verify -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
     dotnet verify/bin/Release/net10.0/KometVerify.dll
-    echo
-    echo "== equivalence + throughput =="
-    dotnet build bench -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
-    dotnet bench/bin/Release/net10.0/KometBench.dll
+    # The benchmark measures throughput, it does not gate anything (it has no failing
+    # exit code). On a shared CI runner its numbers are noise and it is by far the longest
+    # step, so KOMET_SKIP_BENCH=1 leaves it out there - the checks above are the gate.
+    if [[ "${KOMET_SKIP_BENCH:-0}" != "1" ]]; then
+      echo
+      echo "== equivalence + throughput =="
+      dotnet build bench -c Release -v q --nologo -p:VsInstall="$VS_INSTALL"
+      dotnet bench/bin/Release/net10.0/KometBench.dll
+    fi
     ;;
 esac
