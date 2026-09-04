@@ -2327,6 +2327,15 @@ Drei Dinge mussten dafür stillstehen, und alle drei waren erst nach dem Messen 
 Ein schmutziges Arbeitsverzeichnis macht die Zusage kaputt, weil der Hash dann zu keinem
 Commit gehört — `build.sh` sagt das in dem Fall vor dem Bauen.
 
+**Der Compiler gehört zur Eingabe (05.09.).** Der erste CI-Lauf hat die Lücke sofort gezeigt:
+derselbe Commit ergab lokal und auf dem Runner verschiedene DLLs — nicht ein paar Bytes,
+sondern verschiedene *Größen* (395.264 gegen 395.776), weil die SDK-Patchstände auseinander
+liefen. `global.json` nagelt die Version deshalb fest (`rollForward: disable`), und der
+Workflow gibt bewusst keine eigene `dotnet-version` an, damit genau eine Stelle entscheidet.
+Was danach theoretisch noch variieren kann, ist die zlib des Systems (das ZIP wird
+deflate-komprimiert); ob das in der Praxis auseinanderläuft, zeigt der Abgleich zwischen
+CI-Artefakt und lokalem Nachbau — genau so ist der SDK-Unterschied aufgefallen.
+
 ## Was unter Releases landet (05.09.)
 
 Zwei Sorten, weil sie zwei verschiedene Versprechen sind:

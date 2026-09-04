@@ -187,9 +187,23 @@ EOF
     echo "== release candidate: dist/$ZIP + dist/$B_ZIP (v$VERSION b$KOMET_BUILD) =="
     python3 -m zipfile -l "dist/$ZIP"
     python3 -m zipfile -l "dist/$B_ZIP"
+    # The changelog for the ModDB page carries the checksum, and the checksum cannot live in
+    # the repository: writing it into a tracked file would change the commit and with it the
+    # checksum. So moddb/ holds the template and the finished text is written here, next to
+    # the files it describes.
+    CHANGELOG="moddb/changelog-${VERSION}.html"
+    if [[ -f "$CHANGELOG" ]]; then
+      sed -e "s|{{SHA256_KOMET}}|$(cut -d' ' -f1 < "dist/$ZIP.sha256")|g" \
+          -e "s|{{SHA256_BASELINE}}|$(cut -d' ' -f1 < "dist/$B_ZIP.sha256")|g" \
+          -e "s|{{COMMIT}}|$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)|g" \
+          "$CHANGELOG" > "dist/changelog-${VERSION}.html"
+    fi
+
     echo
     echo "== sha256 (for the ModDB page) =="
     cat "dist/$ZIP.sha256" "dist/$B_ZIP.sha256"
+    [[ -f "dist/changelog-${VERSION}.html" ]] \
+      && echo "changelog with those checksums filled in: dist/changelog-${VERSION}.html"
     ;;
   deploy)
     # Die Mod hiess bis 1.51.8 VsPerf - eine liegengebliebene alte DLL wuerde doppelt laden.
