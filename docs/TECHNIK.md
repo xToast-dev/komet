@@ -2332,9 +2332,13 @@ derselbe Commit ergab lokal und auf dem Runner verschiedene DLLs — nicht ein p
 sondern verschiedene *Größen* (395.264 gegen 395.776), weil die SDK-Patchstände auseinander
 liefen. `global.json` nagelt die Version deshalb fest (`rollForward: disable`), und der
 Workflow gibt bewusst keine eigene `dotnet-version` an, damit genau eine Stelle entscheidet.
-Was danach theoretisch noch variieren kann, ist die zlib des Systems (das ZIP wird
-deflate-komprimiert); ob das in der Praxis auseinanderläuft, zeigt der Abgleich zwischen
-CI-Artefakt und lokalem Nachbau — genau so ist der SDK-Unterschied aufgefallen.
+**Und die zlib gehört auch dazu.** Nach dem Pinning war die DLL bytegleich (beide 395.776,
+gleicher Hash), das ZIP aber nicht: jeder Eintrag inhaltlich identisch, jeder Deflate-Strom
+anders — Arch liefert `zlib-ng`, der Runner Standard-zlib, und die beiden erzeugen aus
+denselben Daten verschiedene Ströme. Damit gilt die Zusage heute für den **Inhalt** des
+Archivs, nicht für seine Hülle. Der Hash auf der Downloadseite ist der der veröffentlichten
+Datei; wer nachbaut, bekommt dieselbe DLL, aber möglicherweise ein anders gepacktes ZIP.
+Unkomprimiert zu packen würde auch die Hülle festnageln und kostet 179 KB → 447 KB.
 
 ## Was unter Releases landet (05.09.)
 

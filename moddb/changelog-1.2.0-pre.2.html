@@ -45,8 +45,11 @@
 carries the same numbers in the release notes and as <code>.sha256</code> files next to the
 downloads, written by the build job rather than typed in by hand &mdash; so the checksum here
 and the checksum there have to agree, and neither was produced by whoever wrote this page.</p>
-<p>Beyond comparing, you can reproduce them: the release build is deterministic. Check out
-<code>{{COMMIT}}</code> and run <code>./build.sh release</code>, and the files come out with
-exactly these checksums. The compiler is part of that &mdash; a different SDK patch level
-produces a different assembly &mdash; which is why the version is pinned in
-<code>global.json</code> rather than left to whichever machine builds.</p>
+<p>Beyond comparing, you can rebuild it: check out <code>{{COMMIT}}</code> and run
+<code>./build.sh release</code>, and every file inside the zip comes out byte for byte the
+same, <code>Komet.dll</code> included. The compiler is part of that &mdash; a different SDK
+patch level produces a different assembly &mdash; which is why the version is pinned in
+<code>global.json</code> rather than left to whichever machine builds. The checksum of the zip
+itself can still differ from the one above if your system compresses differently (zlib and
+zlib-ng do not produce identical streams from identical data); the file <em>contents</em> are
+what the build guarantees, and the checksum above belongs to the file published here.</p>
