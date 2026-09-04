@@ -2327,6 +2327,25 @@ Drei Dinge mussten dafür stillstehen, und alle drei waren erst nach dem Messen 
 Ein schmutziges Arbeitsverzeichnis macht die Zusage kaputt, weil der Hash dann zu keinem
 Commit gehört — `build.sh` sagt das in dem Fall vor dem Bauen.
 
+## Was unter Releases landet (05.09.)
+
+Zwei Sorten, weil sie zwei verschiedene Versprechen sind:
+
+| Auslöser | Tag | Form |
+|---|---|---|
+| Push auf `main` | `v<version>` | **Entwurf**, jemand schaut drauf und drückt veröffentlichen |
+| Push auf `nightly`/`buildtest`, manueller Lauf | `preview-<sha>` | **Prerelease**, sofort sichtbar, nie „latest" |
+| Pull Request | — | nichts (ein Fork darf dieses Repo nicht taggen) |
+
+Ein vorhandener Tag wird nie verschoben: eine Version wird einmal veröffentlicht, und ein
+Preview-Tag trägt den Commit, gehört also für immer zu genau diesen Bytes und zu dem sha256 in
+seinen Release-Notes. Genau deshalb steht in den Notes auch, wie man ihn nachrechnet — der
+Build ist reproduzierbar (siehe oben), die Zahl ist also überprüfbar und nicht nur behauptet.
+
+Die Actions laufen auf **node24**: `checkout@v7`, `setup-dotnet@v6`, `upload-artifact@v7`,
+`download-artifact@v8`, `action-gh-release@v3`. Die jeweils vorigen Majors hingen noch an
+node20; die Versionen sind gegen die `action.yml` der Actions geprüft, nicht geraten.
+
 ## Projektstruktur
 
 Ein Ordner ist ein Namespace, ohne Ausnahme: `Culling/` → `Komet.Culling`, `Measure/` →
