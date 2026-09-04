@@ -93,7 +93,7 @@ case "${1:-check}" in
       KOMET_BUILD="${KOMET_BUILD_OVERRIDE:-$(TZ=UTC git log -1 --format=%cd --date=format-local:%y%m%d.%H%M)}"
       SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
       if [[ -n "$(git status --porcelain)" ]]; then
-        echo "WARNUNG: Arbeitsverzeichnis nicht sauber - der sha256 gehoert dann zu keinem Commit" >&2
+        echo "WARNUNG: Arbeitsverzeichnis nicht sauber - der sha256 gehört dann zu keinem Commit" >&2
       fi
     else
       # no repository around (a source drop): fall back to the clock and say so
