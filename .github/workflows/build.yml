@@ -1,0 +1,90 @@
+name: build
+
+# The gate is the verify suite: it applies every real Harmony patch to the real game
+# assemblies, forces JIT compilation and checks behaviour - without starting the game.
+# A transpiler that no longer matches the engine fails here instead of in someone's world.
+on:
+  push:
+    branches: [main, nightly]
+    paths-ignore: ['docs/**', 'moddb/**', 'README.md']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: 'Also run the throughput benchmark (slow, measures nothing useful on a shared runner)'
+        type: boolean
+        default: false
+
+# A second push onto the same branch makes the first run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      # The game assemblies the projects compile against, in the layout the .csproj files
+      # expect (see .github/vintagestory/README.md). They are not on a public feed, so they
+      # live in the repository.
+      VS_INSTALL: ${{ github.workspace }}/.github/vintagestory
+      # No benchmark unless it was asked for: it gates nothing (no failing exit code) and is
+      # by far the longest step.
+      KOMET_SKIP_BENCH: ${{ inputs.run_bench && '0' || '1' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Fails with the missing file names rather than with a wall of CS0246 "type or
+      # namespace not found" from the first reference that could not be resolved.
+      - name: Check the game assemblies are present
+        run: |
+          missing=()
+          for f in VintagestoryAPI.dll VintagestoryLib.dll \
+                   Lib/0Harmony.dll Lib/cairo-sharp.dll Lib/Newtonsoft.Json.dll \
+                   Lib/OpenTK.Core.dll Lib/OpenTK.Graphics.dll Lib/OpenTK.Mathematics.dll \
+                   Lib/OpenTK.Windowing.Common.dll Lib/OpenTK.Windowing.Desktop.dll \
+                   Lib/OpenTK.Windowing.GraphicsLibraryFramework.dll \
+                   Lib/protobuf-net.dll Lib/SkiaSharp.dll \
+                   Lib/Mono.Cecil.dll Lib/MonoMod.Utils.dll Lib/MonoMod.Core.dll \
+                   Lib/MonoMod.Backports.dll Lib/MonoMod.ILHelpers.dll Lib/MonoMod.Iced.dll \
+                   Mods/VSEssentials.dll Mods/VSSurvivalMod.dll; do
+            [[ -f "$VS_INSTALL/$f" ]] || missing+=("$f")
+          done
+          if (( ${#missing[@]} )); then
+            printf 'missing in .github/vintagestory:\n'
+            printf '  %s\n' "${missing[@]}"
+            printf 'see .github/vintagestory/README.md for the expected layout\n'
+            exit 1
+          fi
+          echo "all 21 game assemblies present"
+
+      # bsdtar writes the mod zips in build.sh; the runner image does not always carry it.
+      - name: Install bsdtar
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools
+
+      # build.sh is the single source of truth for what a release is: it builds both mods,
+      # runs the checks, and only then packs the zips (with a modinfo.json generated from
+      # AssemblyInfo.cs, so the zip metadata can never disagree with the binary).
+      - name: Build, verify and pack
+        run: ./build.sh release
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: komet
+          path: dist/Komet_v*.zip
+          if-no-files-found: error
+
+      - name: Upload baseline mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: komet-baseline
+          path: dist/KometBaseline_v*.zip
+          if-no-files-found: error
