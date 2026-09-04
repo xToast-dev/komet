@@ -11,8 +11,12 @@
   <ItemGroup>
     <!-- KometModSystem is compiled in on purpose: the "every patch class is reachable"
          check reflects over its IL. Excluding it is what let a dead patch ship. -->
-    <Compile Include="../src/**/*.cs" Exclude="../src/AssemblyInfo.cs" />
-    <Compile Include="../shared/**/*.cs" LinkBase="shared" />
+    <Compile Include="../*.cs" Exclude="../AssemblyInfo.cs" />
+    <Compile Include="../Culling/**/*.cs" LinkBase="Culling" />
+    <Compile Include="../Runtime/**/*.cs" LinkBase="Runtime" />
+    <Compile Include="../Guard/**/*.cs" LinkBase="Guard" />
+    <Compile Include="../Patches/**/*.cs" LinkBase="Patches" />
+    <Compile Include="../Measure/**/*.cs" LinkBase="Measure" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="VintagestoryAPI"><HintPath>$(VsInstall)/VintagestoryAPI.dll</HintPath><Private>true</Private></Reference>

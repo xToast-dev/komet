@@ -1,7 +1,7 @@
 using System;
 using System.Diagnostics;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Bounds how much chunk mesh data the main thread pushes to the GPU in one frame.

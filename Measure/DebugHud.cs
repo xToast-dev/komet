@@ -344,7 +344,7 @@ public class DebugHud : IRenderer
             // synchronous for the session and repaint, so the HUD never freezes on stale text
             rasterBroken = true;
             lastText = "";
-            capi.Logger.Warning("{0} HUD: hintergrund-raster fehlgeschlagen, ab jetzt synchron: {1}",
+            capi.Logger.Warning("{0} HUD: background raster failed, synchronous from now on: {1}",
                 title, t.Exception?.GetBaseException()?.Message);
             return;
         }
@@ -607,7 +607,7 @@ public class DebugHud : IRenderer
         (string label, double ms)[] buckets =
         {
             ("before", FrameStats.WorstStageMs[(int)EnumRenderStage.Before]),
-            ("schatten", FrameStats.WorstShadowMs),
+            ("shadow", FrameStats.WorstShadowMs),
             ("opaque", FrameStats.WorstStageMs[(int)EnumRenderStage.Opaque]),
             ("oit", FrameStats.WorstStageMs[(int)EnumRenderStage.OIT]),
             ("post", FrameStats.WorstPostComposeMs),
@@ -615,7 +615,7 @@ public class DebugHud : IRenderer
             ("done", FrameStats.WorstStageMs[(int)EnumRenderStage.Done]),
             ("tick", FrameStats.WorstGameTickMs),
             ("swap", FrameStats.WorstSwapMs),
-            ("draussen", Math.Max(0, FrameStats.WorstOutsideMs - FrameStats.WorstSwapMs)),
+            ("outside", Math.Max(0, FrameStats.WorstOutsideMs - FrameStats.WorstSwapMs)),
         };
 
         double total = 0;
@@ -661,7 +661,7 @@ public class DebugHud : IRenderer
         if (!FrameStats.HasData)
         {
             sb.Append(title).Append('\n');
-            sb.Append("sammelt Daten ... (").Append(FrameStats.TotalFrames).Append(" frames)");
+            sb.Append(Loc.T("komet:hud-collecting", "collecting data ... ({0} frames)", FrameStats.TotalFrames));
             return sb.ToString();
         }
 
@@ -671,30 +671,30 @@ public class DebugHud : IRenderer
 
         sb.Append(title).Append('\n');
         sb.Append(Rule, 0, 34).Append('\n');
-        Row(sb, "fps", fps.ToString("F0", ci), Ms(frame));
+        Row(sb, Loc.Hud("fps"), fps.ToString("F0", ci), Ms(frame));
         if (GpuFrameTimer.GpuMs > 0)
-            Row(sb, "gpu-frame", Pct(GpuFrameTimer.GpuMs, frame), Ms(GpuFrameTimer.GpuMs),
-                GpuBusy.IsLimited(GpuFrameTimer.GpuMs, frame) ? "GPU-LIMITIERT" : null);
+            Row(sb, Loc.Hud("gpu frame"), Pct(GpuFrameTimer.GpuMs, frame), Ms(GpuFrameTimer.GpuMs),
+                GpuBusy.IsLimited(GpuFrameTimer.GpuMs, frame) ? Loc.T("komet:hud-gpu-limited", "GPU-LIMITED") : null);
         if (GpuBusy.Available)
-            Row(sb, "gpu-last", GpuBusy.Percent.ToString(ci) + " %", null, GpuBusy.Source);
+            Row(sb, Loc.Hud("gpu load"), GpuBusy.Percent.ToString(ci) + " %", null, GpuBusy.Source);
         if (HitchLog.TotalHitches > 0)
         {
-            Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
+            Row(sb, Loc.Hud("hitches"), N(HitchLog.TotalHitches), null,
                 HitchLog.PerMinute.ToString("F1", ci) + "/min");
             var lastHitch = HitchLog.LastTail();
-            if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
+            if (lastHitch != null) Row(sb, "  " + Loc.Hud("last"), null, null, lastHitch);
         }
         if (FrameStats.GcPauseMsPerSecond > 0.05)
-            Row(sb, "gc-pausen", null, Ms(FrameStats.GcPauseMsPerSecond), "je s");
+            Row(sb, Loc.Hud("gc pauses"), null, Ms(FrameStats.GcPauseMsPerSecond), Loc.T("komet:hud-per-s", "per s"));
         // only while the world is actually loading - a finished world earns a smaller HUD
         if (Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation > 50
             || TesselationStats.ReceivedPerSecond > 0.5)
-            Row(sb, "laden", TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s", null,
-                "warteschlange " + N(Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation));
+            Row(sb, Loc.Hud("loading"), TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s", null,
+                Loc.T("komet:hud-queue", "queue {0}", N(Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation)));
 
         warnings?.Invoke(sb, frame);
 
-        sb.Append(" F7: details, noch mal: aus");
+        sb.Append(Loc.T("komet:hud-f7-hint", " F7: details, again: off"));
         return sb.ToString();
     }
 
@@ -711,7 +711,7 @@ public class DebugHud : IRenderer
         if (!FrameStats.HasData)
         {
             sb.Append(title).Append('\n');
-            sb.Append("sammelt Daten ... (").Append(FrameStats.TotalFrames).Append(" frames)");
+            sb.Append(Loc.T("komet:hud-collecting", "collecting data ... ({0} frames)", FrameStats.TotalFrames));
             return sb.ToString();
         }
 
@@ -719,22 +719,22 @@ public class DebugHud : IRenderer
         var fps = frame > 0 ? 1000.0 / frame : 0;
         var ci = CultureInfo.CurrentCulture;
 
-        sb.Append(title).Append(" · Mittelwerte\n");
+        sb.Append(title).Append(" · ").Append(Loc.T("komet:hud-averages", "averages")).Append('\n');
         sb.Append(Rule).Append('\n');
 
         // ---- how it runs, at a glance ----
-        Row(sb, "fps", fps.ToString("F0", ci), Ms(frame));
+        Row(sb, Loc.Hud("fps"), fps.ToString("F0", ci), Ms(frame));
         if (GpuFrameTimer.GpuMs > 0)
         {
             // The one comparison that settles CPU-bound vs GPU-bound: gpu >= cpu frame time
             // means the GPU is the wall and CPU work cannot move the framerate.
             var gpu = GpuFrameTimer.GpuMs;
-            Row(sb, "gpu-frame", Pct(gpu, frame), Ms(gpu), GpuBusy.IsLimited(gpu, frame) ? "GPU-LIMITIERT" : null);
+            Row(sb, Loc.Hud("gpu frame"), Pct(gpu, frame), Ms(gpu), GpuBusy.IsLimited(gpu, frame) ? Loc.T("komet:hud-gpu-limited", "GPU-LIMITED") : null);
         }
         // The span above includes the GPU's idle gaps between submissions; this is what the
         // driver counted as busy. The two differ exactly when the CPU is the wall.
         if (GpuBusy.Available)
-            Row(sb, "gpu-last", GpuBusy.Percent.ToString(ci) + " %", null, "auslastung (" + GpuBusy.Source + ")");
+            Row(sb, Loc.Hud("gpu load"), GpuBusy.Percent.ToString(ci) + " %", null, Loc.T("komet:hud-busy", "busy ({0})", GpuBusy.Source));
         if (GpuFrameTimer.StageSamples > 0)
         {
             // the GPU's own split, next to the CPU-side stage rows further down
@@ -742,26 +742,26 @@ public class DebugHud : IRenderer
                 EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone);
             var postGpu = GpuFrameTimer.StageSum(EnumRenderStage.AfterOIT, EnumRenderStage.AfterPostProcessing,
                 EnumRenderStage.AfterFinalComposition, EnumRenderStage.AfterBlit);
-            Row(sb, "gpu-stages", null, null,
-                "schatten " + shadowGpu.ToString("F1", ci)
+            Row(sb, Loc.Hud("gpu stages"), null, null,
+                Loc.T("komet:hud-shadow-sp", "shadow ") + shadowGpu.ToString("F1", ci)
                 + " · opaque " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Opaque].ToString("F1", ci)
                 + " · oit " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.OIT].ToString("F1", ci)
                 + " · post " + postGpu.ToString("F1", ci)
                 + " · ortho " + GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Ortho].ToString("F1", ci) + " ms");
         }
-        Row(sb, "schlechtester", null, Ms(FrameStats.MaxFrameMs));
+        Row(sb, Loc.Hud("worst"), null, Ms(FrameStats.MaxFrameMs));
         // where the worst frame actually went - a hitch's cause is invisible in the smoothed
         // averages precisely because it is rare
         var worst = WorstFrameTail();
-        if (worst != null) Row(sb, "  davon", null, null, worst);
+        if (worst != null) Row(sb, "  " + Loc.Hud("of which"), null, null, worst);
         // Every frame over the hitch threshold, attributed and split by camera movement -
         // the row that turns "es ruckelt beim drehen" into a countable statement.
         if (HitchLog.TotalHitches > 0)
         {
-            Row(sb, "ruckler", N(HitchLog.TotalHitches), null,
+            Row(sb, Loc.Hud("hitches"), N(HitchLog.TotalHitches), null,
                 HitchLog.PerMinute.ToString("F1", ci) + "/min, " + HitchLog.CommandHint);
             var lastHitch = HitchLog.LastTail();
-            if (lastHitch != null) Row(sb, "  zuletzt", null, null, lastHitch);
+            if (lastHitch != null) Row(sb, "  " + Loc.Hud("last"), null, null, lastHitch);
         }
 
         // ---- where the frame goes ----
@@ -769,37 +769,37 @@ public class DebugHud : IRenderer
         // share of the frame drawn as a bar (ten cells = the whole frame). Including the game
         // tick and the outside-the-stages remainder, the block accounts for 100 % - the eye
         // compares bars instead of parsing a percent column.
-        Section(sb, "frame-aufteilung");
-        BucketRow(sb, "before", FrameStats.StageMs[(int)EnumRenderStage.Before], frame);
+        Section(sb, Loc.Hud("frame breakdown"));
+        BucketRow(sb, Loc.Hud("before"), FrameStats.StageMs[(int)EnumRenderStage.Before], frame);
         // each cascade including its Done half, so nothing hides between the rows
-        BucketRow(sb, "schatten fern", FrameStats.StageMs[(int)EnumRenderStage.ShadowFar]
+        BucketRow(sb, Loc.Hud("shadow far"), FrameStats.StageMs[(int)EnumRenderStage.ShadowFar]
                                      + FrameStats.StageMs[(int)EnumRenderStage.ShadowFarDone], frame);
-        BucketRow(sb, "schatten nah", FrameStats.StageMs[(int)EnumRenderStage.ShadowNear]
+        BucketRow(sb, Loc.Hud("shadow near"), FrameStats.StageMs[(int)EnumRenderStage.ShadowNear]
                                     + FrameStats.StageMs[(int)EnumRenderStage.ShadowNearDone], frame);
-        BucketRow(sb, "opaque", FrameStats.StageMs[(int)EnumRenderStage.Opaque], frame);
-        BucketRow(sb, "oit", FrameStats.StageMs[(int)EnumRenderStage.OIT], frame);
+        BucketRow(sb, Loc.Hud("opaque"), FrameStats.StageMs[(int)EnumRenderStage.Opaque], frame);
+        BucketRow(sb, Loc.Hud("oit"), FrameStats.StageMs[(int)EnumRenderStage.OIT], frame);
         // AfterOIT through AfterBlit - SSAO, god rays, colour grading; a fifth of the frame
         // used to be invisible here
-        BucketRow(sb, "post/compose", FrameStats.PostComposeMs, frame);
-        BucketRow(sb, "ortho (gui)", FrameStats.StageMs[(int)EnumRenderStage.Ortho], frame);
-        BucketRow(sb, "done", FrameStats.StageMs[(int)EnumRenderStage.Done], frame);
-        BucketRow(sb, "game tick", FrameStats.GameTickMs, frame);
+        BucketRow(sb, Loc.Hud("post/compose"), FrameStats.PostComposeMs, frame);
+        BucketRow(sb, Loc.Hud("ortho (gui)"), FrameStats.StageMs[(int)EnumRenderStage.Ortho], frame);
+        BucketRow(sb, Loc.Hud("done"), FrameStats.StageMs[(int)EnumRenderStage.Done], frame);
+        BucketRow(sb, Loc.Hud("game tick"), FrameStats.GameTickMs, frame);
         // Whatever no stage and no tick accounts for: buffer swap, frame limiter, driver
         // back-pressure. Naming it stops it from being mistaken for measurement error.
-        BucketRow(sb, "ausserhalb", FrameStats.OutsideStagesMs, frame,
+        BucketRow(sb, Loc.Hud("outside"), FrameStats.OutsideStagesMs, frame,
             FrameStats.AvgSwapMs > 0.005
-                ? "davon swap " + FrameStats.AvgSwapMs.ToString("F2", ci)
-                : "swap/treiber");
+                ? Loc.T("komet:hud-of-which-swap", "of which swap {0}", FrameStats.AvgSwapMs.ToString("F2", ci))
+                : Loc.T("komet:hud-swap-driver", "swap/driver"));
 
         // ---- gc ----
         // GC pauses stop every thread at once - the only mechanism that slows the render
         // thread, the tesselation thread and the occlusion worker by the same factor at the
         // same time. When this section is large, no renderer is guilty; the allocations are.
-        Section(sb, "gc");
+        Section(sb, Loc.Hud("gc"));
         if (FrameStats.GcPauseMsPerSecond > 0.05)
-            Row(sb, "gc-pausen", FrameStats.Gen0PerSecond.ToString("F0", ci) + "/s",
+            Row(sb, Loc.Hud("gc pauses"), FrameStats.Gen0PerSecond.ToString("F0", ci) + "/s",
                 Ms(FrameStats.GcPauseMsPerSecond),
-                "je s · " + FrameStats.AllocMbPerSecond.ToString("F0", ci) + " MB/s alloc"
+                Loc.T("komet:hud-per-s-alloc", "per s · {0} MB/s alloc", FrameStats.AllocMbPerSecond.ToString("F0", ci))
                 + (FrameStats.Gen2PerSecond > 0.05
                     ? " · gen2 " + FrameStats.Gen2PerSecond.ToString("F1", ci) + "/s"
                     : ""));
@@ -813,8 +813,8 @@ public class DebugHud : IRenderer
             var unattributed = Math.Max(0.0,
                 FrameStats.AllocMbPerSecond - FrameStats.MainAllocMbPerSecond
                 - FrameStats.NetAllocMbPerSecond - FrameStats.PrefetchAllocMbPerSecond - tessAlloc);
-            Row(sb, "alloc-quellen", "MB/s", null,
-                "netz " + FrameStats.NetAllocMbPerSecond.ToString("F0", ci)
+            Row(sb, Loc.Hud("alloc sources"), "MB/s", null,
+                Loc.T("komet:hud-net", "net ") + FrameStats.NetAllocMbPerSecond.ToString("F0", ci)
                 + " · main " + FrameStats.MainAllocMbPerSecond.ToString("F0", ci)
                 // prefetch is usually zero; it stays measured, but only earns screen width
                 // when it has something to say
@@ -822,7 +822,7 @@ public class DebugHud : IRenderer
                     ? " · prefetch " + FrameStats.PrefetchAllocMbPerSecond.ToString("F0", ci)
                     : "")
                 + " · tess " + tessAlloc.ToString("F0", ci)
-                + " · rest " + unattributed.ToString("F0", ci));
+                + Loc.T("komet:hud-rest", " · rest ") + unattributed.ToString("F0", ci));
         }
         // The mode, stated without a verdict attached.
         //
@@ -834,54 +834,55 @@ public class DebugHud : IRenderer
         // collections are never background. Which mode is right is now an open measurement, so
         // the HUD reports and the hitch log judges (see HitchLog.GcModeVerdict), rather than
         // both of them assuming.
-        Row(sb, "gc-modus", System.Runtime.GCSettings.IsServerGC ? "server" : "workst.", null,
+        Row(sb, Loc.Hud("gc mode"), System.Runtime.GCSettings.IsServerGC ? "server" : Loc.T("komet:hud-workstation", "workst."), null,
             HitchLog.WorstEphemeralPauseMs >= 1.0
-                ? "längste gen0/1-pause " + HitchLog.WorstEphemeralPauseMs.ToString("F0", ci) + " ms"
+                ? Loc.T("komet:hud-longest-ephemeral", "longest gen0/1 pause {0} ms", HitchLog.WorstEphemeralPauseMs.ToString("F0", ci))
                 : null);
 
         // ---- the world and the loading pipeline ----
-        Section(sb, "welt & laden");
+        Section(sb, Loc.Hud("world & loading"));
         // Not RuntimeStats.renderedTriangles: SystemRenderTerrain only fills those while the
         // engine's own debug screen is open, which is why the triangle figure once read "0 von 0".
-        Row(sb, "draw calls", N(drawCallsPerFrame), null,
-            "dreiecke " + Mio(renderedTris) + " von " + Mio(allocatedTris) + " mio");
-        Row(sb, "entities", N(RuntimeStats.renderedEntities));
-        Row(sb, "chunks", N(loadedChunks), null,
-            "warteschlange " + N(RuntimeStats.chunksAwaitingTesselation)
-            + "/" + N(RuntimeStats.chunksAwaitingPooling));
+        Row(sb, Loc.Hud("draw calls"), N(drawCallsPerFrame), null,
+            Loc.T("komet:hud-triangles", "triangles {0} of {1} mio", Mio(renderedTris), Mio(allocatedTris)));
+        Row(sb, Loc.Hud("entities"), N(RuntimeStats.renderedEntities));
+        Row(sb, Loc.Hud("chunks"), N(loadedChunks), null,
+            Loc.T("komet:hud-queue-2", "queue {0}/{1}",
+                N(RuntimeStats.chunksAwaitingTesselation), N(RuntimeStats.chunksAwaitingPooling)));
         if (TesselationStats.TotalChunks > 0)
         {
-            Row(sb, "tesselation", TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s",
+            Row(sb, Loc.Hud("tesselation"), TesselationStats.ChunksPerSecond.ToString("F0", ci) + "/s",
                 Ms(TesselationStats.MsPerChunk),
-                "je chunk · " + TesselationStats.NeighbourMsPerChunk.ToString("F1", ci) + " nachbarn · "
-                    + TesselationStats.AllocMbPerSecond.ToString("F0", ci) + " MB/s");
+                Loc.T("komet:hud-per-chunk", "per chunk · {0} neighbours · {1} MB/s",
+                    TesselationStats.NeighbourMsPerChunk.ToString("F1", ci),
+                    TesselationStats.AllocMbPerSecond.ToString("F0", ci)));
             // arrival rate from the server - a low number here with an empty queue means the
             // wait is server-side (worldgen/sending), not this client
-            Row(sb, "empfangen", TesselationStats.ReceivedPerSecond.ToString("F0", ci) + "/s", null,
-                "vom server");
+            Row(sb, Loc.Hud("received"), TesselationStats.ReceivedPerSecond.ToString("F0", ci) + "/s", null,
+                Loc.T("komet:hud-from-server", "from server"));
         }
         if (vramBytes > 0)
-            Row(sb, "terrain vram", N(vramBytes / 1048576.0) + " MB", null,
-                poolCount + " pools · " + (fragmentation * 100f).ToString("F0", ci) + " % frag");
-        Row(sb, "chunk upload", null, Ms(FrameStats.AvgUploadMs),
-            "max " + FrameStats.MaxUploadMs.ToString("F1", ci));
+            Row(sb, Loc.Hud("terrain vram"), N(vramBytes / 1048576.0) + " MB", null,
+                Loc.T("komet:hud-pools-frag", "{0} pools · {1} % frag", poolCount, (fragmentation * 100f).ToString("F0", ci)));
+        Row(sb, Loc.Hud("chunk upload"), null, Ms(FrameStats.AvgUploadMs),
+            Loc.T("komet:hud-max", "max {0}", FrameStats.MaxUploadMs.ToString("F1", ci)));
         // Cores the whole process keeps busy. Low at idle is HEALTH, not waste - a frame is
         // a latency problem and the serial main thread caps it (Amdahl); this row is for
         // judging the streaming pipeline, where the workers should actually show up.
         if (FrameStats.CpuCoresBusy > 0.05)
-            Row(sb, "cpu-kerne",
+            Row(sb, Loc.Hud("cpu cores"),
                 (100.0 * FrameStats.CpuCoresBusy / Environment.ProcessorCount).ToString("F0", ci) + " %",
                 null,
-                FrameStats.CpuCoresBusy.ToString("F1", ci) + " von "
-                    + Environment.ProcessorCount + " kernen beschäftigt");
-        Row(sb, "sichtweite", N(viewDistance), null, "blöcke");
+                Loc.T("komet:hud-cores-busy", "{0} of {1} cores busy",
+                    FrameStats.CpuCoresBusy.ToString("F1", ci), Environment.ProcessorCount));
+        Row(sb, Loc.Hud("view distance"), N(viewDistance), null, Loc.T("komet:hud-blocks", "blocks"));
         // The overlay's own price, so it can never again masquerade as an engine problem:
         // a Windows tester's ~40 ms Cairo rebuild at fixed 4 Hz WAS the ortho stutter.
         if (AvgRebuildMs >= 0.05)
-            Row(sb, "hud-aufbau", null, Ms(AvgRebuildMs),
-                "alle " + rebuildInterval.ToString("0.##", ci)
-                + " s · upload " + AvgUploadMs.ToString("F1", ci) + " ms"
-                + (BackgroundRaster && !rasterBroken ? " · raster im worker" : ""));
+            Row(sb, Loc.Hud("hud rebuild"), null, Ms(AvgRebuildMs),
+                Loc.T("komet:hud-rebuild", "every {0} s · upload {1} ms",
+                    rebuildInterval.ToString("0.##", ci), AvgUploadMs.ToString("F1", ci))
+                + (BackgroundRaster && !rasterBroken ? Loc.T("komet:hud-raster-worker", " · raster in worker") : ""));
 
         extra?.Invoke(sb, frame);
 

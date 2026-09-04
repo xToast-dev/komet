@@ -1,8 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using HarmonyLib;
-using Vintagestory.API.Client;
+using Komet.Runtime;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 

@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
-using System.Reflection;
 using System.Text;
 using HarmonyLib;
 
@@ -192,10 +191,10 @@ public static class RetessSourcePatches
             ? 0
             : (Stopwatch.GetTimestamp() - countingSince) / (double)Stopwatch.Frequency;
         if (seconds < 1 || StatMarks == 0)
-            return "noch keine dirty-marks aufgezeichnet";
+            return "no dirty marks recorded yet";
 
         var sb = new StringBuilder(512);
-        sb.AppendFormat(ci, "dirty-marks: {0:F0}/s gesamt ({1:F0}/s nur-rand, {2:F0}/s prioritaet) ueber {3:F0}s\n",
+        sb.AppendFormat(ci, "dirty marks: {0:F0}/s total ({1:F0}/s edge only, {2:F0}/s priority) over {3:F0}s\n",
             StatMarks / seconds, StatEdgeOnly / seconds, StatPriority / seconds, seconds);
 
         // Shares, not rates: samples may come from a manual toggle spanning the session or
@@ -203,9 +202,9 @@ public static class RetessSourcePatches
         var top = new List<KeyValuePair<string, long>>(Sources);
         if (top.Count == 0)
         {
-            sb.Append("quellen: noch keine samples (laeuft mit max. ")
+            sb.Append("sources: no samples yet (runs at most ")
               .Append(MaxCapturesPerSecond)
-              .Append("/s; '.komet toggle retess' hebt die kappe)\n");
+              .Append("/s; '.komet toggle retess' lifts the cap)\n");
         }
         else
         {

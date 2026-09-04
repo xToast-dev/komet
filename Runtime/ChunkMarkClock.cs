@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// When each chunk was last marked dirty, keyed by the engine's index3d.

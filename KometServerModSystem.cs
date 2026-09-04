@@ -1,5 +1,6 @@
 using System;
 using HarmonyLib;
+using Komet.Runtime;
 using Vintagestory.API.Common;
 using Vintagestory.Server;
 

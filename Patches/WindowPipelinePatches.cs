@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using HarmonyLib;
+using Komet.Runtime;
 using Vintagestory.Client.NoObf;
 
 

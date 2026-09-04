@@ -4,7 +4,7 @@ using System.Text;
 using HarmonyLib;
 using Vintagestory.API.Client;
 
-namespace Komet;
+namespace Komet.Culling;
 
 /// <summary>
 /// Checks, on sampled sweeps, that <see cref="FastCuller"/> drew exactly what vanilla's

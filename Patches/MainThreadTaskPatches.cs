@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using HarmonyLib;
+using Komet.Guard;
 using Vintagestory.API.Common;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
@@ -46,6 +47,18 @@ public static class MainThreadTaskPatches
 
     /// <summary>Liveness: this many tasks always run, whatever the clock says.</summary>
     public const int MinPerFrame = 8;
+
+    /// <summary>
+    /// The budget only applies to a world that is up. Everything a join queues - the
+    /// LevelFinalize packet above all (task code "readpacket6") - is lifecycle, not load:
+    /// renderers are registered before it and only initialised by it, so spreading that
+    /// queue over frames lets a registered renderer draw against half-built vanilla state
+    /// (1.2.0-pre.2: WeatherSystemClient.OnRenderFrame NRE'd on a WeatherDataAtPlayer that
+    /// LevelFinalizeInit had not made yet). Until LevelFinalize has run, the drain is
+    /// vanilla's: everything queued runs in the frame it arrived. Set by the mod system's
+    /// LevelFinalize handler, cleared on world leave (<see cref="Detach"/>).
+    /// </summary>
+    public static bool WorldReady;
 
     /// <summary>The budget stretches with the backlog (x2 at this many waiting tasks), and
     /// past <see cref="MaxBacklog"/> it is ignored - a queue that grows faster than the
@@ -140,6 +153,7 @@ public static class MainThreadTaskPatches
     internal static void RunTasks(Queue<ClientTask> reversed, Func<bool> suspended, Action requeue, FrameProfilerUtil debugProfiler)
     {
         var started = Stopwatch.GetTimestamp();
+        var budgetMs = WorldReady ? BudgetMs : 0;
         var ran = 0;
         while (reversed.Count > 0)
         {
@@ -154,7 +168,7 @@ public static class MainThreadTaskPatches
             // vanilla's rule: a suspend mid-drain hands the remainder back (and empties this queue)
             if (suspended()) { requeue(); break; }
             // the budget uses the same hand-back, so order and the requeue semantics are vanilla's
-            if (OverBudget(BudgetMs, (t1 - started) * TicksToMs, ran, reversed.Count))
+            if (OverBudget(budgetMs, (t1 - started) * TicksToMs, ran, reversed.Count))
             {
                 StatBudgetCuts++;
                 StatDeferredTasks += reversed.Count;
@@ -244,17 +258,17 @@ public static class MainThreadTaskPatches
     public static void Write(StringBuilder sb, int count, System.Globalization.CultureInfo ci)
     {
         var top = Top(count);
-        sb.AppendFormat(ci, "hauptthread-tasks: {0:F2} ms/frame, {1:N0} seit start",
+        sb.AppendFormat(ci, "main thread tasks: {0:F2} ms/frame, {1:N0} since start",
             Measure.FrameStats.AvgMainTaskMs, StatTasks);
         if (StatWorstMs >= 1.0)
-            sb.AppendFormat(ci, ", laengste {0:F1} ms ({1})", StatWorstMs, StatWorstCode);
+            sb.AppendFormat(ci, ", longest {0:F1} ms ({1})", StatWorstMs, StatWorstCode);
         if (BudgetMs > 0)
-            sb.AppendFormat(ci, ", budget {0:0.#} ms: {1:N0} frames gekappt, {2:N0} tasks verschoben", BudgetMs, StatBudgetCuts, StatDeferredTasks);
+            sb.AppendFormat(ci, ", budget {0:0.#} ms: {1:N0} frames capped, {2:N0} tasks deferred", BudgetMs, StatBudgetCuts, StatDeferredTasks);
         else
-            sb.Append(", kein budget");
+            sb.Append(", no budget");
         if (top.Count > 0)
         {
-            sb.Append(" | teuerste: ");
+            sb.Append(" | most expensive: ");
             for (var i = 0; i < top.Count; i++)
             {
                 if (i > 0) sb.Append(", ");
@@ -274,9 +288,11 @@ public static class MainThreadTaskPatches
         StatDeferredTasks = 0;
     }
 
-    /// <summary>World leave: the cached game instance must not outlive its session.</summary>
+    /// <summary>World leave: the cached game instance must not outlive its session, and the
+    /// next join drains unbudgeted again until its own LevelFinalize.</summary>
     public static void Detach()
     {
+        WorldReady = false;
         cachedGame = null;
         cachedSuspended = null;
         cachedRequeue = null;

@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using HarmonyLib;
+using Komet.Runtime;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.Client.NoObf;
@@ -67,7 +68,20 @@ public static class EntityLoadPatches
     /// <summary>Warning sink (unknown entity types, like vanilla's own error line).</summary>
     public static Action<string> Log;
 
-    public static long StatLoaded, StatDeferredFrames, StatPromoted, StatDropped, StatUpdatedPending;
+    public static long StatLoaded, StatDeferredFrames, StatPromoted, StatDropped, StatUpdatedPending, StatStaleFlushes;
+
+    /// <summary>
+    /// How long the bins may go without a frame boundary before intake stops holding anything.
+    ///
+    /// Only <see cref="OnFrameBoundary"/> finishes a held entity. If that event stops coming
+    /// while the patch stays applied, every entity the server sends is held forever and never
+    /// reaches LoadedEntities - the world simply has no creatures in it. Held work whose drain
+    /// is gone has to fall back to vanilla (finish on the spot), so a boundary this old counts
+    /// as none; see EntityTessPatches.StaleAfterMs for the same rule and the same reason.
+    /// </summary>
+    public const double StaleAfterMs = 250.0;
+
+    private static long lastBoundaryTs;
     public static double StatWorstMs;
     public static string StatWorstCode;
     public static int PendingCount => pendingById.Count;
@@ -290,6 +304,14 @@ public static class EntityLoadPatches
         var pend = new Pending { Id = p.EntityId, Entity = entity, Type = type, Spawn = spawn, Bin = BinOf(distSq) };
         bins[pend.Bin].Add(pend);
         pendingById[pend.Id] = pend;
+
+        // the drain that empties these bins is not running - finish everything here, which is
+        // vanilla's own timing, instead of holding entities nobody will ever hand over
+        if (DrainStale(Stopwatch.GetTimestamp(), lastBoundaryTs))
+        {
+            StatStaleFlushes++;
+            FlushAll();
+        }
     }
 
     private static void Update(Packet_Entity p, Entity entity)
@@ -326,9 +348,15 @@ public static class EntityLoadPatches
 
     // ---- the drain ------------------------------------------------------------------------
 
+    /// <summary>The staleness rule, pure: no boundary within <see cref="StaleAfterMs"/> means
+    /// nothing is draining the bins. Zero (none seen yet) counts as stale.</summary>
+    internal static bool DrainStale(long nowTs, long lastTs)
+        => lastTs == 0 || (nowTs - lastTs) * 1000.0 / Stopwatch.Frequency > StaleAfterMs;
+
     /// <summary>Called on the frame boundary (main thread): nearest bins first, under budget.</summary>
     public static void OnFrameBoundary()
     {
+        lastBoundaryTs = Stopwatch.GetTimestamp();
         if (pendingById.Count == 0) return;
         var g = game;
         if (g == null) return;
@@ -398,11 +426,12 @@ public static class EntityLoadPatches
         for (var i = 0; i < BinCount; i++) bins[i].Clear();
         pendingById.Clear();
         game = null;
+        lastBoundaryTs = 0;
     }
 
     public static void ResetStats()
     {
-        StatLoaded = StatDeferredFrames = StatPromoted = StatDropped = StatUpdatedPending = 0;
+        StatLoaded = StatDeferredFrames = StatPromoted = StatDropped = StatUpdatedPending = StatStaleFlushes = 0;
         StatWorstMs = 0;
         StatWorstCode = null;
     }

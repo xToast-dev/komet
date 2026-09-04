@@ -1,9 +1,10 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Komet.Culling;
 using Vintagestory.API.Client;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Gives back the video memory of chunk mesh pools that have run empty.

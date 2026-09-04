@@ -1,8 +1,11 @@
 using System;
 using System.Diagnostics;
+using Komet.Culling;
+using Komet.Guard;
+using Komet.Measure;
+using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Komet.Measure;
 
 namespace Komet;
 
@@ -40,28 +43,30 @@ public partial class KometModSystem
     private void RegisterCommands(ICoreClientAPI api)
     {
         api.ChatCommands.Create("komet")
-            .WithDescription("Vintage Story performance patches: status and counters")
+            .WithDescription(Loc.T("komet:cmd-root", "Vintage Story performance patches: status and counters"))
             .BeginSubCommand("hud")
-                .WithDescription("Toggle the on-screen performance overlay (same as F7)")
+                .WithDescription(Loc.T("komet:cmd-hud", "Toggle the on-screen performance overlay (same as F7)"))
                 .HandleWith(_ =>
                 {
                     hud.Visible = !hud.Visible;
-                    return TextCommandResult.Success(hud.Visible ? "HUD an (F7 schaltet um)" : "HUD aus");
+                    return TextCommandResult.Success(hud.Visible
+                        ? Loc.T("komet:msg-hud-on", "HUD on (F7 toggles)")
+                        : Loc.T("komet:msg-hud-off", "HUD off"));
                 })
             .EndSubCommand()
             .BeginSubCommand("stats")
-                .WithDescription("Show what the culling patch has been doing since the last reset")
+                .WithDescription(Loc.T("komet:cmd-stats", "Show what the culling patch has been doing since the last reset"))
                 .HandleWith(_ => TextCommandResult.Success(LoggedStats()))
             .EndSubCommand()
             .BeginSubCommand("hitch")
-                .WithDescription("Ruckler-Protokoll: jeder Frame ueber der Schwelle mit Ursache und Kamerabewegung. 'reset' leert es")
+                .WithDescription(Loc.T("komet:cmd-hitch", "Hitch log: every frame over the threshold with its cause and the camera movement. 'reset' clears it"))
                 .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
                 .HandleWith(args =>
                 {
                     if (string.Equals(args[0] as string, "reset", System.StringComparison.OrdinalIgnoreCase))
                     {
                         HitchLog.Reset();
-                        return TextCommandResult.Success("hitch-log geleert.");
+                        return TextCommandResult.Success(Loc.T("komet:msg-hitch-cleared", "hitch log cleared."));
                     }
                     var report = HitchLog.BuildReport();
                     Mod.Logger.Notification("hitch report:\n{0}", report);
@@ -69,7 +74,7 @@ public partial class KometModSystem
                 })
             .EndSubCommand()
             .BeginSubCommand("report")
-                .WithDescription("Alles auf einmal: umgebung, abweichende einstellungen, frame-aufteilung, ruckler-protokoll. Landet als ein Block im client-main.log")
+                .WithDescription(Loc.T("komet:cmd-report", "Everything at once: environment, settings that differ from the default, frame breakdown, hitch log. Lands as one block in client-main.log"))
                 .HandleWith(_ =>
                 {
                     var report = BuildFullReport();
@@ -77,29 +82,30 @@ public partial class KometModSystem
                     // and the chat window wraps it into something nobody can copy back out.
                     Mod.Logger.Notification("full report:\n{0}", report);
                     return TextCommandResult.Success(
-                        "report steht im client-main.log (zwischen '==== komet report ====' und '==== ende ===='). "
-                        + "Kompletten Block kopieren.");
+                        Loc.T("komet:msg-report-written",
+                            "the report is in client-main.log (between '==== komet report ====' and "
+                            + "'==== end ===='). Copy the whole block."));
                 })
             .EndSubCommand()
             .BeginSubCommand("toggle")
-                .WithDescription("Ein einzelnes System an/aus: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit, entload, entsync ... - zur Bisektion oder zum A/B-Messen")
+                .WithDescription(Loc.T("komet:cmd-toggle", "Turn a single system on or off: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit, entload, entsync ... - for bisecting or A/B measuring"))
                 .WithArgs(api.ChatCommands.Parsers.Word("system"))
                 .HandleWith(args => TextCommandResult.Success(ToggleSystem(args[0] as string)))
             .EndSubCommand()
             .BeginSubCommand("stress")
-                .WithDescription("Automatische Messfahrt, drift-fest mit Baselines verschraenkt - Bewegung/Fliegen ist ok. Optional: Sekunden pro Scheibe (default 2) oder 'stop'")
+                .WithDescription(Loc.T("komet:cmd-stress", "Automatic measurement run, drift-proof by interleaving baselines - moving or flying is fine. Optional: seconds per slice (default 2), or 'stop'"))
                 .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
                 .HandleWith(args => TextCommandResult.Success(HandleStress(args[0] as string)))
             .EndSubCommand()
             .BeginSubCommand("retess")
-                .WithDescription("Wer markiert Chunks dirty? Zaehler und gesampelte Quellen-Rangliste. 'reset' leert")
+                .WithDescription(Loc.T("komet:cmd-retess", "Who marks chunks dirty? Counters and a sampled ranking of the sources. 'reset' clears it"))
                 .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
                 .HandleWith(args =>
                 {
                     if (string.Equals(args[0] as string, "reset", System.StringComparison.OrdinalIgnoreCase))
                     {
                         Patches.RetessSourcePatches.Reset();
-                        return TextCommandResult.Success("dirty-mark-zaehler geleert.");
+                        return TextCommandResult.Success(Loc.T("komet:msg-retess-cleared", "dirty mark counters cleared."));
                     }
                     var report = Patches.RetessSourcePatches.BuildReport();
                     Mod.Logger.Notification("retess report:\n{0}", report);
@@ -107,7 +113,7 @@ public partial class KometModSystem
                 })
             .EndSubCommand()
             .BeginSubCommand("conflicts")
-                .WithDescription("Wer patcht komets methoden oder komet-code, und weicht die engine vom verifizierten build ab? Prueft sofort neu")
+                .WithDescription(Loc.T("komet:cmd-conflicts", "Who patches komet's methods or komet's own code, and does the engine differ from the verified build? Rescans immediately"))
                 .HandleWith(_ =>
                 {
                     if (!PatchGuard.EngineChecked)
@@ -119,12 +125,12 @@ public partial class KometModSystem
                 })
             .EndSubCommand()
             .BeginSubCommand("safemode")
-                .WithDescription("Alle darstellungsrelevanten Optimierungen sofort an/aus - trennt in Sekunden, ob ein Bildfehler von komet kommt")
+                .WithDescription(Loc.T("komet:cmd-safemode", "Every optimisation that changes what is drawn, on or off at once - settles in seconds whether a visual glitch comes from komet"))
                 .HandleWith(_ => TextCommandResult.Success(ToggleSafeMode()))
             .EndSubCommand()
             .BeginSubCommand("reset")
-                .WithDescription("Reset the counters")
-                .HandleWith(_ => { ResetStats(); return TextCommandResult.Success("komet counters reset."); })
+                .WithDescription(Loc.T("komet:cmd-reset", "Reset the counters"))
+                .HandleWith(_ => { ResetStats(); return TextCommandResult.Success(Loc.T("komet:msg-counters-reset", "komet counters reset.")); })
             .EndSubCommand()
             .HandleWith(_ => TextCommandResult.Success(LoggedStats()));
     }
@@ -132,9 +138,9 @@ public partial class KometModSystem
     private string HandleStress(string arg)
     {
         if (string.Equals(arg, "stop", System.StringComparison.OrdinalIgnoreCase))
-            return StressTest.Stop("auf wunsch");
+            return StressTest.Stop("on request");
         if (safeMode)
-            return "Safemode ist an - erst '.komet safemode' zuruecknehmen, dann testen.";
+            return Loc.T("komet:msg-safemode-blocks", "Safemode is on - take it back with '.komet safemode' first, then test.");
 
         double sliceSeconds = 2;
         if (arg != null && double.TryParse(arg, System.Globalization.NumberStyles.Float,
@@ -155,63 +161,63 @@ public partial class KometModSystem
     /// </summary>
     private System.Collections.Generic.List<StressTest.Phase> BuildStressPhases() => new()
     {
-        new StressTest.Phase { Name = "sweep aus (vanilla)",
+        new StressTest.Phase { Name = "sweep off (vanilla)",
             Enter = () => FastCuller.Enabled = false,
             Exit = () => FastCuller.Enabled = config.FastFrustumCulling },
-        new StressTest.Phase { Name = "occlusion aus (vanilla)",
+        new StressTest.Phase { Name = "occlusion off (vanilla)",
             Enter = () => FastChunkCuller.Enabled = false,
             Exit = () => FastChunkCuller.Enabled = config.FastOcclusionCulling },
         // Default is vanilla's window build since 1.42.2, so the phase turns the pipeline ON.
         // It measured -0,05 +-0,10 here, i.e. nothing - the throughput it buys is chunk LOADING,
         // which a frame-time delta cannot see.
-        new StressTest.Phase { Name = "fenster-pipe an",
+        new StressTest.Phase { Name = "window pipe on",
             Enter = () => WindowPrebuilder.Enabled = !WindowPrebuilder.HardDisabled,
             // never resurrect a feature that disabled itself (validation limit, worker crash)
             Exit = () => WindowPrebuilder.Enabled = config.TesselationWindowPipelining && !WindowPrebuilder.HardDisabled },
-        new StressTest.Phase { Name = "firepit-gate aus",
+        new StressTest.Phase { Name = "firepit gate off",
             Enter = () => Patches.FirepitPatches.Enabled = false,
             Exit = () => Patches.FirepitPatches.Enabled = true },
-        new StressTest.Phase { Name = "glerror-skip an",
+        new StressTest.Phase { Name = "glerror skip on",
             Enter = () => Patches.GlErrorPatches.SkipEnabled = true,
             Exit = () => Patches.GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck },
-        new StressTest.Phase { Name = "sonnen-query jeder frame",
+        new StressTest.Phase { Name = "sun query every frame",
             Enter = () => Patches.SunQueryPatches.Interval = 1,
             Exit = () => Patches.SunQueryPatches.Interval = config.SunOcclusionQueryInterval },
-        new StressTest.Phase { Name = "entity-tess-budget aus",
+        new StressTest.Phase { Name = "entity tess budget off",
             Enter = () => Patches.EntityTessPatches.Enabled = false,
             Exit = () => Patches.EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0 },
         // Off = everything held finishes at once and every packet goes straight to vanilla.
         // Only streaming scenes (join flood, flying) have entity loads to measure.
         // Off = vanilla's 200 pieces per tick; only measurable while the minimap fills.
-        new StressTest.Phase { Name = "minimap-budget aus (200/tick)",
+        new StressTest.Phase { Name = "minimap budget off (200/tick)",
             Enter = () => Patches.MinimapPatches.Enabled = false,
             Exit = () => Patches.MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0 },
-        new StressTest.Phase { Name = "minimap-direktupload aus (FBO)",
+        new StressTest.Phase { Name = "minimap direct upload off (FBO)",
             Enter = () => Patches.MinimapPatches.DirectUpload = false,
             Exit = () => Patches.MinimapPatches.DirectUpload = config.MinimapDirectUpload },
         // Off = vanilla's whole-queue drain; only a streaming scene has bursts to cut.
-        new StressTest.Phase { Name = "task-budget aus",
+        new StressTest.Phase { Name = "task budget off",
             Enter = () => Patches.MainThreadTaskPatches.BudgetMs = 0,
             Exit = () => Patches.MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs) },
         // Off = every entity animates every frame, as vanilla; measurable wherever many
         // entities are loaded (a farm, a join flood).
-        new StressTest.Phase { Name = "anim-lod aus",
+        new StressTest.Phase { Name = "anim lod off",
             Enter = () => Patches.EntityAnimPatches.LodEnabled = false,
             Exit = () => Patches.EntityAnimPatches.LodEnabled = config.EntityAnimationLod },
-        new StressTest.Phase { Name = "entity-lade-budget aus",
+        new StressTest.Phase { Name = "entity load budget off",
             Enter = () => { Patches.EntityLoadPatches.Enabled = false; Patches.EntityLoadPatches.FlushAll(); },
             Exit = () => Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 },
         // Server side, singleplayer only: fewer position/attribute packets means less for the
         // integrated server to build and the shared GC to collect - a GC-column effect, like
         // the recycler, not a per-frame CPU one.
-        new StressTest.Phase { Name = "entity-sync-tuning aus (server)",
+        new StressTest.Phase { Name = "entity sync tuning off (server)",
             Enter = () => { Patches.EntitySyncPatches.DistanceSendRate = false; Patches.EntitySyncPatches.TrackingHysteresis = false; },
             Exit = () => { Patches.EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
                            Patches.EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning; } },
-        new StressTest.Phase { Name = "attribut-noop-skip aus (server)",
+        new StressTest.Phase { Name = "attribute no-op skip off (server)",
             Enter = () => Patches.EntitySyncPatches.AttributeNoOpSkip = false,
             Exit = () => Patches.EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip },
-        new StressTest.Phase { Name = "kanten-koalesz aus",
+        new StressTest.Phase { Name = "edge coalescing off",
             Enter = () => { Patches.EdgeCoalescePatches.Enabled = false; Patches.EdgeCoalescePatches.FlushAll(); },
             Exit = () => Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0 },
         // The shadow group. Until 1.40.0 the plan had no phase for any of it, which is why
@@ -224,13 +230,13 @@ public partial class KometModSystem
         // photographed vanilla's hard shadow edge), so the phase turns it OFF and the delta
         // reads as its remaining cost. The 1.42.x both-cascades version measured +0,72 +-0,08;
         // far-only must come in under that - this phase is what checks it.
-        new StressTest.Phase { Name = "schattenbox aus (vanilla-kegel)",
+        new StressTest.Phase { Name = "shadow box off (vanilla wedge)",
             Enter = () => Patches.ShadowPatches.SymmetricBox = false,
             Exit = () => Patches.ShadowPatches.SymmetricBox = config.SymmetricShadowBox },
         // Default-on since 1.43.0; the phase switches it off, so the delta reads as what the
         // throttle SAVES in this scene. While moving it saves nothing by design (movement
         // forces a redraw) - run the stress test standing still to see its real share.
-        new StressTest.Phase { Name = "schatten-drossel aus (jeder frame)",
+        new StressTest.Phase { Name = "shadow throttle off (every frame)",
             Enter = () => Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1),
             Exit = () => Patches.ShadowThrottlePatches.SetIntervals(
                 config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval, config.ShadowFarMaxSkip) },
@@ -244,7 +250,7 @@ public partial class KometModSystem
         // prefers 32 at the measured pool shape, but the benchmark is a model of the scene and
         // this phase is the scene. Interleaved against neighbour baselines like every other
         // phase, so the answer does not depend on which minute it was measured in.
-        new StressTest.Phase { Name = "zellziel 160 statt " + DefaultCellTarget,
+        new StressTest.Phase { Name = "cell target 160 instead of " + DefaultCellTarget,
             Enter = () => SetCellTarget(160),
             Exit = () => SetCellTarget(config.PartsPerCellTarget) },
         // Default-on; the phase switches it OFF, so the delta reads as what bridging draw
@@ -252,23 +258,23 @@ public partial class KometModSystem
         // submission cost (fewer glMultiDrawElements ranges) for GPU vertex work on clipped,
         // pixel-identical geometry - measurable only where the frame is CPU-bound, which is
         // exactly what the 1.47/1.48 reports showed (gpu ~2,5 ms of ~13 ms).
-        new StressTest.Phase { Name = "luecken-merge aus",
+        new StressTest.Phase { Name = "gap merge off",
             Enter = () => FastCuller.GapMergeDrawRanges = false,
             Exit = () => FastCuller.GapMergeDrawRanges = config.GapMergeDrawRanges },
         // Default-on; the phase hands the recycler's storage back to vanilla, so the delta
         // reads as what the size-class pool saves. Its effect is GC pressure, not per-frame
         // CPU - expect it to show only in streaming scenes (fly over fresh terrain), and
         // read it together with the gc column of the hitch log.
-        new StressTest.Phase { Name = "mesh-recycler aus (vanilla-ablage)",
+        new StressTest.Phase { Name = "mesh recycler off (vanilla store)",
             Enter = () => Patches.MeshRecyclerPatches.SetEnabled(false),
             Exit = () => Patches.MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler) },
-        new StressTest.Phase { Name = "extras-pool aus (frische arrays)",
+        new StressTest.Phase { Name = "extras pool off (fresh arrays)",
             Enter = () => { Patches.TightClonePatches.PoolExtras = false; Patches.TightClonePatches.ClearPools(); },
             Exit = () => Patches.TightClonePatches.PoolExtras = config.PoolMeshExtras },
-        new StressTest.Phase { Name = "animatable-gate aus (vanilla)",
+        new StressTest.Phase { Name = "animatable gate off (vanilla)",
             Enter = () => Patches.AnimatableCullPatches.Enabled = false,
             Exit = () => Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers },
-        new StressTest.Phase { Name = "lod3 raus aus schattenpass",
+        new StressTest.Phase { Name = "lod3 out of the shadow pass",
             Enter = () => FastCuller.ShadowSkipRedundantLod = true,
             Exit = () => FastCuller.ShadowSkipRedundantLod = config.ShadowSkipRedundantLod },
         // The diagnostics group. These do not draw anything and safemode does not switch them
@@ -276,28 +282,28 @@ public partial class KometModSystem
         // was reported again after the drawing systems had all been cleared by measurement.
         // Instrumentation the mod carries is on the same side of the ledger as the work it
         // removes; these three phases are what makes that testable rather than argued.
-        new StressTest.Phase { Name = "renderer-profiler an (diagnose)",
+        new StressTest.Phase { Name = "renderer profiler on (diagnostic)",
             Enter = () => { Patches.RendererProfiler.Enabled = true; WrapRenderers(); },
             Exit = () => { Patches.RendererProfiler.Enabled = config.ProfileRenderers;
                            if (config.ProfileRenderers) WrapRenderers(); else UnwrapRenderers(); } },
-        new StressTest.Phase { Name = "retess-quellensampling an (diagnose)",
+        new StressTest.Phase { Name = "retess source sampling on (diagnostic)",
             Enter = () => Patches.RetessSourcePatches.SampleSources = true,
             Exit = () => Patches.RetessSourcePatches.SampleSources = config.SampleRetessSources },
-        new StressTest.Phase { Name = "sweep-gegenprobe an (diagnose)",
+        new StressTest.Phase { Name = "sweep cross-check on (diagnostic)",
             Enter = () => { CullVerifier.SampleEvery = 512; CullVerifier.Reset(); },
             Exit = () => CullVerifier.SampleEvery = config.VerifyCullSweepEvery },
         // The two always-on attributions, priced like the before-stage attribution: a few
         // Stopwatch reads per frame, but measured rather than assumed.
-        new StressTest.Phase { Name = "task-attribution aus (vanilla-drain)",
+        new StressTest.Phase { Name = "task attribution off (vanilla drain)",
             Enter = () => Patches.MainThreadTaskPatches.Enabled = false,
             Exit = () => Patches.MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks },
-        new StressTest.Phase { Name = "tick-profiler aus",
+        new StressTest.Phase { Name = "tick profiler off",
             Enter = () => { Patches.TickProfiler.Enabled = false; WrapTickListeners(); },
             Exit = () => { Patches.TickProfiler.Enabled = config.ProfileTickListeners; WrapTickListeners(); } },
-        new StressTest.Phase { Name = "sweep-vektorkernel aus (skalar)",
+        new StressTest.Phase { Name = "sweep vector kernel off (scalar)",
             Enter = () => FastCuller.VectorCulling = false,
             Exit = () => FastCuller.VectorCulling = config.VectorCulling && FastCuller.VectorAvailable },
-        new StressTest.Phase { Name = "alles vanilla (= safemode)",
+        new StressTest.Phase { Name = "everything vanilla (= safemode)",
             Enter = AllVanilla,
             Exit = AllConfigured },
     };
@@ -315,147 +321,147 @@ public partial class KometModSystem
         {
             case "cull":
                 FastCuller.Enabled = !FastCuller.Enabled;
-                state = "sichtbarkeits-sweep " + (FastCuller.Enabled ? "AN" : "AUS (vanilla)");
+                state = "visibility sweep " + (FastCuller.Enabled ? "ON" : "OFF (vanilla)");
                 break;
             case "occlusion":
                 FastChunkCuller.Enabled = !FastChunkCuller.Enabled;
-                state = "occlusion-culling " + (FastChunkCuller.Enabled ? "AN" : "AUS (vanilla)");
+                state = "occlusion culling " + (FastChunkCuller.Enabled ? "ON" : "OFF (vanilla)");
                 break;
             case "reclaim":
                 PoolReclaimer.Enabled = !PoolReclaimer.Enabled;
-                state = "vram-reclaimer " + (PoolReclaimer.Enabled ? "AN" : "AUS");
+                state = "vram reclaimer " + (PoolReclaimer.Enabled ? "ON" : "OFF");
                 break;
             case "sunquery":
                 Patches.SunQueryPatches.Interval = Patches.SunQueryPatches.Interval > 1 ? 1 : config.SunOcclusionQueryInterval;
-                state = "sonnen-query-drossel " + (Patches.SunQueryPatches.Interval > 1 ? "AN" : "AUS (jeder frame)");
+                state = "sun query throttle " + (Patches.SunQueryPatches.Interval > 1 ? "ON" : "OFF (every frame)");
                 break;
             case "firepit":
                 Patches.FirepitPatches.Enabled = !Patches.FirepitPatches.Enabled;
-                state = "firepit-gate " + (Patches.FirepitPatches.Enabled ? "AN" : "AUS (vanilla)");
+                state = "firepit gate " + (Patches.FirepitPatches.Enabled ? "ON" : "OFF (vanilla)");
                 break;
             case "prebuild":
                 WindowPrebuilder.Enabled = !WindowPrebuilder.Enabled;
                 if (WindowPrebuilder.Enabled) WindowPrebuilder.HardDisabled = false; // explicit user intent overrides a self-disable
-                state = "fenster-pipeline " + (WindowPrebuilder.Enabled ? "AN" : "AUS (vanilla-fensterbau)");
+                state = "window pipeline " + (WindowPrebuilder.Enabled ? "ON" : "OFF (vanilla window build)");
                 break;
             case "glerror":
                 Patches.GlErrorPatches.SkipEnabled = !Patches.GlErrorPatches.SkipEnabled;
-                state = "glGetError-skip " + (Patches.GlErrorPatches.SkipEnabled
-                    ? "AN (2 treiber-syncs/frame gespart, VRAM-warnung aus)"
-                    : "AUS (vanilla)");
+                state = "glGetError skip " + (Patches.GlErrorPatches.SkipEnabled
+                    ? "ON (2 driver syncs/frame saved, VRAM warning off)"
+                    : "OFF (vanilla)");
                 break;
             case "enttess":
                 Patches.EntityTessPatches.Enabled = !Patches.EntityTessPatches.Enabled;
-                state = "entity-tesselation-budget " + (Patches.EntityTessPatches.Enabled ? "AN" : "AUS (vanilla)");
+                state = "entity tesselation budget " + (Patches.EntityTessPatches.Enabled ? "ON" : "OFF (vanilla)");
                 break;
             case "shadowbox":
                 Patches.ShadowPatches.SymmetricBox = !Patches.ShadowPatches.SymmetricBox;
-                state = "symmetrische schattenbox " + (Patches.ShadowPatches.SymmetricBox
-                    ? "AN (wuerfel um die kamera)" : "AUS (vanilla-kegel)");
+                state = "symmetric shadow box " + (Patches.ShadowPatches.SymmetricBox
+                    ? "ON (cube around the camera)" : "OFF (vanilla wedge)");
                 break;
             case "simd":
-                if (!FastCuller.VectorAvailable) return "diese CPU hat kein AVX - der Sweep laeuft ohnehin skalar.";
+                if (!FastCuller.VectorAvailable) return Loc.T("komet:msg-no-avx", "this CPU has no AVX - the sweep runs scalar anyway.");
                 FastCuller.VectorCulling = !FastCuller.VectorCulling;
-                state = "sweep-vektorkernel " + (FastCuller.VectorCulling
-                    ? "AN (4 teile je befehl)" : "AUS (skalar, ein teil je befehl)");
+                state = "sweep vector kernel " + (FastCuller.VectorCulling
+                    ? "ON (4 parts per instruction)" : "OFF (scalar, one part per instruction)");
                 break;
             case "profiler":
                 // Wrapping/unwrapping needs the event manager, which only exists in a world.
                 Patches.RendererProfiler.Enabled = !Patches.RendererProfiler.Enabled;
                 if (Patches.RendererProfiler.Enabled) WrapRenderers(); else UnwrapRenderers();
-                state = "renderer-profiling " + (Patches.RendererProfiler.Enabled
-                    ? "AN (" + Patches.RendererProfiler.StatWrapped + " renderer gewickelt - kostet frame-zeit)"
-                    : "AUS (vanilla-dispatch)");
+                state = "renderer profiling " + (Patches.RendererProfiler.Enabled
+                    ? "ON (" + Patches.RendererProfiler.StatWrapped + " renderers wrapped - costs frame time)"
+                    : "OFF (vanilla dispatch)");
                 break;
             case "prioupload":
                 Patches.PrioUploadPatches.Enabled = !Patches.PrioUploadPatches.Enabled;
-                state = "prio-upload-budget " + (Patches.PrioUploadPatches.Enabled
-                    ? "AN (stuerme verteilen sich auf mehrere frames)"
-                    : "AUS (vanilla: prio-queue komplett in einem frame)");
+                state = "prio upload budget " + (Patches.PrioUploadPatches.Enabled
+                    ? "ON (bursts spread over several frames)"
+                    : "OFF (vanilla: the whole prio queue in one frame)");
                 break;
             case "beforeattr":
                 Patches.RendererProfiler.AttributeBeforeStage = !Patches.RendererProfiler.AttributeBeforeStage;
                 if (Patches.RendererProfiler.AttributeBeforeStage) WrapRenderers();
                 else if (!Patches.RendererProfiler.Enabled) UnwrapRenderers();
-                state = "before-stage-attribution " + (Patches.RendererProfiler.AttributeBeforeStage
-                    ? "AN (ruckler-zeilen koennen den before-renderer nennen)"
-                    : "AUS (vanilla-dispatch in der before-stage)");
+                state = "before stage attribution " + (Patches.RendererProfiler.AttributeBeforeStage
+                    ? "ON (hitch lines can name the before renderer)"
+                    : "OFF (vanilla dispatch in the before stage)");
                 break;
             case "uploaddruck":
                 UploadBudget.FramePressureInput = !UploadBudget.FramePressureInput;
-                state = "upload-frame-druck " + (UploadBudget.FramePressureInput
-                    ? "AN (heisse frames mit laufenden uploads druecken das budget)"
-                    : "AUS (drossel sieht nur die upload-uhr, wie vor 01.09.)");
+                state = "upload frame pressure " + (UploadBudget.FramePressureInput
+                    ? "ON (hot frames with uploads in flight push the budget down)"
+                    : "OFF (the throttle only sees the upload clock, as before 01.09.)");
                 break;
             case "hudraster":
                 DebugHud.BackgroundRaster = !DebugHud.BackgroundRaster;
-                state = "hud-raster " + (DebugHud.BackgroundRaster
-                    ? "IM WORKER (frame zahlt nur sampling + upload)"
-                    : "SYNCHRON (kompletter aufbau im frame, wie vanilla-overlays)");
+                state = "hud raster " + (DebugHud.BackgroundRaster
+                    ? "IN THE WORKER (the frame only pays sampling + upload)"
+                    : "SYNCHRONOUS (full rebuild inside the frame, like vanilla overlays)");
                 break;
             case "retess":
                 Patches.RetessSourcePatches.SampleSources = !Patches.RetessSourcePatches.SampleSources;
-                state = "dirty-mark-quellensampling " + (Patches.RetessSourcePatches.SampleSources
-                    ? "UNGEDECKELT (jede 8. markierung mit stack - '.komet retess' zeigt die rangliste)"
-                    : "GEDECKELT (weiter aktiv, max. 25 captures/s)");
+                state = "dirty mark source sampling " + (Patches.RetessSourcePatches.SampleSources
+                    ? "UNCAPPED (every 8th mark with a stack - '.komet retess' shows the ranking)"
+                    : "CAPPED (still active, at most 25 captures/s)");
                 break;
             case "cullcheck":
                 CullVerifier.SampleEvery = CullVerifier.SampleEvery > 0 ? 0 : Math.Max(1, config.VerifyCullSweepEvery);
                 CullVerifier.Reset();
-                state = "sweep-gegenprobe " + (CullVerifier.SampleEvery > 0
-                    ? "AN (jeder " + CullVerifier.SampleEvery + ". sweep gegen vanilla)" : "AUS");
+                state = "sweep cross-check " + (CullVerifier.SampleEvery > 0
+                    ? "ON (every " + CullVerifier.SampleEvery + "th sweep against vanilla)" : "OFF");
                 break;
             case "cellsize":
                 SetCellTarget(FastCuller.PartsPerCellTarget == DefaultCellTarget ? 160 : DefaultCellTarget);
-                state = "gitter-zellziel jetzt " + FastCuller.PartsPerCellTarget + " teile je zelle";
+                state = "grid cell target now " + FastCuller.PartsPerCellTarget + " parts per cell";
                 break;
             case "gapmerge":
                 FastCuller.GapMergeDrawRanges = !FastCuller.GapMergeDrawRanges;
-                state = "luecken-merging " + (FastCuller.GapMergeDrawRanges
-                    ? "AN (ranges ueberspannen frustum-geclippte teile)"
-                    : "AUS (nur noch nahtlos benachbarte ranges)");
+                state = "gap merging " + (FastCuller.GapMergeDrawRanges
+                    ? "ON (ranges span frustum-clipped parts)"
+                    : "OFF (only seamlessly adjacent ranges)");
                 break;
             case "recycler":
                 Patches.MeshRecyclerPatches.SetEnabled(!Patches.MeshRecyclerPatches.Enabled);
-                state = "mesh-recycler-pool " + (Patches.MeshRecyclerPatches.Enabled
-                    ? "AN (groessenklassen, budget " + Patches.MeshRecyclerPatches.BudgetMb + " MB)"
-                    : "AUS (vanilla-ablage, eigener vorrat freigegeben)");
+                state = "mesh recycler pool " + (Patches.MeshRecyclerPatches.Enabled
+                    ? "ON (size classes, budget " + Patches.MeshRecyclerPatches.BudgetMb + " MB)"
+                    : "OFF (vanilla store, own stock released)");
                 break;
             case "tightclone":
                 Patches.TightClonePatches.Enabled = !Patches.TightClonePatches.Enabled;
-                state = "klon-kompakt " + (Patches.TightClonePatches.Enabled
-                    ? "AN (custom-parts werden inhaltsgross kopiert)"
-                    : "AUS (vanilla: kapazitaetsgrosse kopien)");
+                state = "tight clone " + (Patches.TightClonePatches.Enabled
+                    ? "ON (custom parts are copied at content size)"
+                    : "OFF (vanilla: capacity-sized copies)");
                 break;
             case "extrapool":
                 Patches.TightClonePatches.PoolExtras = !Patches.TightClonePatches.PoolExtras;
                 if (!Patches.TightClonePatches.PoolExtras) Patches.TightClonePatches.ClearPools();
-                state = "extras-pool " + (Patches.TightClonePatches.PoolExtras
-                    ? "AN (per-face- und custom-arrays der chunk-teile werden recycelt)"
-                    : "AUS (vanilla: frische arrays je teil, vorrat freigegeben)");
+                state = "extras pool " + (Patches.TightClonePatches.PoolExtras
+                    ? "ON (per-face and custom arrays of the chunk parts are recycled)"
+                    : "OFF (vanilla: fresh arrays per part, stock released)");
                 break;
             case "animcull":
                 Patches.AnimatableCullPatches.Enabled = !Patches.AnimatableCullPatches.Enabled;
-                state = "animatable-frustum-gate " + (Patches.AnimatableCullPatches.Enabled
-                    ? "AN (animierte block-entities ausserhalb des frustums werden uebersprungen)"
-                    : "AUS (vanilla: jede instanz zeichnet in jeder stage)");
+                state = "animatable frustum gate " + (Patches.AnimatableCullPatches.Enabled
+                    ? "ON (animated block entities outside the frustum are skipped)"
+                    : "OFF (vanilla: every instance draws in every stage)");
                 break;
             case "shadowlod":
                 FastCuller.ShadowSkipRedundantLod = !FastCuller.ShadowSkipRedundantLod;
-                state = "lod3-stellvertreter im schattenpass " + (FastCuller.ShadowSkipRedundantLod
-                    ? "WEG (nur noch die detaillierte version)" : "DRIN (vanilla, beide versionen)");
+                state = "lod3 stand-ins in the shadow pass " + (FastCuller.ShadowSkipRedundantLod
+                    ? "GONE (only the detailed version left)" : "IN (vanilla, both versions)");
                 break;
             case "shadowstab":
                 Patches.ShadowStabilityPatches.Enabled = !Patches.ShadowStabilityPatches.Enabled;
-                state = "schatten-texel-snapping " + (Patches.ShadowStabilityPatches.Enabled
-                    ? "AN" : "AUS (vanilla)")
-                    + (Patches.ShadowStabilityPatches.StatSnaps == 0 ? " - patch nicht installiert, komet.json" : "");
+                state = "shadow texel snapping " + (Patches.ShadowStabilityPatches.Enabled
+                    ? "ON" : "OFF (vanilla)")
+                    + (Patches.ShadowStabilityPatches.StatSnaps == 0 ? " - patch not installed, komet.json" : "");
                 break;
             case "shadowthrottle":
                 if (Patches.ShadowThrottlePatches.Throttling)
                 {
                     Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1);
-                    state = "schatten-drossel AUS (ferne kaskade jeden frame, vanilla)";
+                    state = "shadow throttle OFF (far cascade every frame, vanilla)";
                 }
                 else
                 {
@@ -464,17 +470,17 @@ public partial class KometModSystem
                     var far = Math.Max(2, config.ShadowFarUpdateInterval);
                     var skip = Math.Max(4, config.ShadowFarMaxSkip);
                     Patches.ShadowThrottlePatches.SetIntervals(far, config.ShadowNearUpdateInterval, skip);
-                    state = $"schatten-drossel AN (ferne kaskade alle {far}-{skip} frames, bewegung erzwingt sofort)";
+                    state = $"shadow throttle ON (far cascade every {far}-{skip} frames, movement forces it immediately)";
                 }
                 break;
             case "shadowfade":
                 Patches.ShadowPatches.FadeFix = !Patches.ShadowPatches.FadeFix;
-                state = "schatten-fade-fix " + (Patches.ShadowPatches.FadeFix ? "AN" : "AUS (vanilla)");
+                state = "shadow fade fix " + (Patches.ShadowPatches.FadeFix ? "ON" : "OFF (vanilla)");
                 break;
             case "shadowdist":
                 Patches.ShadowPatches.DistanceMultiplier =
                     Patches.ShadowPatches.DistanceMultiplier != 1.0 ? 1.0 : Patches.ShadowPatches.ConfiguredMultiplier;
-                state = "schattenweite x" + Patches.ShadowPatches.DistanceMultiplier.ToString("0.##",
+                state = "shadow distance x" + Patches.ShadowPatches.DistanceMultiplier.ToString("0.##",
                     System.Globalization.CultureInfo.CurrentCulture)
                     + (Patches.ShadowPatches.DistanceMultiplier == 1.0 ? " (vanilla)" : "");
                 break;
@@ -484,14 +490,14 @@ public partial class KometModSystem
                     // never strand a held mark: everything pending goes out before vanilla takes over
                     Patches.EdgeCoalescePatches.Enabled = false;
                     Patches.EdgeCoalescePatches.FlushAll();
-                    state = "kanten-koaleszenz AUS (vanilla, alles ausgegeben)";
+                    state = "edge coalescing OFF (vanilla, everything flushed)";
                 }
                 else
                 {
                     // the patch is always applied and runtime-gated, so the toggle can
                     // enable the experiment even with the config default of 0/off
                     Patches.EdgeCoalescePatches.Enabled = true;
-                    state = "kanten-koaleszenz AN (experiment; default ist aus)";
+                    state = "edge coalescing ON (experimental; the default is off)";
                 }
                 break;
             case "entload":
@@ -500,135 +506,136 @@ public partial class KometModSystem
                     // never strand a held entity: everything pending finishes before vanilla takes over
                     Patches.EntityLoadPatches.Enabled = false;
                     Patches.EntityLoadPatches.FlushAll();
-                    state = "entity-lade-budget AUS (vanilla: jede entity komplett in ihrem paket-task; alles gehaltene sofort geladen)";
+                    state = "entity load budget OFF (vanilla: every entity finishes in its packet task; everything held is loaded now)";
                 }
                 else
                 {
                     Patches.EntityLoadPatches.Enabled = true;
-                    state = "entity-lade-budget AN (" + Patches.EntityLoadPatches.BudgetMs.ToString("0.#",
-                        System.Globalization.CultureInfo.CurrentCulture) + " ms/frame, naechste entity zuerst)";
+                    state = "entity load budget ON (" + Patches.EntityLoadPatches.BudgetMs.ToString("0.#",
+                        System.Globalization.CultureInfo.CurrentCulture) + " ms/frame, nearest entity first)";
                 }
                 break;
             case "minimap":
                 Patches.MinimapPatches.Enabled = !Patches.MinimapPatches.Enabled;
-                state = "minimap-budget " + (Patches.MinimapPatches.Enabled
-                    ? "AN (" + Patches.MinimapPatches.TargetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " ms je tick, kappe passt sich an)"
-                    : "AUS (vanilla: bis zu 200 kacheln je tick)");
+                state = "minimap budget " + (Patches.MinimapPatches.Enabled
+                    ? "ON (" + Patches.MinimapPatches.TargetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " ms per tick, the cap adapts)"
+                    : "OFF (vanilla: up to 200 tiles per tick)");
                 break;
             case "minimapdirect":
                 Patches.MinimapPatches.DirectUpload = !Patches.MinimapPatches.DirectUpload;
-                state = "minimap-direktupload " + (Patches.MinimapPatches.DirectUpload
-                    ? "AN (kacheln per glTexSubImage2D in die komponenten-textur)"
-                    : "AUS (vanilla: framebuffer-draw je kachel)");
+                state = "minimap direct upload " + (Patches.MinimapPatches.DirectUpload
+                    ? "ON (tiles via glTexSubImage2D into the component texture)"
+                    : "OFF (vanilla: a framebuffer draw per tile)");
                 break;
             case "taskbudget":
                 Patches.MainThreadTaskPatches.BudgetMs = Patches.MainThreadTaskPatches.BudgetMs > 0
                     ? 0 : (config.MainThreadTaskBudgetMs > 0 ? config.MainThreadTaskBudgetMs : 3.0);
-                state = "task-drain-budget " + (Patches.MainThreadTaskPatches.BudgetMs > 0
-                    ? "AN (" + Patches.MainThreadTaskPatches.BudgetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " ms je frame, rest geht geordnet in den naechsten frame)"
-                    : "AUS (vanilla: alles, was ansteht, laeuft in diesem frame)")
-                    + (Patches.MainThreadTaskPatches.Enabled ? "" : " - wirkt erst mit 'mtt' AN");
+                state = "task drain budget " + (Patches.MainThreadTaskPatches.BudgetMs > 0
+                    ? "ON (" + Patches.MainThreadTaskPatches.BudgetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " ms per frame, the remainder goes to the next frame in order)"
+                    : "OFF (vanilla: everything queued runs in this frame)")
+                    + (Patches.MainThreadTaskPatches.Enabled ? "" : " - only takes effect with 'mtt' ON");
                 break;
             case "animlod":
                 Patches.EntityAnimPatches.LodEnabled = !Patches.EntityAnimPatches.LodEnabled;
-                state = "anim-lod " + (Patches.EntityAnimPatches.LodEnabled
-                    ? "AN (schatten-only entities jeder 3., ab " + Patches.EntityAnimPatches.FarBlocks.ToString("0", System.Globalization.CultureInfo.CurrentCulture)
-                      + " bloecken jeder 2. frame)"
-                    : "AUS (vanilla: jede entity jeden frame)")
-                    + (Patches.EntityAnimPatches.Enabled ? "" : " - wirkt erst mit 'entbefore' AN");
+                state = "anim lod " + (Patches.EntityAnimPatches.LodEnabled
+                    ? "ON (shadow-only entities every 3rd, beyond " + Patches.EntityAnimPatches.FarBlocks.ToString("0", System.Globalization.CultureInfo.CurrentCulture)
+                      + " blocks every 2nd frame)"
+                    : "OFF (vanilla: every entity every frame)")
+                    + (Patches.EntityAnimPatches.Enabled ? "" : " - only takes effect with 'entbefore' ON");
                 break;
             case "entbefore":
                 Patches.EntityAnimPatches.Enabled = !Patches.EntityAnimPatches.Enabled;
-                state = "entity-before-attribution " + (Patches.EntityAnimPatches.Enabled
-                    ? "AN (vor-render und anim getrennt gestoppt, ruckler-zeilen nennen die entity)"
-                    : "AUS (vanilla-schleife, damit auch kein anim-lod)");
+                state = "entity before attribution " + (Patches.EntityAnimPatches.Enabled
+                    ? "ON (pre-render and anim clocked separately, hitch lines name the entity)"
+                    : "OFF (vanilla loop, and therefore no anim lod either)");
                 break;
             case "clientalloc":
                 Patches.ClientAllocPatches.Enabled = !Patches.ClientAllocPatches.Enabled;
-                state = "client-alloc-attribution " + (Patches.ClientAllocPatches.Enabled
-                    ? "AN (worker-threads und threadpool je aufrufer)" : "AUS");
+                state = "client alloc attribution " + (Patches.ClientAllocPatches.Enabled
+                    ? "ON (worker threads and thread pool per caller)" : "OFF");
                 break;
             case "allocsample":
                 if (AllocSampler.Enabled)
                 {
                     Measure.FrameStats.PeriodicSample -= AllocSampler.Sample;
                     AllocSampler.Stop();
-                    state = "alloc-stichprobe AUS";
+                    state = "alloc sampling OFF";
                 }
                 else
                 {
                     AllocSampler.Start();
                     if (AllocSampler.Enabled) Measure.FrameStats.PeriodicSample += AllocSampler.Sample;
                     state = AllocSampler.Enabled
-                        ? "alloc-stichprobe AN (runtime-events, alle threads, nach typ)"
-                        : "alloc-stichprobe konnte nicht starten: " + AllocSampler.Failure;
+                        ? "alloc sampling ON (runtime events, all threads, by type)"
+                        : "alloc sampling could not start: " + AllocSampler.Failure;
                 }
                 break;
             case "packetsrc":
                 Patches.PacketSourcePatches.Enabled = !Patches.PacketSourcePatches.Enabled;
-                state = "block-paket-quellen (server) " + (Patches.PacketSourcePatches.Enabled ? "AN" : "AUS")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - misst nur den integrierten server");
+                state = "block packet sources (server) " + (Patches.PacketSourcePatches.Enabled ? "ON" : "OFF")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - only measures the integrated server");
                 break;
             case "serveralloc":
                 Patches.ServerAllocPatches.Enabled = !Patches.ServerAllocPatches.Enabled;
-                state = "server-alloc-attribution " + (Patches.ServerAllocPatches.Enabled ? "AN" : "AUS")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - misst nur den integrierten server");
+                state = "server alloc attribution " + (Patches.ServerAllocPatches.Enabled ? "ON" : "OFF")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - only measures the integrated server");
                 break;
             case "mtt":
                 Patches.MainThreadTaskPatches.Enabled = !Patches.MainThreadTaskPatches.Enabled;
-                state = "hauptthread-task-attribution " + (Patches.MainThreadTaskPatches.Enabled
-                    ? "AN (jede task wird gestoppt, ruckler-zeilen nennen den paket-typ)"
-                    : "AUS (vanilla-drain)");
+                state = "main thread task attribution " + (Patches.MainThreadTaskPatches.Enabled
+                    ? "ON (every task is clocked, hitch lines name the packet type)"
+                    : "OFF (vanilla drain)");
                 break;
             case "tickprofiler":
                 Patches.TickProfiler.Enabled = !Patches.TickProfiler.Enabled;
                 WrapTickListeners();
-                state = "tick-profiler " + (Patches.TickProfiler.Enabled
-                    ? "AN (" + Patches.TickProfiler.StatWrapped + " listener gewickelt)"
-                    : "AUS (vanilla-delegates)");
+                state = "tick profiler " + (Patches.TickProfiler.Enabled
+                    ? "ON (" + Patches.TickProfiler.StatWrapped + " listeners wrapped)"
+                    : "OFF (vanilla delegates)");
                 break;
             case "entsync":
                 Patches.EntitySyncPatches.DistanceSendRate = !Patches.EntitySyncPatches.DistanceSendRate;
                 Patches.EntitySyncPatches.TrackingHysteresis = Patches.EntitySyncPatches.DistanceSendRate;
-                state = "entity-sync-tuning (server) " + (Patches.EntitySyncPatches.DistanceSendRate
-                    ? "AN (positionen distanzabhaengig, tracking mit hysterese)"
-                    : "AUS (vanilla: 30 Hz fuer alle, hartes tracking-band)")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - wirkt nur auf einem server, auf dem komet laeuft");
+                state = "entity sync tuning (server) " + (Patches.EntitySyncPatches.DistanceSendRate
+                    ? "ON (positions by distance, tracking with hysteresis)"
+                    : "OFF (vanilla: 30 Hz for everything, hard tracking band)")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - only has an effect on a server that runs komet");
                 break;
             case "attrskip":
                 Patches.EntitySyncPatches.AttributeNoOpSkip = !Patches.EntitySyncPatches.AttributeNoOpSkip;
-                state = "attribut-noop-skip (server) " + (Patches.EntitySyncPatches.AttributeNoOpSkip
-                    ? "AN (unveraenderte attribut-pfade werden nicht gesendet)"
-                    : "AUS (vanilla: jeder dirty-pfad geht raus)")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - wirkt nur auf einem server, auf dem komet laeuft");
+                state = "attribute no-op skip (server) " + (Patches.EntitySyncPatches.AttributeNoOpSkip
+                    ? "ON (unchanged attribute paths are not sent)"
+                    : "OFF (vanilla: every dirty path goes out)")
+                    + (capi != null && capi.IsSinglePlayer ? "" : " - only has an effect on a server that runs komet");
                 break;
             case "edgeprio":
                 if (Patches.EdgeRetessPriorityPatches.Enabled)
                 {
                     Patches.EdgeRetessPriorityPatches.Enabled = false;
-                    state = "edge-retess-prio AUS (vanilla-reihenfolge, sichtbare rand-reparaturen warten wieder)";
+                    state = "edge retess prio OFF (vanilla order, visible edge repairs wait again)";
                 }
                 else
                 {
                     Patches.EdgeRetessPriorityPatches.Enabled = true;
                     // explicit user intent overrides a self-disable
                     Patches.EdgeRetessPriorityPatches.HardDisabled = false;
-                    state = "edge-retess-prio AN (sichtbare rand-reparaturen ueberholen die warteschlange)";
+                    state = "edge retess prio ON (visible edge repairs overtake the queue)";
                 }
                 break;
             default:
-                return "unbekannt. Systeme: cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
+                return Loc.T("komet:msg-unknown-system", "unknown. Systems: ")
+                     + "cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
                      + "prebuild, firepit, enttess, entload, minimap, minimapdirect, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
                      + "beforeattr, tickprofiler, mtt, taskbudget, entbefore, animlod, serveralloc, clientalloc, allocsample, packetsrc, retess, hudraster, cullcheck, cellsize, shadowbox, shadowfade, "
                      + "shadowdist, shadowlod, shadowstab, shadowthrottle, entsync, attrskip";
         }
 
-        var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} empfangen, "
-                    + $"warteschl. {Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation:N0}, "
+        var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} received, "
+                    + $"queued {Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation:N0}, "
                     + $"uptime {uptime.Elapsed.TotalSeconds:F0}s";
-        Mod.Logger.Notification("toggle: {0} | weltzustand: {1}", state, world);
+        Mod.Logger.Notification("toggle: {0} | world: {1}", state, world);
         return state + " | " + world;
     }
 
@@ -642,7 +649,7 @@ public partial class KometModSystem
         safeMode = !safeMode;
         if (safeMode)
         {
-            if (StressTest.Running) StressTest.Stop("safemode uebernimmt");
+            if (StressTest.Running) StressTest.Stop("safemode takes over");
             savedSunInterval = Patches.SunQueryPatches.Interval;
             savedGlErrorSkip = Patches.GlErrorPatches.SkipEnabled;
             savedFirepitGate = Patches.FirepitPatches.Enabled;
@@ -650,10 +657,11 @@ public partial class KometModSystem
             savedEdgeCoalesce = Patches.EdgeCoalescePatches.Enabled;
             savedEdgePriority = Patches.EdgeRetessPriorityPatches.Enabled;
             AllVanilla();
-            Mod.Logger.Notification("safemode AN | warteschl. {0:N0}, uptime {1:F0}s",
+            Mod.Logger.Notification("safemode ON | queued {0:N0}, uptime {1:F0}s",
                 Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation, uptime.Elapsed.TotalSeconds);
-            return "SAFEMODE AN - komet zeichnet nichts mehr anders als vanilla. "
-                 + "Bildfehler noch da? Dann ist es nicht diese Mod. '.komet safemode' schaltet zurueck.";
+            return Loc.T("komet:msg-safemode-on",
+                "SAFEMODE ON - komet no longer draws anything differently from vanilla. "
+                + "Glitch still there? Then it is not this mod. '.komet safemode' switches back.");
         }
 
         AllConfigured();
@@ -666,9 +674,9 @@ public partial class KometModSystem
         Patches.EdgeCoalescePatches.Enabled = savedEdgeCoalesce;
         Patches.EdgeRetessPriorityPatches.Enabled =
             savedEdgePriority && !Patches.EdgeRetessPriorityPatches.HardDisabled;
-        Mod.Logger.Notification("safemode AUS | warteschl. {0:N0}, uptime {1:F0}s",
+        Mod.Logger.Notification("safemode OFF | queued {0:N0}, uptime {1:F0}s",
             Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation, uptime.Elapsed.TotalSeconds);
-        return "Safemode aus - Optimierungen laufen wieder gemaess komet.json.";
+        return Loc.T("komet:msg-safemode-off", "Safemode off - the optimisations run according to komet.json again.");
     }
 
     /// <summary>

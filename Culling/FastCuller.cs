@@ -5,12 +5,12 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using HarmonyLib;
-using Vintagestory.API.Client;
-using Vintagestory.API.Datastructures;
-using Vintagestory.API.MathTools;
 using Komet.Measure;
+using Komet.Runtime;
+using Vintagestory.API.Client;
+using Vintagestory.API.MathTools;
 
-namespace Komet;
+namespace Komet.Culling;
 
 /// <summary>
 /// Drop-in replacement for <see cref="MeshDataPool.FrustumCull"/>, the per-frame visibility

@@ -16,19 +16,19 @@ namespace Komet.Measure;
 /// and counts which bucket dominated - so "es ruckelt beim drehen" becomes a measured,
 /// attributable statement instead of an impression.
 ///
-/// Lives in shared/ so the baseline records hitches identically: hitches per minute is then a
+/// Lives in Measure/ so the baseline records hitches identically: hitches per minute is then a
 /// number that can be compared between vanilla and komet by construction.
 /// </summary>
 public static class HitchLog
 {
-    // Bucket indices, mirroring the worst-frame tail's vocabulary. "schatten" and "post" are
+    // Bucket indices, mirroring the worst-frame tail's vocabulary. "shadow" and "post" are
     // the same stage sums FrameStats publishes; "draussen" is outside-stages minus the swap.
     public const int Before = 0, Schatten = 1, Opaque = 2, Oit = 3, Post = 4,
                      Ortho = 5, Done = 6, Tick = 7, Swap = 8, Draussen = 9;
     public const int BucketCount = 10;
 
     public static readonly string[] BucketNames =
-        { "before", "schatten", "opaque", "oit", "post", "ortho", "done", "tick", "swap", "draussen" };
+        { "before", "shadow", "opaque", "oit", "post", "ortho", "done", "tick", "swap", "draussen" };
 
     /// <summary>Floor in milliseconds - below this a frame is never booked...</summary>
     public static double MinMs = 15.0;
@@ -385,7 +385,7 @@ public static class HitchLog
 
         if (Log != null)
         {
-            if (RateLimitAllows(uptime.Elapsed.TotalSeconds)) Log("ruckler: " + FormatEntry(in ring[slot]));
+            if (RateLimitAllows(uptime.Elapsed.TotalSeconds)) Log("hitches: " + FormatEntry(in ring[slot]));
             else suppressedLogs++;
         }
     }
@@ -520,8 +520,8 @@ public static class HitchLog
         var ci = CultureInfo.CurrentCulture;
         var paused = CountPaused > 0 ? string.Format(ci, " | {0} im pausenmenue verworfen", CountPaused) : "";
         if (TotalHitches == 0)
-            return string.Format(ci, "keine (schwelle mind. {0:F0} ms und {1:F1}x avg){2}", MinMs, Factor, paused);
-        return string.Format(ci, "{0} ({1:F1}/min): {2} beim drehen, {3} in bewegung, {4} im stand, {5} mit gc-pause ({6} gen2){7}",
+            return string.Format(ci, "none (threshold at least {0:F0} ms and {1:F1}x avg){2}", MinMs, Factor, paused);
+        return string.Format(ci, "{0} ({1:F1}/min): {2} while turning, {3} while moving, {4} standing still, {5} with a gc pause ({6} gen2){7}",
             TotalHitches, PerMinute, CountTurning, CountMoving, CountStill, CountGcPause, CountGen2, paused);
     }
 
@@ -530,19 +530,19 @@ public static class HitchLog
     {
         var ci = CultureInfo.CurrentCulture;
         var sb = new StringBuilder(1024);
-        sb.AppendFormat(ci, "ruckler seit reset: {0} ({1:F1}/min) | schwelle: mind. {2:F0} ms und {3:F1}x avg-frame\n",
+        sb.AppendFormat(ci, "hitches since reset: {0} ({1:F1}/min) | threshold: at least {2:F0} ms and {3:F1}x the avg frame\n",
             TotalHitches, PerMinute, MinMs, Factor);
 
         if (TotalHitches == 0)
         {
-            sb.Append("nichts aufgezeichnet - normal spielen (umschauen, laufen) und erneut abrufen");
+            sb.Append("nothing recorded - play normally (look around, walk) and ask again");
             return sb.ToString();
         }
 
-        sb.AppendFormat(ci, "kamera: {0} beim drehen (ab {1:F0} grad/s), {2} in bewegung, {3} im stand | {4} mit gc-pause, davon {5} gen2\n",
+        sb.AppendFormat(ci, "camera: {0} while turning (from {1:F0} deg/s), {2} while moving, {3} standing still | {4} with a gc pause, {5} of them gen2\n",
             CountTurning, TurnThresholdDegPerSec, CountMoving, CountStill, CountGcPause, CountGen2);
         if (CountPaused > 0)
-            sb.AppendFormat(ci, "pausenmenue: {0} lange frames verworfen (spiel stand, kein ruckler)\n", CountPaused);
+            sb.AppendFormat(ci, "pause menu: {0} long frames discarded (the game was paused, not a hitch)\n", CountPaused);
 
         // ordered by count, descending - small fixed array, done the plain way
         sb.Append("dominanter bucket: ");
@@ -560,7 +560,7 @@ public static class HitchLog
         sb.Append('\n');
 
         if (suppressedLogs > 0)
-            sb.AppendFormat(ci, "({0} weitere nicht einzeln geloggt)\n", suppressedLogs);
+            sb.AppendFormat(ci, "({0} more not logged individually)\n", suppressedLogs);
 
         var show = Math.Min(ringCount, 8);
         sb.Append("letzte ").Append(show).Append(":\n");
@@ -608,10 +608,10 @@ public static class HitchLog
     {
         if (!serverGc || worstEphemeralMs < 25.0) return null;
         return string.Format(CultureInfo.CurrentCulture,
-            "  -> server-gc hat hier {0:F0} ms am stueck alle threads angehalten, in einer gen0/gen1-"
-            + "sammlung.\n     die ist in JEDEM modus stop-the-world; server-gc macht sie nur seltener "
-            + "und dafuer viel laenger.\n     fuer ein spiel ist workstation+concurrent die passendere "
-            + "wahl: DOTNET_gcServer=0 im startskript.",
+            "  -> server gc stopped every thread for {0:F0} ms in one go here, in a gen0/gen1 "
+            + "collection.\n     that one is stop-the-world in EVERY mode; server gc only makes it rarer "
+            + "and much longer in exchange.\n     for a game, workstation+concurrent is usually the better "
+            + "choice: DOTNET_gcServer=0 in the start script.",
             worstEphemeralMs);
     }
 

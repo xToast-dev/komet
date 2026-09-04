@@ -221,7 +221,7 @@ public static class ClientAllocPatches
             }
             if (pool.Count > shown) sb.Append(", ...");
         }
-        if (!Enabled) sb.Append(" (AUS)");
+        if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 

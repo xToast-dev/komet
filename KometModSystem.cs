@@ -1,9 +1,12 @@
 using System;
 using System.Runtime;
 using HarmonyLib;
+using Komet.Culling;
+using Komet.Guard;
+using Komet.Measure;
+using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Komet.Measure;
 
 namespace Komet;
 
@@ -276,7 +279,15 @@ public partial class KometModSystem : ModSystem
         // nothing is "resolved", which side should win is not this mod's call.
         PatchGuard.Warn = msg => Mod.Logger.Warning(msg);
         PatchGuard.Notify = msg => Mod.Logger.Notification(msg);
-        guardFinalize = () => RunPatchGuard(engineCheck: true);
+        guardFinalize = () =>
+        {
+            // The drain budget starts here and not a frame earlier: everything the join
+            // queued (LevelFinalize itself included) has to run in its own frame, or a
+            // renderer that is already registered draws against state its LevelFinalize
+            // has not built yet (see MainThreadTaskPatches.WorldReady).
+            Patches.MainThreadTaskPatches.WorldReady = true;
+            RunPatchGuard(engineCheck: true);
+        };
         api.Event.LevelFinalize += guardFinalize;
         guardListenerId = api.Event.RegisterGameTickListener(_ => RunPatchGuard(engineCheck: false), 10000);
 
@@ -494,7 +505,13 @@ public partial class KometModSystem : ModSystem
             ? "animatable renderer frustum gate (animated block entities outside the stage's frustum are skipped)"
             : "animatable renderer frustum gate off (vanilla); '.komet toggle animcull' enables it live");
 
-        if (config.EntityTesselationBudgetMs > 0)
+        // Both entity budgets reopen their window on the frame boundary, and only there. If
+        // the measurement bracket above did not apply, that boundary never fires: the
+        // tesselation budget would then skip EVERY entity shape for the rest of the session
+        // (all animals invisible) and the load budget would hold every entity forever. A
+        // feature whose reset is missing runs vanilla instead - the patches carry the same
+        // rule at runtime (StaleAfterMs), this is the same decision one step earlier.
+        if (config.EntityTesselationBudgetMs > 0 && RequireFrameBoundary("entity tesselation budget"))
             Patch(() =>
             {
                 Patches.EntityTessPatches.Apply(harmony, config.EntityTesselationBudgetMs);
@@ -510,12 +527,14 @@ public partial class KometModSystem : ModSystem
             Patches.EntityLoadPatches.Log = msg => Mod.Logger.Warning(msg);
             Patches.EntityLoadPatches.Apply(harmony);
             Patches.EntityLoadPatches.BudgetMs = config.EntityLoadBudgetMs > 0 ? config.EntityLoadBudgetMs : 1.5;
-            Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0;
+            Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 && MeasurementPatches.FrameBoundaryLive;
             MeasurementPatches.FrameBoundary += Patches.EntityLoadPatches.OnFrameBoundary;
             entityLoadHooked = true;
-        }, config.EntityLoadBudgetMs > 0
-            ? $"entity load budget ({config.EntityLoadBudgetMs:0.#} ms/frame, nearest entity first)"
-            : "entity load budget off (vanilla: each entity finishes in its packet's task); '.komet toggle entload' enables it live");
+        }, config.EntityLoadBudgetMs <= 0
+            ? "entity load budget off (vanilla: each entity finishes in its packet's task); '.komet toggle entload' enables it live"
+            : MeasurementPatches.FrameBoundaryLive
+                ? $"entity load budget ({config.EntityLoadBudgetMs:0.#} ms/frame, nearest entity first)"
+                : "entity load budget off: without the frame measurement nothing would ever drain the held entities");
 
         // Always applied, gated at runtime ('.komet toggle minimap'): the transpiled cap
         // returns vanilla's 200 while disabled, so off is exactly vanilla.
@@ -619,6 +638,20 @@ public partial class KometModSystem : ModSystem
     /// A failed patch must never take the game down with it - the engine's internals can shift
     /// between point releases. Log it, skip that one optimisation, carry on.
     /// </summary>
+    /// <summary>
+    /// Guards a feature that can only be correct while the frame boundary fires. Says so once,
+    /// in the same voice as <see cref="Patch"/>, and answers false so the caller stays on
+    /// vanilla - which is a real loss of speed, and never a loss of correctness.
+    /// </summary>
+    private bool RequireFrameBoundary(string what)
+    {
+        if (MeasurementPatches.FrameBoundaryLive) return true;
+        Mod.Logger.Warning(
+            "'{0}' stays off: the frame measurement did not apply, so its per-frame budget would never reset. Running vanilla here.",
+            what);
+        return false;
+    }
+
     private void Patch(Action apply, string what)
     {
         try
@@ -649,16 +682,16 @@ public partial class KometModSystem : ModSystem
             if (engineCheck)
             {
                 if (PatchGuard.Findings.Count == 0)
-                    Mod.Logger.Notification("patch-kollisionen: keine - niemand sonst patcht komets methoden oder komet-code");
+                    Mod.Logger.Notification("patch collisions: none - nobody else patches komet's methods or komet's own code");
                 else
-                    Mod.Logger.Notification("patch-kollisionen: {0} ({1} hoch) - '.komet conflicts' fuer die liste",
-                        PatchGuard.Findings.Count, PatchGuard.CountAt(PatchGuard.Severity.Hoch));
+                    Mod.Logger.Notification("patch collisions: {0} ({1} high) - '.komet conflicts' for the list",
+                        PatchGuard.Findings.Count, PatchGuard.CountAt(PatchGuard.Severity.High));
             }
         }
         catch (Exception e)
         {
             // a guard that reports problems must never become one
-            Mod.Logger.Notification("patch guard konnte nicht pruefen ({0}), laeuft ohne ihn weiter", e.GetType().Name);
+            Mod.Logger.Notification("patch guard could not check ({0}), continuing without it", e.GetType().Name);
         }
     }
 
@@ -797,7 +830,7 @@ public partial class KometModSystem : ModSystem
 
     public override void Dispose()
     {
-        if (StressTest.Running) StressTest.Stop("welt wird verlassen");
+        if (StressTest.Running) StressTest.Stop("leaving the world");
         if (fbRebuildListenerId >= 0)
         {
             capi?.Event.UnregisterGameTickListener(fbRebuildListenerId);

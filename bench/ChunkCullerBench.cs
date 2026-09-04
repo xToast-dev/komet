@@ -2,8 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
+using Komet.Culling;
 using Vintagestory.API.MathTools;
-using Komet;
 
 /// <summary>
 /// Vanilla ChunkCuller ray walk vs the hoisted one, on a synthetic chunk map.

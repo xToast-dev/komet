@@ -10,3 +10,17 @@ resharper_inconsistent_naming_highlighting = none
 resharper_csharp_naming_rule_violation_highlighting = none
 dotnet_diagnostic.IDE1006.severity = none
 dotnet_naming_rule.parameters_should_be_camel_case.severity = none
+
+# Folder == namespace, and the source folders sit next to Komet.csproj so that every tool
+# computing "RootNamespace + path from the project file" arrives at the same answer we do.
+# That is why there is no src/ level: a namespace inspection derived Komet.Src.* from it and
+# rewrote the generated EngineFingerprint.g.cs on 04.09.2026, which unhooked it from
+# PatchGuard and left the engine-drift check comparing against nothing. Keep the rule ON -
+# it now protects the layout instead of fighting it.
+dotnet_style_namespace_match_folder = true
+
+# Written by ./build.sh fingerprint, not edited. It is NOT called EngineFingerprint.g.cs:
+# an editor rule that renames a file to match the single type inside it did exactly that on
+# 04.09.2026 and the reference broke. File name == type name keeps every such rule quiet.
+[Guard/EngineFingerprint.cs]
+generated_code = true

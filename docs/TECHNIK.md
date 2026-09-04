@@ -736,7 +736,7 @@ tesselation      118/s    4,10 ms  je chunk, 1,2 nachbarn
 ```
 
 ms/chunk mal Queue-Länge ist die verbleibende Ladezeit; sinkt der `nachbarn`-Anteil nach dem
-Einschalten des Prefetch, wirkt er. Die Zeile kommt aus `shared/` und erscheint auch in der
+Einschalten des Prefetch, wirkt er. Die Zeile kommt aus `Measure/` und erscheint auch in der
 Baseline — Vorher/Nachher ist damit ein Mod-Manager-Toggle.
 
 **Der Teardown-NRE und warum die erste Reparatur nicht hielt (01.09. abends).** Ein heiß
@@ -1300,7 +1300,7 @@ auf die Mittelwerte verbogen → Test fällt.
 
 Der Worst-Frame-Snapshot hält genau *einen* Frame pro Fenster fest und ist weg, sobald das
 Fenster rollt — für die Frage „warum ruckelt es **beim Umschauen**?" reicht das nicht.
-Das Hitch-Log (`shared/HitchLog.cs`) bucht deshalb **jeden** Frame, der die Schwelle reißt
+Das Hitch-Log (`Measure/HitchLog.cs`) bucht deshalb **jeden** Frame, der die Schwelle reißt
 (mindestens `HitchMinMs` = 15 ms **und** `HitchFrameFactor` = 2× des laufenden
 Durchschnitts), einzeln: komplette Bucket-Aufteilung (before/schatten/opaque/oit/post/
 ortho/done/tick/swap/draussen), GC-Pausen-Anteil, und — der eigentliche Punkt — die
@@ -1321,7 +1321,7 @@ Ablesen:
   GC-Pause, dominante Buckets) plus die letzten acht Einträge; `.komet hitch reset` leert
 - jede Buchung landet als eigene Zeile in `client-main.log` (max. 6 je 30 s, Rest gezählt)
 
-Das Log liegt in `shared/` und läuft in der Baseline identisch mit — „ruckler/min vanilla
+Das Log liegt in `Measure/` und läuft in der Baseline identisch mit — „ruckler/min vanilla
 gegen komet" ist damit per Konstruktion vergleichbar. Außerdem seit 1.31.0: HUD und
 `.komet` nennen den **GC-Modus**.
 
@@ -1539,6 +1539,18 @@ Spieler ist strukturell außen vor: `EntityPlayerShapeRenderer` überschreibt
 `TesselateShape()` ohne base-Aufruf, der Patch auf der Basismethode sieht ihn nie.
 `.komet toggle enttess`, Safemode schaltet es ab, HUD-Zeile `entity-tess N verschoben`,
 Stress-Phase `entity-tess-budget aus`.
+
+**Das Budget muss nach vorn ausfallen (04.09.).** Sein Fenster wird ausschließlich von
+`MeasurementPatches.FrameBoundary` zurückgesetzt. Bleibt dieses Event aus, während der Patch
+angewandt ist, fällt `spentThisFrameMs` nie wieder unter das Budget — dann wird *jede* weitere
+`TesselateShape` übersprungen, dauerhaft, für jede animierte Entity: „alle Tiere sind
+unsichtbar", ohne Exception und ohne Logzeile. Zwei Riegel: `RequireFrameBoundary` lässt das
+Feature erst gar nicht an, wenn die Messklammer nicht greifen konnte (Logzeile statt stiller
+Fehlfunktion), und zur Laufzeit öffnet `StaleAfterMs` (250 ms ohne Boundary) das Fenster selbst
+wieder — `StatStaleResets` zählt das. Dieselbe Regel im Entity-Load-Budget: ohne Drain hält
+`Intake` nichts mehr zurück, sondern schließt sofort ab (`DrainStale`, `StatStaleFlushes`),
+sonst erreichte keine einzige Entity je `LoadedEntities`. Ein Budget, das seinen Reset
+verliert, darf auf Vanilla zurückfallen, nie auf „nie".
 
 **Beifang desselben Logs, ein Messfehler seit 1.0:** `tick 26,6 ms` in einem 26,2-ms-Frame.
 `CoreServerEventManager.TriggerGameTick` ruft `base.TriggerGameTick` — die gepatchte
@@ -1919,6 +1931,17 @@ wachsen. Reine Regel `OverBudget(budget, spent, ran, remaining)` im Verify.
 `.komet toggle taskbudget`, Stress-Phase `task-budget aus`, Report: `hauptthread-tasks: …
 budget 3 ms: N frames gekappt, M tasks verschoben`, HUD `mt-tasks · N frames gekappt`.
 
+**Das Budget gilt erst ab `LevelFinalize` (04.09.).** Ein Bericht zu 1.2.0-pre.2 zeigte beim
+Weltbeitritt eine `NullReferenceException` in `WeatherSystemClient.OnRenderFrame` — Vanilla
+registriert den Renderer früh, baut sein `WeatherDataAtPlayer` aber erst in
+`LevelFinalizeInit`, und der Level-Finalize-Handler ist selbst eine Hauptthread-Task
+(`readpacket6=LevelFinalize`). Über Frames verteilt heißt das: der Before-Stage-Renderer läuft
+ein Frame, bevor das Paket, das ihn initialisiert, an der Reihe war. Das Beitritts-Gedränge ist
+Lebenszyklus, keine Last — `MainThreadTaskPatches.WorldReady` (gesetzt im `LevelFinalize`-Hook
+des Mod-Systems, gelöscht beim Verlassen in `Detach`) hält den Drain bis dahin auf Vanilla:
+alles, was ankommt, läuft im selben Frame. Verify prüft beide Seiten (ungebudgetiert vor
+`LevelFinalize`, gekappt danach, zurück auf Vanilla nach `Detach`).
+
 ## Server-Allokation: die 193 MB/s bekommen Namen (02.09.)
 
 Jede gen0-Sammlung pausiert den Render-Thread, egal wer alloziert hat. Die Join-Flut-Reports
@@ -2035,7 +2058,7 @@ buchen seitdem nur noch die Main-Thread-Anteile — die Worker-Zeit stiehlt kein
 
 Neben `Komet.dll` wird `KometBaseline.dll` mit installiert. Die enthält **nur die Messung**
 und **keine einzige Optimierung** — dasselbe HUD, aus buchstäblich denselben Quelldateien
-(`shared/`), damit eine Zahl hier und eine Zahl dort dasselbe bedeuten und sich subtrahieren
+(`Measure/`), damit eine Zahl hier und eine Zahl dort dasselbe bedeuten und sich subtrahieren
 lassen. Ihre einzigen Harmony-Patches lesen eine Uhr.
 
 ```
@@ -2203,7 +2226,6 @@ Neubau bisektieren.
 | `BulkMeshUpload` | `false` | Chunk-Meshes am Stück kopieren — wirkungslos ohne persistentes Mapping |
 | `ExperimentalPersistentMapping` | `false` | `allowPStorage` scharf schalten (siehe oben, ungetesteter Engine-Pfad) |
 | `MeasureCullTime` | `true` | Sweep messen, damit ms/Frame statt Ereigniszahlen erscheinen (~0,03 ms/Frame) |
-| `MeasureRenderStages` | `true` | Zeit pro Render-Stage und Game-Tick (2 Stopwatch-Lesungen × ~13 Stages) |
 | `FixShadowFadeCutoff` | `true` | harte Schattenkante in der Ferne zu einer weichen Verblendung machen |
 | `ShadowDistanceMultiplier` | `1.0` | ferne Schatten-Kaskade strecken (klobiger + teurer) |
 | `ProfileRenderers` | `true` | Zeit je einzelnem Renderer messen (HUD-Sektion „teuerste renderer") |
@@ -2238,22 +2260,80 @@ Optimierung übersprungen und das Spiel läuft normal weiter.
 
 ---
 
+## Sprachen: Logs Englisch, HUD und Chat in der Sprache des Spielers (04.09.)
+
+Eine Trennlinie, die man an jeder Stelle im Code beantworten kann: **wird der Text geloggt, ist
+er Englisch.** Report, Ruckler-Zeilen, `.komet toggle`- und `.komet stress`-Ausgaben und jede
+`Mod.Logger`-Zeile sind Diagnose-Artefakte — sie landen im `client-main.log`, werden in
+Bugreports kopiert und von Leuten gelesen, die den erzeugenden Client nicht haben. **Wird er nur
+angezeigt, wird er übersetzt.** Das sind genau zwei Oberflächen: das F7-HUD und die
+Chat-Antworten des `.komet`-Befehls (inklusive der Beschreibungen in der Chat-Hilfe).
+
+`Measure/Loc.cs` ist die ganze Mechanik. Jeder Aufruf trägt seinen englischen Text als Argument
+mit, nicht nur einen Schlüssel:
+
+```csharp
+DebugHud.Row(sb, Loc.Hud("cpu cores"), ...);              // -> komet:hud-cpu-cores
+Loc.T("komet:hud-cores-busy", "{0} of {1} cores busy", a, b);
+```
+
+Der Fallback ist kein Fehlerfall, sondern der Normalfall in drei Situationen: die Verify-Suite
+läuft ohne Spiel und ohne geladene Sprachdatei, KometBaseline zeigt dasselbe HUD ohne eigene
+Assets, und eine Sprache kann einen Schlüssel schlicht nicht kennen. In allen dreien erscheint
+der englische Text aus der Quelle — nie ein roher Schlüssel, nie eine leere Zeile.
+`Loc.Hud` leitet den Schlüssel aus dem Label ab (`"cpu cores"` → `komet:hud-cpu-cores`), damit
+eine Zeile nicht von ihrem Eintrag wegdriften kann.
+
+Die Dateien liegen in `assets/komet/lang/{en,de}.json` und wandern per `build.sh release` ins
+ZIP. Die Schlüssel tragen ihre Domain selbst (`"komet:hud-fps"`), weil `TranslationService`
+einen Schlüssel mit `:` unverändert übernimmt und nur einen ohne die Domain voranstellt.
+
+Verify hält beides zusammen: es liest **die Quelldateien** (nicht das, was ein Lauf zufällig
+gedruckt hat), sammelt jedes `Loc.T`/`Loc.Hud` und verlangt, dass `en.json` und `de.json` exakt
+diese Schlüsselmenge tragen — ein fehlender zeigt einem deutschen Spieler still Englisch, ein
+überzähliger ist eine Übersetzung für Text, den niemand mehr druckt. Dazu vergleicht es die
+Platzhalter je Eintrag: eine Übersetzung, der ein `{0}` fehlt, würde sonst mitten im Frame in
+`string.Format` werfen.
+
+Nicht übersetzt und mit Absicht: die Bucket-Namen in `WorstFrameTail` (`shadow`, `outside`, …).
+Dieselbe Funktion füttert HUD **und** Report, und das Vokabular der Ruckler-Zeilen muss über
+beide gleich lauten, sonst reden Log und Bildschirm über verschiedene Dinge.
+
 ## Projektstruktur
 
+Ein Ordner ist ein Namespace, ohne Ausnahme: `Culling/` → `Komet.Culling`, `Measure/` →
+`Komet.Measure`, die Wurzel → `Komet`. Die Quellordner liegen deshalb seit dem 04.09. direkt
+neben `Komet.csproj` und nicht mehr unter `src/` — ein Werkzeug, das den erwarteten Namespace
+aus `RootNamespace` plus Pfad ab der Projektdatei rechnet, kam sonst auf `Komet.Src.*` und
+„reparierte" das notfalls selbst (einmal geschehen, siehe Fingerprint unten). `Measure/`
+kompiliert in vier Projekte hinein und heißt in allen `Komet.Measure`.
+
 ```
-src/FastCuller.cs              Sichtbarkeits-Sweep: SoA-Cache, Cull-Loops, Range-Merging
-src/RayTraversal.cs            Chunk-Raywalk mit aus der Schleife gehobenen Konstanten
-src/FastChunkCuller.cs         Occlusion-Pass: Snapshot, flaches Gitter, parallel
-src/UploadBudget.cs            Regler für die Upload-Zeit pro Frame
-shared/FrameStats.cs           Pro-Frame-Buchführung, exponentiell geglättet
-shared/DebugHud.cs             das Overlay (Ortho-Stage, Text-Textur alle 250 ms erneuert)
-shared/MeasurementPatches.cs   reine Zeitmessung — auch von der Baseline-Mod benutzt
-baseline/                      die Vanilla-Messlatte: shared/ + ModSystem, sonst nichts
-src/Patches/                   Harmony-Einsprungpunkte
-src/KometModSystem.cs          Laden, Config, .komet-Command
-verify/                        wendet die echten Patches auf die echten Assemblies an,
-                               erzwingt JIT und prüft Verhalten — ohne das Spiel zu starten
-bench/                         Äquivalenz- und Durchsatzmessung gegen Vanilla
+KometModSystem.cs             Laden, Config, .komet-Command   -> Komet
+KometConfig.cs                die Schalter samt Doku-Kommentar
+Culling/                      Sichtbarkeit                    -> Komet.Culling
+  FastCuller.cs                     Sweep: SoA-Cache, Cull-Loops, Range-Merging
+  RayTraversal.cs                   Chunk-Raywalk, Konstanten aus der Schleife gehoben
+  FastChunkCuller.cs                Occlusion-Pass: Snapshot, flaches Gitter, parallel
+  CullVerifier.cs                   stichprobenweiser Abgleich gegen Vanillas Ergebnis
+Runtime/                      Motor unter den Patches         -> Komet.Runtime
+  WorkerSet.cs, CpuTopology.cs      Threads und was die CPU wirklich hergibt
+  UploadBudget.cs, InflowBrake.cs   Regler für Upload-Zeit und Nachschub pro Frame
+  ClientQueues.cs, PoolReclaimer.cs, ArrayPoolByClass.cs, ChunkMarkClock.cs
+  AllocSampler.cs, StressTest.cs, WindowPrebuilder.cs
+Guard/                        Selbstprüfung                   -> Komet.Guard
+  PatchGuard.cs                     fremde Patches auf Komets Methoden, Engine-Drift
+  EngineFingerprint.cs            generiert von ./build.sh fingerprint
+  TaskCodes.cs                      Paket-Id -> Name, aus Packet_ServerIdEnum gelesen
+Patches/                      Harmony-Einsprungpunkte         -> Komet.Patches
+Measure/                      Messung, auch von der Baseline  -> Komet.Measure
+  FrameStats.cs                     Pro-Frame-Buchführung, exponentiell geglättet
+  DebugHud.cs                       das Overlay (Ortho-Stage, Textur alle 250 ms neu)
+  MeasurementPatches.cs             reine Zeitmessung
+KometBaseline/                     die Vanilla-Messlatte: Measure/ + ModSystem, sonst nichts
+verify/                       wendet die echten Patches auf die echten Assemblies an,
+                              erzwingt JIT und prüft Verhalten — ohne Spielstart
+bench/                        Äquivalenz- und Durchsatzmessung gegen Vanilla
 ```
 
 `verify` ist wichtig: ein kaputter Transpiler wäre sonst erst beim Mod-Laden aufgefallen.
@@ -2436,7 +2516,7 @@ und Komets 1:1-Transkriptionen (Task-Drain, Entity-Before-Schleife, Minimap-Uplo
 ersetzen dort still, was der Fork in derselben Methode geändert hat. Keine Exception, keine
 Log-Zeile.
 
-`src/PatchGuard.cs` beantwortet beides, ohne Verhalten zu ändern — eine Kollision wird gemeldet,
+`Guard/PatchGuard.cs` beantwortet beides, ohne Verhalten zu ändern — eine Kollision wird gemeldet,
 nie „aufgelöst", denn wer gewinnen soll, ist nicht Sache dieser Mod.
 
 **Harmony-Kollisionen** kommen aus Harmonys eigenem Register (`Harmony.GetAllPatchedMethods` +
@@ -2446,14 +2526,24 @@ Stufen: **hoch** = fremder Transpiler neben Komets Transpiler, fremder abbrechen
 Komets abbrechendem Prefix (die Zeile sagt, wer zuerst läuft), Patch auf Komet-Code; **mittel** =
 abbrechender Prefix auf einer nur gemessenen Methode (die Messung bucht dann einen übersprungenen
 Aufruf), fremder Transpiler unter Komets Prefix/Postfix; **info** = nicht abbrechende Prefixe,
-Postfixe, Finalizer. Geprüft bei `LevelFinalize` (alle Mods sind dann gestartet) und alle 10 s
+Postfixe, Finalizer.
+
+**Wo Komet die Methode ersetzt (04.09.).** Komets Transkriptionen sind abbrechende Prefixe — der
+Task-Drain, die Entity-Before-Schleife, die Entity-Paket-Handler, die PhysicsManager-Regeln, der
+Minimap-Upload. Auf so einer Methode gilt Vanilla-Harmony-Semantik: der fremde **Transpiler**
+läuft nie (das Original läuft nicht), ein fremder **Prefix**, der hinter Komets einsortiert ist,
+wird gar nicht mehr aufgerufen, und ein fremder **Postfix** läuft zwar, sieht aber das Ergebnis
+der Transkription statt das des Originals. Das ergibt die Feldmeldung „seit dieser Mod sind
+Tiere unsichtbar" ohne eine einzige Exception. Der Guard stuft diese drei Fälle deshalb als
+**hoch/hoch/mittel** ein und schreibt den Grund in die Zeile (`komets prefix ersetzt das
+original, diese IL-umschreibung laeuft nie`), statt sie wie früher als Info abzutun. Geprüft bei `LevelFinalize` (alle Mods sind dann gestartet) und alle 10 s
 danach, weil Mods auch spät patchen; jeder Fund wird einmal als Warnung geloggt
 (`patch-kollision HOCH: Typ.Methode - 'modid' transpiler (prio 400) neben komet transpiler: …`),
 bleibt im Report (`patch-kollisionen: N (x hoch, y mittel, z info)` plus eine Zeile je Fund)
 und in `.komet conflicts`. Komets eigene Ids sind `komet`, `komet.server`, `komet.verify`.
 
 **Engine-Fingerabdruck.** `./build.sh fingerprint` lässt die Verify-Suite laufen (die wendet
-jeden Patch an) und hasht danach jede gepatchte Engine-Methode in `src/EngineFingerprint.g.cs`:
+jeden Patch an) und hasht danach jede gepatchte Engine-Methode in `Guard/EngineFingerprint.cs`:
 FNV-1a über Opcodes plus *aufgelöste* Operanden (Member-Namen statt Metadaten-Tokens,
 Sprungziele als Offsets, Literale als Text), damit ein Neubau derselben Quelle gleich hasht;
 dazu Spielversion und Modul-Ids der betroffenen Assemblies. Harmony patcht auf Native-Ebene und
@@ -2538,7 +2628,7 @@ war mit rund 9,7 ms seinerseits fast voll; welche Seite die Wand ist, sagt die S
 
 Was es sagt, ist die Auslastung des Treibers. Auf Linux veröffentlicht amdgpu sie in sysfs
 (`/sys/class/drm/cardN/device/gpu_busy_percent`), ein Integer, vom Treiber gepflegt. Neu in
-`shared/GpuBusy.cs`: zweimal die Sekunde gelesen (Mikrosekunden, kein GL-Aufruf, kein
+`Measure/GpuBusy.cs`: zweimal die Sekunde gelesen (Mikrosekunden, kein GL-Aufruf, kein
 Treiber-Sync), erste Karte mit der Datei (Connector-Einträge wie `card1-DP-1` werden
 übersprungen), nach drei unlesbaren Werten schaltet sich die Zeile ab statt zu lügen. HUD-Zeile
 `gpu-last 93 %`, Report `gpu 10,20 ms (153 proben, auslastung 93 % laut amdgpu)`. Die Marke
@@ -2588,7 +2678,7 @@ Zwei Dinge waren trotzdem falsch, beide auf Komets Seite:
    `patch-kollision INFO` im Warning-Log, dazu „Captured 2 issues during startup". Ein
    fremder Prefix ohne Abbruch neben einer reinen Zeitmessung ist keine Kollision im Sinn der
    Frage „überschreibt jemand Komets Funktion". Der Wächter erkennt jetzt, wenn alles, was
-   Komet auf der Methode hat, aus `shared/MeasurementPatches` stammt (`Finding.MeasurementOnly`),
+   Komet auf der Methode hat, aus `Measure/MeasurementPatches` stammt (`Finding.MeasurementOnly`),
    schreibt dann „neben komets messklammer (prefix+postfix): … komet misst hier nur, nichts zu
    entscheiden", und **Info-Befunde gehen ins Notification-Log**, nur Mittel und Hoch bleiben
    Warnungen. Die Swap-Transpiler-Klammer zählt als Messklammer, `SunRelightChunk` mit dem
@@ -2609,7 +2699,7 @@ Nach der Klammer um jeden Engine-Thread blieben im Report 46 MB/s „rest = unge
 das ist, sagt keine Klammer, denn eine Klammer braucht ein Ziel. Die Runtime selbst zählt
 aber mit: mit dem GC-Keyword auf Verbose feuert der CLR etwa alle 100 KB Allokation ein
 `GCAllocationTick`-Ereignis mit Größe, Typ des Objekts, das die Schwelle überschritten hat,
-und OS-Thread-Id. `src/AllocSampler.cs` ist ein prozessinterner `EventListener` darauf: kein
+und OS-Thread-Id. `Runtime/AllocSampler.cs` ist ein prozessinterner `EventListener` darauf: kein
 Patch, keine Klammer, keine Engine-Methode berührt. Bei 200 MB/s sind das zweitausend
 Ereignisse die Sekunde, je ein Dictionary-Zugriff auf dem Dispatch-Thread der Runtime.
 
@@ -2633,7 +2723,7 @@ als `eventpipe`.
 ### Paket 58 heißt ExchangeBlock, und wer es schickt, sagt jetzt der Server
 
 `hauptthread-tasks: readpacket58 0,01 ms (638.134x)`: 7.000 Pakete die Sekunde beim
-Streamen. Die Id stand nur in der Engine (`Packet_ServerIdEnum`); `src/TaskCodes.cs` liest
+Streamen. Die Id stand nur in der Engine (`Packet_ServerIdEnum`); `Guard/TaskCodes.cs` liest
 die Tabelle einmal per Reflection, und der Drain bucht ab jetzt `readpacket58=ExchangeBlock`
 und `readpacket6=LevelFinalize`, in Ruckler-Zeile und Report gleich.
 
@@ -2645,7 +2735,7 @@ Bulk-Accessoren sind es nicht (deren Commit geht über `SendBlockUpdateBulk` als
 Einzelpakete kommen aus `world.BlockAccessor.ExchangeBlock` direkt. Kandidaten im
 Survival-Code: `BlockShapeFromAttributes.OnServerGameTick("melt")` (Schnee, der von Dächern
 schmilzt), Farmland, Crops, Bienenstöcke, Kohlenmeiler. Statt zu raten:
-`src/Patches/PacketSourcePatches.cs`, ein Prefix auf `ServerMain.SendSetBlock` (dem einen
+`Patches/PacketSourcePatches.cs`, ein Prefix auf `ServerMain.SendSetBlock` (dem einen
 Trichter für Exchange- und Set-Einzelpakete), zählt beide Sorten und nimmt jeden 16. Aufruf
 als Kandidaten für einen Stack-Walk bis zum ersten Frame außerhalb der Accessor-Leitung,
 gedeckelt auf 25 Captures die Sekunde. Report: `block-pakete (server): exchange 638.134,
@@ -2660,7 +2750,7 @@ Die Ruckler-Liste hatte mehrmals `before 13,5 | upload 12,7` und `upload 9,7`, g
 Upload-Ziel von 6 ms. Ein Vertex-Budget kann eine Kostenart nicht sehen: `MeshDataPoolManager.AddModel`
 legt, wenn kein Pool Platz hat, per `MeshDataPool.AllocateNewPool` einen neuen an, und das
 ist `AllocateEmptyMesh` mit GL-Puffern von Dutzenden Megabyte, mitten im Upload-Drain. Neue
-optionale Messklammer in `shared/MeasurementPatches.cs` (Zeit je Anlage, Anzahl je Frame),
+optionale Messklammer in `Measure/MeasurementPatches.cs` (Zeit je Anlage, Anzahl je Frame),
 in der Ruckler-Zeile `upload 12,7 (davon 1 neue pools 9,8)` sobald es ein echter Anteil ist,
 im Report `mesh-pools angelegt: N seit reset, X ms gesamt, laengste Y ms`. Erst wenn der
 nächste Report sagt, wie oft und wie teuer, lohnt eine Antwort (Pools vorab anlegen, kleinere
@@ -2686,7 +2776,7 @@ die GPU-Seite zu optimieren, ist berechtigt, und dafür fehlte das Instrument: `
 sagt nicht, ob die Schattenkarte, die ferne Kaskade mit LOD3, der Opaque-Pass oder SheyderMods
 Post-Processing die Millisekunden hält. Blind an der Schattenauflösung zu drehen wäre Raten.
 
-Neu in `shared/GpuFrameTimer.cs`: am Anfang jeder Render-Stage schreibt der Mess-Prefix auf
+Neu in `Measure/GpuFrameTimer.cs`: am Anfang jeder Render-Stage schreibt der Mess-Prefix auf
 `TriggerRenderStage` eine `GL_TIMESTAMP`-Query (genau dort, wo die CPU-Stage-Uhr startet),
 der End-Renderer eine letzte am Frame-Ende. Die Differenzen sind die GPU-Spanne je Stage;
 eine Stage, die die Engine in diesem Frame nicht auslöst (gedrosselte ferne Kaskade, OIT

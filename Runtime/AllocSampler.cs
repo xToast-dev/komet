@@ -9,7 +9,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// Names every allocating thread in the process, and the types they allocate - without a
@@ -221,7 +221,7 @@ public sealed class AllocSampler : EventListener
         AppendRanked(sb, ci, ByThread.Values, 10, "MB/s");
         sb.Append(" | typen ");
         AppendRanked(sb, ci, ByType.Values, 8, "MB/s");
-        if (!Enabled) sb.Append(" (AUS)");
+        if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 

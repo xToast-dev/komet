@@ -497,12 +497,6 @@ public class KometConfig
     public bool HudBackgroundRaster { get; set; } = true;
 
     /// <summary>
-    /// Measure each render stage and the game tick so the HUD can show where a frame goes.
-    /// Two Stopwatch reads per stage, about 13 stages a frame.
-    /// </summary>
-    public bool MeasureRenderStages { get; set; } = true;
-
-    /// <summary>
     /// Keep the terrain tesselation thread awake while chunks are queued. Vanilla's thread
     /// loop sleeps 5 ms after every tick regardless of the backlog; with 1500 chunks waiting
     /// those naps are pure loading time. An empty queue still sleeps like vanilla.

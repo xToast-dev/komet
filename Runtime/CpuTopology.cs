@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace Komet;
+namespace Komet.Runtime;
 
 /// <summary>
 /// How many physical cores this machine has - asked, not guessed.

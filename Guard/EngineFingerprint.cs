@@ -3,7 +3,7 @@
 // One entry per engine method the patches touch: FNV-1a over opcodes and resolved
 // operands (PatchGuard.FingerprintOf). The mod compares these at world start.
 // </auto-generated>
-namespace Komet;
+namespace Komet.Guard;
 
 internal static class EngineFingerprint
 {

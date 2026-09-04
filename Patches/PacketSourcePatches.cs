@@ -149,7 +149,7 @@ public static class PacketSourcePatches
 
     public static void Write(StringBuilder sb, CultureInfo ci)
     {
-        sb.AppendFormat(ci, "block-pakete (server): exchange {0:N0}, set {1:N0} seit reset = {2:F0}/s",
+        sb.AppendFormat(ci, "block packets (server): exchange {0:N0}, set {1:N0} since reset = {2:F0}/s",
             StatExchange, StatSet, PerSecond);
         var ranking = Ranking(5);
         if (ranking.Count > 0)
@@ -161,7 +161,7 @@ public static class PacketSourcePatches
                 sb.AppendFormat(ci, "{0} {1:F0}%", ranking[i].source, ranking[i].share);
             }
         }
-        if (!Enabled) sb.Append(" (AUS)");
+        if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 

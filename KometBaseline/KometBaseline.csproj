@@ -22,7 +22,7 @@
   <ItemGroup>
     <!-- the measurement code is literally the same files the optimising mod uses, so the two
          mods cannot drift apart and their numbers stay comparable -->
-    <Compile Include="../shared/**/*.cs" LinkBase="shared" />
+    <Compile Include="../Measure/**/*.cs" LinkBase="Measure" />
     <Compile Remove="**/bin/**" />
     <Compile Remove="**/obj/**" />
   </ItemGroup>

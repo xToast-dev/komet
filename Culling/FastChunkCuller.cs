@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using HarmonyLib;
+using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
-namespace Komet;
+namespace Komet.Culling;
 
 /// <summary>
 /// Replacement for ChunkCuller.CullInvisibleChunks, the occlusion pass that decides which

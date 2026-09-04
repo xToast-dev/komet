@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 
-namespace Komet;
+namespace Komet.Culling;
 
 /// <summary>
 /// The chunk-grid ray walk behind occlusion culling, with the per-ray constants hoisted out
