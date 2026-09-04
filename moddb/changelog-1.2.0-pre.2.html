@@ -1,0 +1,49 @@
+<!-- Changelog for the ModDB file upload of Komet_v1.2.0-pre.2.zip. Paste into the file's
+     changelog field; works as plain text too if the field strips markup.
+     {{SHA256_KOMET}}, {{SHA256_BASELINE}} and {{COMMIT}} are filled in by ./build.sh release,
+     which writes the finished file to dist/ - the checksum cannot be committed here, because
+     committing it would change the commit and therefore the checksum. -->
+<p><strong>New</strong></p>
+<ul>
+<li><strong>Hitches outside the render stages now have a name.</strong> Every server packet that is not chunk data runs as a main-thread task, and a burst of them used to show up as an unnamed lump in the frame. The HUD and <code>.komet report</code> now name the packet type behind it (<code>readpacket33=EntityLoaded</code> rather than "somewhere outside"), and that drain runs under a per-frame budget, so a burst is spread over a few frames instead of stopping one dead.</li>
+<li><strong>World joins hitch less.</strong> The client used to build every entity the server sent in a single frame. Entities are now finished under a per-frame budget, nearest one first &mdash; a distant chicken appears a few frames later, which nobody can see, instead of the join stuttering.</li>
+<li><strong>Distant creatures animate less often.</strong> An entity whose shadow is the only thing on screen animates every third frame, one beyond 48 blocks every second frame, each time with the skipped time folded in &mdash; animation runs at the same speed, it is just sampled less. The own player and anything near you are untouched.</li>
+<li><strong>The HUD speaks German.</strong> The F7 overlay and the <code>.komet</code> chat replies follow the game language; English and German ship with the mod. Logs, reports and hitch lines stay English on purpose &mdash; they end up in bug reports and have to be readable by whoever helps you.</li>
+<li><strong>GPU time per render stage</strong>, next to the CPU time that was already there, plus the driver's own busy figure where the system exposes it. Together they answer "CPU-bound or GPU-bound?" without guessing.</li>
+<li><strong>The mod notices when another mod patches the same engine method</strong> and says so once, with a severity and a reason &mdash; including the case where Komet's own replacement quietly makes the other mod's patch do nothing. It also fingerprints the engine at world start, so a game update that changed a patched method is named instead of silently misbehaving. <code>.komet conflicts</code> lists it.</li>
+<li><strong>Server-side sync tuning</strong> for the integrated server (singleplayer): position updates thin out with distance, entity tracking gets a hysteresis band instead of flapping at the boundary, and attribute paths whose bytes did not change are not sent. Every rule is individually switchable.</li>
+<li><strong>More diagnostics:</strong> per-listener game tick profiling, allocation sampling by type, block packet sources, minimap upload budget and a direct upload path.</li>
+</ul>
+<p><strong>Fixed</strong></p>
+<ul>
+<li><strong>Crash on joining a world</strong> (<code>NullReferenceException</code> in <code>WeatherSystemClient</code>, reported against pre.2). The new task budget could spread the join backlog over several frames, which let an already-registered renderer draw before the packet that initialises it had run. The budget now starts only once the world is finalised: everything a join queues runs in the frame it arrives, exactly like vanilla.</li>
+<li><strong>Budgets could stop for good instead of falling back.</strong> The entity tesselation and entity loading budgets reopen their window on the frame boundary and nowhere else. If that signal was missing, every further shape was skipped &mdash; permanently, for every animated creature &mdash; and held entities never loaded. Both now detect the missing signal and run vanilla instead, and the HUD counts it when it happens.</li>
+<li>Measurement errors on engine methods that exist more than once, GPU timing and GPU load, GC and allocation statistics while the HUD is closed, and mesh pool allocations are now booked correctly.</li>
+<li>Large hitches in the 2D stage are attributed to the dialog that caused them.</li>
+<li>No more false hitch reports while the pause menu is open &mdash; the game is standing still, that is not a stutter.</li>
+<li>Shadow map quality no longer overshoots on weak GPUs, and the CPU thread budget behaves on machines with few cores.</li>
+<li>The misleading thread priority message on Linux is gone.</li>
+</ul>
+<p><strong>Changed</strong></p>
+<ul>
+<li><strong>Config layout is now version 11</strong> (20 new settings since 1.1.0). An existing <code>komet.json</code> is backed up next to itself and regenerated with defaults &mdash; re-apply your custom values afterwards.</li>
+<li>Minimum game version stays 1.22.0. Built and verified against 1.22.7; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually.</li>
+</ul>
+<p><strong>Internals</strong></p>
+<ul>
+<li>Release builds are reproducible: the same commit produces the same bytes, so the checksum below can be recomputed by anyone rather than merely trusted.</li>
+<li>Every build now runs on GitHub Actions &mdash; both mods built, the full patch and behaviour suite executed against the real game assemblies, and the packaged zips attached to the run.</li>
+</ul>
+<p><strong>Verify your download</strong></p>
+<p>SHA-256 of the files on this page:</p>
+<pre>{{SHA256_KOMET}}  Komet_v1.2.0-pre.2.zip
+{{SHA256_BASELINE}}  KometBaseline_v1.1.0.zip</pre>
+<p>Check it with <code>sha256sum Komet_v1.2.0-pre.2.zip</code> (Linux) or
+<code>Get-FileHash Komet_v1.2.0-pre.2.zip</code> (Windows PowerShell).</p>
+<p>The same numbers are published on GitHub, so this page is not the only place that
+asserts them: <a href="https://github.com/xToast-dev/komet/releases">github.com/xToast-dev/komet/releases</a>
+carries them in the release notes, produced by the build job rather than typed in by hand.
+And because the build is reproducible, you can check out that release's tag
+(<code>{{COMMIT}}</code>) and run <code>./build.sh release</code> to obtain files with exactly
+these checksums &mdash; a hash you can reproduce says something a hash you can only compare
+does not.</p>
