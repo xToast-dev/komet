@@ -75,16 +75,35 @@ jobs:
       - name: Build, verify and pack
         run: ./build.sh release
 
+      # Into the run summary, so the checksum of a build can be read (and pasted onto the
+      # ModDB page) without downloading the artifact first. Note what the number identifies:
+      # the dll carries a build stamp down to the minute, so this is the hash of THIS zip,
+      # not of "version x.y.z" - publish the hash of the file that is actually uploaded.
+      - name: Report checksums
+        run: |
+          {
+            echo '### sha256'
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat dist/*.sha256
+
       - name: Upload mod
         uses: actions/upload-artifact@v4
         with:
           name: komet
-          path: dist/Komet_v*.zip
+          path: |
+            dist/Komet_v*.zip
+            dist/Komet_v*.zip.sha256
           if-no-files-found: error
 
       - name: Upload baseline mod
         uses: actions/upload-artifact@v4
         with:
           name: komet-baseline
-          path: dist/KometBaseline_v*.zip
+          path: |
+            dist/KometBaseline_v*.zip
+            dist/KometBaseline_v*.zip.sha256
           if-no-files-found: error

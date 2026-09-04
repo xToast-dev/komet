@@ -7,7 +7,8 @@
 #   ./build.sh config     regenerate dist/komet.json from the real config class
 #   ./build.sh fingerprint  regenerate Guard/EngineFingerprint.cs (IL hashes of every engine
 #                           method the patches touch, against VS_INSTALL) - after a game update
-#   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB
+#   ./build.sh release    full checks, then pack dist/Komet_v<version>.zip for ModDB,
+#                           each zip with a .sha256 next to it to publish alongside it
 # Environment: VS_INSTALL points at the game (default /opt/vintagestory), KOMET_SKIP_BENCH=1
 # leaves out the throughput benchmark (CI: it gates nothing and dominates the runtime).
 set -euo pipefail
@@ -114,10 +115,22 @@ EOF
     (cd "$STAGE" && bsdtar -a -cf "../$B_ZIP" modinfo.json modicon.png KometBaseline.dll)
     rm -rf "$STAGE"
 
+    # One checksum per published file, written next to it and printed here. It is meant to
+    # go on the ModDB page so a downloader can prove that the zip they got is the zip that
+    # was uploaded - the only thing a hash can honestly promise.
+    #
+    # It identifies THIS artefact, not "version 1.2.0": the dll carries a build stamp down to
+    # the minute and the zip carries file times, so a second run of this target produces a
+    # different hash for the same source. Publish the hash of the file you actually upload.
+    (cd dist && sha256sum "$ZIP" > "$ZIP.sha256" && sha256sum "$B_ZIP" > "$B_ZIP.sha256")
+
     echo
     echo "== release candidate: dist/$ZIP + dist/$B_ZIP (v$VERSION b$KOMET_BUILD) =="
     bsdtar -tvf "dist/$ZIP"
     bsdtar -tvf "dist/$B_ZIP"
+    echo
+    echo "== sha256 (for the ModDB page) =="
+    cat "dist/$ZIP.sha256" "dist/$B_ZIP.sha256"
     ;;
   deploy)
     # Die Mod hiess bis 1.51.8 VsPerf - eine liegengebliebene alte DLL wuerde doppelt laden.
