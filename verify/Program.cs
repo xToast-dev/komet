@@ -21,11 +21,39 @@ using Vintagestory.API.MathTools;
 internal static class Program
 {
     private static int failures;
+    private static int skipped;
+
+    /// <summary>Stands in for the Optimum fork's marker type: a constant named Version is all the detector reads.</summary>
+    private static class FakeOptimumInfo { public const string Version = "9.9.9"; }
+
+    /// <summary>An ILogger that swallows everything, for engine code that insists on one.</summary>
+    public class NoopLogger : System.Reflection.DispatchProxy
+    {
+        protected override object Invoke(MethodInfo targetMethod, object[] args) => null;
+    }
 
     private static void Check(string what, Action a)
     {
         try { a(); Console.WriteLine($"  ok    {what}"); }
         catch (Exception e) { failures++; Console.WriteLine($"  FAIL  {what}\n        {e.GetType().Name}: {e.Message}"); if (Environment.GetEnvironmentVariable("KOMET_TRACE") != null) Console.WriteLine(e.StackTrace); }
+    }
+
+    /// <summary>
+    /// A check that could not run here, with the reason - printed as a result and counted, not
+    /// silently left out. A suite that quietly shrinks on one machine is worth less than one
+    /// that says which part of itself did not run.
+    ///
+    /// The one legitimate reason so far: the game's ASSET tree. CI compiles against the engine
+    /// assemblies, which live in the repository because they are what every patch binds to -
+    /// but the content tree is hundreds of megabytes of game data, so a check that reads a real
+    /// shape file runs on a machine with the game installed and is skipped on the runner.
+    /// Never use this to step around a check that fails: a missing file is a reason, a red
+    /// check is a result.
+    /// </summary>
+    private static void Skip(string what, string why)
+    {
+        skipped++;
+        Console.WriteLine($"  skip  {what}\n        {why}");
     }
 
     /// <summary>Forces the JIT to compile the patched body; invalid IL surfaces here.</summary>
@@ -88,6 +116,23 @@ internal static class Program
         Check("AnimationManager.OnClientFrame transpiler", () => { harmony.Patch(onClientFrame, transpiler: replaceAny); ForceJit(onClientFrame); });
 
         Check("GlErrorPatches (opt-in)", () => GlErrorPatches.Apply(harmony));
+
+        // Applied here so the fingerprint covers it too: the mod loader's phase call is a
+        // private engine method, and a rename in a game update must be caught at build time
+        // rather than by a "could not enable" line in somebody's log.
+        Check("mod load phase timing (ModLoader.TryRunModPhase)", () =>
+        {
+            // Harmony binds patch parameters BY NAME, so the loader's own spelling is part of
+            // this patch's contract - and a rename would otherwise only show up as a "could
+            // not enable" line in a player's log after a game update.
+            var phaseCall = AccessTools.Method(typeof(Vintagestory.Common.ModLoader), "TryRunModPhase",
+                [typeof(Mod), typeof(ModSystem), typeof(ICoreAPI), typeof(Vintagestory.Common.ModRunPhase)]);
+            if (phaseCall == null) throw new Exception("ModLoader.TryRunModPhase(Mod, ModSystem, ICoreAPI, ModRunPhase) is gone");
+            var names = "";
+            foreach (var par in phaseCall.GetParameters()) names += (names.Length > 0 ? "," : "") + par.Name;
+            if (names != "mod,system,api,phase") throw new Exception("the loader's parameter names changed: " + names);
+            ModPhasePatches.Apply(harmony);
+        });
 
         // Every batched-cull check below has to go through the real worker threads, not the
         // inline fallback - otherwise the parallel path ships unexercised.
@@ -228,6 +273,100 @@ internal static class Program
                 out double dMinX, out _, out _, out double dMaxX, out _, out _);
             if (dMaxX - dMinX > 2 * half + 1e-6)
                 throw new Exception("diagonal light still produces an oversized box");
+        });
+
+        Check("the coverage margin buys exactly the camera movement the throttle then spends", () =>
+        {
+            // The margin's whole promise: a far map drawn for camera C0 with half-size
+            // half + m still covers everything the shader samples while the camera is anywhere
+            // within MoveLimit of C0. If that is off by a metre, the shadow gets a hard cut-off
+            // line that jumps on the next redraw - the exact artefact the 0,15 block movement
+            // rule was protecting against before the margin existed.
+            double[] lightView = new double[16];
+            Vintagestory.API.MathTools.Mat4d.LookAt(lightView,
+                new double[] { 0.38, 0.85, 0.36 }, new double[4], new double[] { 0, 1, 0 });
+
+            const double camX = 1234.5, camY = 143.2, camZ = -987.3, range = 255.0, margin = 16.0;
+            double half = range * ShadowPatches.BoxRadiusFactor;
+            double faded = range * ShadowPatches.FadeCompleteFraction;
+
+            // the box as MakeBoxSymmetric builds it with the margin on
+            ShadowPatches.SymmetricLightSpaceBounds(lightView, camX, camY, camZ, half + margin,
+                out double minX, out double minY, out double minZ,
+                out double maxX, out double maxY, out double maxZ);
+
+            double limit = ShadowThrottlePatches.MoveLimitFor(0.15, margin);
+            if (Math.Abs(limit - margin * ShadowThrottlePatches.MarginSafety) > 1e-9)
+                throw new Exception($"movement limit {limit} is not the margin's safe share");
+            if (ShadowThrottlePatches.MoveLimitFor(0.15, 0) != 0.15)
+                throw new Exception("without a margin the bare threshold must survive");
+            if (ShadowThrottlePatches.MoveLimitFor(30.0, 16.0) != 30.0)
+                throw new Exception("a configured threshold larger than the margin must win");
+
+            var rnd = new Random(23);
+            const double eps = 1e-9;
+            for (int i = 0; i < 4000; i++)
+            {
+                // the camera anywhere on or inside the ball of radius `limit` around C0 ...
+                double ca = rnd.NextDouble() * Math.PI * 2, cb = Math.Acos(2 * rnd.NextDouble() - 1);
+                double cd = (i & 1) == 0 ? limit : limit * Math.Cbrt(rnd.NextDouble());
+                double c1x = camX + cd * Math.Sin(cb) * Math.Cos(ca);
+                double c1y = camY + cd * Math.Cos(cb);
+                double c1z = camZ + cd * Math.Sin(cb) * Math.Sin(ca);
+
+                // ... and a point on the fade sphere around THAT camera: the farthest thing the
+                // shader will still ask the retained map about
+                double a = rnd.NextDouble() * Math.PI * 2, b = Math.Acos(2 * rnd.NextDouble() - 1);
+                double px = c1x + faded * Math.Sin(b) * Math.Cos(a);
+                double py = c1y + faded * Math.Cos(b);
+                double pz = c1z + faded * Math.Sin(b) * Math.Sin(a);
+
+                double lx = lightView[0] * px + lightView[4] * py + lightView[8] * pz + lightView[12];
+                double ly = lightView[1] * px + lightView[5] * py + lightView[9] * pz + lightView[13];
+                double lz = lightView[2] * px + lightView[6] * py + lightView[10] * pz + lightView[14];
+
+                double u = (lx - minX) / (maxX - minX), v = (ly - minY) / (maxY - minY);
+                if (u < 0.03 - eps || u > 0.97 + eps || v < 0.03 - eps || v > 0.97 + eps)
+                    throw new Exception($"after {cd:0.00} blocks of movement, a point at the fade edge "
+                                      + $"lands at uv ({u:0.000}, {v:0.000}) - outside the band the shader reads");
+                if (lz < minZ - eps || lz > maxZ + eps)
+                    throw new Exception("the retained box no longer contains the fade sphere in depth");
+            }
+
+            // And the margin must not be free: without it, the same movement DOES leave the band.
+            ShadowPatches.SymmetricLightSpaceBounds(lightView, camX, camY, camZ, half,
+                out double nX, out double nY, out double _, out double xX, out double xY, out double _2);
+            bool escaped = false;
+            for (int i = 0; i < 2000 && !escaped; i++)
+            {
+                double ca = rnd.NextDouble() * Math.PI * 2, cb = Math.Acos(2 * rnd.NextDouble() - 1);
+                double c1x = camX + limit * Math.Sin(cb) * Math.Cos(ca);
+                double c1y = camY + limit * Math.Cos(cb);
+                double c1z = camZ + limit * Math.Sin(cb) * Math.Sin(ca);
+                double a = rnd.NextDouble() * Math.PI * 2, b = Math.Acos(2 * rnd.NextDouble() - 1);
+                double px = c1x + faded * Math.Sin(b) * Math.Cos(a);
+                double py = c1y + faded * Math.Cos(b);
+                double pz = c1z + faded * Math.Sin(b) * Math.Sin(a);
+                double lx = lightView[0] * px + lightView[4] * py + lightView[8] * pz + lightView[12];
+                double ly = lightView[1] * px + lightView[5] * py + lightView[9] * pz + lightView[13];
+                double u = (lx - nX) / (xX - nX), v = (ly - nY) / (xY - nY);
+                escaped = u < 0.03 || u > 0.97 || v < 0.03 || v > 0.97;
+            }
+            if (!escaped)
+                throw new Exception("the un-margined box covers the moved camera too - the margin buys nothing");
+
+            // The effective margin follows the box shape, not the setting: safemode puts
+            // vanilla's cone back, and a movement limit derived from a box nobody drew is the
+            // cut-off line again.
+            ShadowPatches.FarBoxMargin = margin;
+            ShadowPatches.SymmetricBox = true;
+            if (ShadowPatches.EffectiveFarBoxMargin != margin) throw new Exception("margin not effective with the sphere box");
+            if (ShadowThrottlePatches.CoverageMargin != margin) throw new Exception("the throttle does not see the margin");
+            ShadowPatches.ToVanilla();
+            if (ShadowPatches.EffectiveFarBoxMargin != 0) throw new Exception("margin survived safemode");
+            if (ShadowThrottlePatches.MoveLimit != ShadowThrottlePatches.MoveThreshold)
+                throw new Exception("the movement limit outlived the box it was derived from");
+            ShadowPatches.FarBoxMargin = 0;
         });
 
         Check("sphere box touches ONLY the far cascade's box", () =>
@@ -716,6 +855,66 @@ internal static class Program
             var q3 = new Queue<ClientTask>();
             q3.Enqueue(new ClientTask { Code = null, Action = () => { } });
             MainThreadTaskPatches.RunTasks(q3, () => false, () => { }, null);
+
+            // The queue lock is taken in whichever form the engine declares it: vanilla's
+            // object through Monitor, the Optimum fork's System.Threading.Lock through its own
+            // Enter. Monitor on a Lock instance is a DIFFERENT lock than the one the fork's
+            // enqueue holds, so the typed path must never fall through to Monitor.
+            // (1.2.0-pre.3 bound the field by type and crashed on the fork before it could race.)
+            if (MainThreadTaskPatches.LockField == null) throw new Exception("MainThreadTasksLock not resolved");
+            var plain = new object();
+            var viaMonitor = new MainThreadTaskPatches.QueueLock(plain);
+            if (viaMonitor.IsTyped) throw new Exception("a plain object was taken for a Lock");
+            viaMonitor.Enter();
+            if (!System.Threading.Monitor.IsEntered(plain)) throw new Exception("object lock not held through Monitor");
+            viaMonitor.Exit();
+            if (System.Threading.Monitor.IsEntered(plain)) throw new Exception("object lock not released");
+            // created through Activator, as the field read hands it over: an object, not a Lock
+            object typedInstance = Activator.CreateInstance(typeof(System.Threading.Lock));
+            var viaLock = new MainThreadTaskPatches.QueueLock(typedInstance);
+            if (!viaLock.IsTyped) throw new Exception("a System.Threading.Lock was not recognised as one");
+            viaLock.Enter();
+            if (!((System.Threading.Lock)typedInstance).IsHeldByCurrentThread) throw new Exception("Lock not held through its own Enter");
+            if (System.Threading.Monitor.IsEntered(typedInstance)) throw new Exception("Lock was taken through Monitor - not the lock the engine's EnterScope holds");
+            viaLock.Exit();
+            if (((System.Threading.Lock)typedInstance).IsHeldByCurrentThread) throw new Exception("Lock not released");
+
+            // The whole drain against a real ClientMain: handover and requeue go through the
+            // engine's own lock field, whatever this build declares it as.
+            var game = (Vintagestory.Client.NoObf.ClientMain)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.Client.NoObf.ClientMain));
+            game.MainThreadTasks = new Queue<ClientTask>();
+            game.GameLaunchTasks = new Queue<ClientTask>();
+            AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.ClientMain, Queue<ClientTask>>("reversedQueue")(game) = new Queue<ClientTask>();
+            AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.ClientMain, Queue<ClientTask>>("holdingQueue")(game) = new Queue<ClientTask>();
+            MainThreadTaskPatches.LockField.SetValue(game, Activator.CreateInstance(MainThreadTaskPatches.LockField.FieldType));
+            Vintagestory.Client.ScreenManager.FrameProfiler ??= new FrameProfilerUtil(_ => { });
+            var suspendRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.ClientMain, bool>("SuspendMainThreadTasks");
+            MainThreadTaskPatches.Detach();
+            order.Clear();
+            game.MainThreadTasks.Enqueue(new ClientTask { Code = "p", Action = () => order.Add("p") });
+            game.MainThreadTasks.Enqueue(new ClientTask { Code = "q", Action = () => order.Add("q") });
+            if (MainThreadTaskPatches.Prefix(game)) throw new Exception("the prefix must replace the original while enabled");
+            if (string.Join(",", order) != "p,q" || game.MainThreadTasks.Count != 0)
+                throw new Exception($"drain through the real ClientMain ran '{string.Join(",", order)}', {game.MainThreadTasks.Count} left");
+            // suspend mid-drain: the remainder goes back to the FRONT of the shared queue,
+            // ahead of what the network thread queued meanwhile
+            order.Clear();
+            game.MainThreadTasks.Enqueue(new ClientTask { Code = "r", Action = () =>
+            {
+                order.Add("r");
+                suspendRef(game) = true;
+                game.MainThreadTasks.Enqueue(new ClientTask { Code = "late", Action = () => order.Add("late") });
+            } });
+            game.MainThreadTasks.Enqueue(new ClientTask { Code = "s", Action = () => order.Add("s") });
+            MainThreadTaskPatches.Prefix(game);
+            var back = game.MainThreadTasks.ToArray();
+            if (string.Join(",", order) != "r" || back.Length != 2 || back[0].Code != "s" || back[1].Code != "late")
+                throw new Exception($"suspend mid-drain ran '{string.Join(",", order)}', shared queue now [{string.Join(",", Array.ConvertAll(back, t => t.Code))}], expected [s,late]");
+            // a suspended game drains nothing and touches nothing
+            MainThreadTaskPatches.Prefix(game);
+            if (game.MainThreadTasks.Count != 2) throw new Exception("a suspended drain must leave the queue alone");
+            suspendRef(game) = false;
+            MainThreadTaskPatches.Detach();
             MainThreadTaskPatches.Reset();
         });
 
@@ -823,6 +1022,91 @@ internal static class Program
                 throw new Exception("unwrap did not restore the original delegates");
             if (TickProfiler.StatWrapped != 0) throw new Exception("StatWrapped after unwrap");
             TickProfiler.Reset();
+        });
+
+        // The mod profiler rides on the two wrappers above; what is its own is the map from a
+        // type to the mod that shipped it, the folding cadence, and the two texts it composes.
+        Check("mod attribution maps types to mods, folds on cadence, and composes both texts", () =>
+        {
+            ModProfiler.Clear();
+
+            var code = FakeMod("probe", "Probe Mod", new List<ModSystem> { new ProbeModSystem() });
+            var content = FakeMod("contentonly", "Content Only", new List<ModSystem>());
+            ModProfiler.BuildIndex(new List<Mod> { code, content });
+
+            if (ModProfiler.ModCount != 2 || ModProfiler.CodeModCount != 1)
+                throw new Exception($"{ModProfiler.ModCount} mods, {ModProfiler.CodeModCount} with code");
+
+            // The whole idea in two lines: a type from the mod's assembly resolves to the mod,
+            // a type from the game's does not - and the second one must not be blamed on anybody.
+            var probe = ModProfiler.Of(typeof(ProbeModSystem));
+            if (probe.ModId != "probe") throw new Exception("a type of the mod's assembly resolved to " + probe.ModId);
+            if (!ReferenceEquals(ModProfiler.Of(typeof(Vintagestory.Client.NoObf.ClientMain)), ModProfiler.Engine))
+                throw new Exception("an engine type was attributed to a mod");
+            if (ModProfiler.Find("contentonly") == null) throw new Exception("the content mod is not in the index");
+
+            // Render ticks fold only when the renderer profiler measured the frame; tick ticks
+            // fold every frame. Both are exponential, so one fold is a fraction of the input -
+            // what matters is that it moved, and that the raw ticks were cleared.
+            long oneMs = System.Diagnostics.Stopwatch.Frequency / 1000;
+            probe.RenderTicks = 4 * oneMs;
+            probe.TickTicks = 2 * oneMs;
+            ModProfiler.FoldRender();
+            if (probe.RenderTicks != 0) throw new Exception("fold did not clear the render ticks");
+            if (probe.RenderMs <= 0 || probe.RenderMs > 4) throw new Exception($"render fold gave {probe.RenderMs}");
+            if (probe.TickMs != 0) throw new Exception("the render fold touched the tick bucket");
+            ModProfiler.FoldTick();
+            if (probe.TickTicks != 0 || probe.TickMs <= 0) throw new Exception("tick fold");
+            if (ModProfiler.TotalMs < probe.Ms) throw new Exception("the total does not contain the mod");
+
+            var ranked = ModProfiler.Top(5);
+            if (ranked.Count != 1 || ranked[0].ModId != "probe")
+                throw new Exception($"ranking has {ranked.Count} entries, first {(ranked.Count > 0 ? ranked[0].ModId : "-")}");
+
+            // Load phases arrive before the index exists in the game; here they arrive after,
+            // and both paths end in the same entry. The slowest phase is what the table names.
+            ModProfiler.NoteLoad("probe", "assets", 1200, serverSide: false);
+            ModProfiler.NoteLoad("probe", "startside", 300, serverSide: true);
+            if (Math.Abs(probe.LoadMs - 1200) > 0.001 || Math.Abs(probe.LoadServerMs - 300) > 0.001)
+                throw new Exception($"load {probe.LoadMs} client / {probe.LoadServerMs} server");
+            if (probe.SlowestPhase != "assets") throw new Exception("slowest phase " + probe.SlowestPhase);
+            if (ModProfiler.TopLoad(5).Count != 1) throw new Exception("load ranking");
+
+            // The HUD text, without a GL context - the same contract the performance HUD has.
+            probe.PatchedMethods = 12;
+            probe.PatchedForeign = 11;
+            probe.Transpilers = 2;
+            probe.Blocks = 30;
+            string full = ModHud.ComposeMods("mods", compact: false, frameMs: 10.0, allRenderers: false);
+            foreach (string needle in new[] { "probe", "12" })
+                if (!full.Contains(needle)) throw new Exception($"the full text lost '{needle}'");
+            foreach (string line in full.Split('\n'))
+                if (line.Trim().Length == 0) throw new Exception("blank line in the mod HUD text");
+            // The caveat that decides how every number above it reads must be in BOTH views.
+            string compact = ModHud.ComposeMods("mods", compact: true, frameMs: 10.0, allRenderers: false);
+            if (!compact.Contains("before stage")) throw new Exception("the compact view drops the renderer caveat");
+            if (compact.Contains("not attributed")) throw new Exception("the compact view carries the full sections");
+            if (compact.Split('\n').Length >= full.Split('\n').Length)
+                throw new Exception("the compact view is not smaller");
+            // ... and it is gone once there is nothing to warn about: with every stage wrapped
+            // the numbers mean what they say, and a permanent caveat would train the eye to
+            // skip the line that matters.
+            if (ModHud.ComposeMods("mods", false, 10.0, true).Contains("before stage"))
+                throw new Exception("the caveat survived with every stage wrapped");
+
+            // The report is English whatever the client speaks, and it never prints the table
+            // without what the table cannot see.
+            var sb = new System.Text.StringBuilder();
+            ModProfiler.Write(sb, System.Globalization.CultureInfo.InvariantCulture, 10.0, false);
+            string report = sb.ToString();
+            foreach (string needle in new[] { "mods:", "per frame:", "not attributed", "at load", "probe" })
+                if (!report.Contains(needle)) throw new Exception($"the report lost '{needle}'");
+
+            ModProfiler.Reset();
+            if (probe.RenderMs != 0 || probe.TickMs != 0) throw new Exception("reset left per-frame figures");
+            if (Math.Abs(probe.LoadMs - 1200) > 0.001) throw new Exception("reset threw away the load times");
+            ModProfiler.Clear();
+            if (ModProfiler.Indexed || ModProfiler.ModCount != 0) throw new Exception("clear left the index behind");
         });
 
         Check("server entity sync: distance send rate, tracking hysteresis, attribute no-op filter", () =>
@@ -2953,6 +3237,18 @@ internal static class Program
             Console.WriteLine("\n--- HUD preview (voll) ---");
             Console.WriteLine(DebugHud.Compose(previewTitle,
                 3412, 1536, 512L * 1048576, 214, 0.11f, 41024, null));
+
+            // The second overlay, from a hand-made index - the box has to be readable when it
+            // is full, and no build machine has forty mods installed.
+            BuildPreviewModIndex();
+            // A stated frame time rather than this runner's: the preview's numbers are made up,
+            // and a share of a 1 ms sleep loop would print percentages nobody can sanity-check.
+            const double previewFrame = 10.6;
+            Console.WriteLine("\n--- mod HUD preview (kompakt) ---");
+            Console.WriteLine(ModHud.ComposeMods("komet · mods", true, previewFrame, false));
+            Console.WriteLine("\n--- mod HUD preview (voll) ---");
+            Console.WriteLine(ModHud.ComposeMods("komet · mods", false, previewFrame, true));
+            ModProfiler.Clear();
             Console.WriteLine("--- end ---\n");
         }
 
@@ -3538,6 +3834,269 @@ internal static class Program
             if (ShadowResPatches.EffectiveMapSize != ShadowResPatches.ShadowMapSize)
                 throw new Exception($"effective size {ShadowResPatches.EffectiveMapSize} ignores the "
                                     + $"real framebuffer {ShadowResPatches.ShadowMapSize}");
+        });
+
+        Check("near shadow map: size rule, and the postfix sits on the framebuffer setup", () =>
+        {
+            // The rule is pure: 0 keeps the engine's size, anything else is clamped to the
+            // floor and ceiling and rounded to a multiple of 64.
+            if (ShadowResPatches.NearSizeFor(7168, 0) != 7168) throw new Exception("0 must keep the engine's size");
+            if (ShadowResPatches.NearSizeFor(7168, -1) != 7168) throw new Exception("negative must keep the engine's size");
+            if (ShadowResPatches.NearSizeFor(7168, 4096) != 4096) throw new Exception("4096 must be 4096");
+            if (ShadowResPatches.NearSizeFor(7168, 100) != ShadowResPatches.NearMapMin) throw new Exception("below the floor must land on the floor");
+            if (ShadowResPatches.NearSizeFor(7168, 1 << 20) != ShadowResPatches.NearMapMax) throw new Exception("above the ceiling must land on the ceiling");
+            if (ShadowResPatches.NearSizeFor(7168, 4000) != 4032) throw new Exception($"4000 must round to 4032, got {ShadowResPatches.NearSizeFor(7168, 4000)}");
+            if (ShadowResPatches.NearSizeFor(6144, 9000) != 9024) throw new Exception("a near map larger than the far one is the player's call, not refused");
+
+            // Apply (in the resolution check above) put the postfix on SetupDefaultFrameBuffers;
+            // it must be there whatever the extra steps say, because the live command needs it.
+            MethodInfo setup = AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientPlatformWindows), "SetupDefaultFrameBuffers");
+            var info = Harmony.GetPatchInfo(setup);
+            bool present = false;
+            foreach (var pf in info.Postfixes)
+                if (pf.PatchMethod.Name == nameof(ShadowResPatches.ResizeNearMap)) present = true;
+            if (!present) throw new Exception("ResizeNearMap is not a postfix of SetupDefaultFrameBuffers");
+            ForceJit(setup);
+
+            // The GL-free paths of the postfix: no list, a list without the near slot, and a
+            // near slot the engine left without a texture (shadows off or quality 1) all mark
+            // the setup as seen and touch nothing.
+            ShadowResPatches.NearMapSize = 4096;
+            ShadowResPatches.ResizeNearMap(null);
+            if (!ShadowResPatches.NearSetupRan) throw new Exception("a null list must still count as 'setup ran'");
+            if (ShadowResPatches.NearMapSizeApplied != 0) throw new Exception("nothing can have been applied without a framebuffer");
+            var list = new List<Vintagestory.API.Client.FrameBufferRef>();
+            for (int i = 0; i < 13; i++) list.Add(null);
+            ShadowResPatches.ResizeNearMap(list);
+            list[12] = new Vintagestory.API.Client.FrameBufferRef { Width = 7168, Height = 7168, DepthTextureId = 0 };
+            ShadowResPatches.ResizeNearMap(list);
+            if (list[12].Width != 7168) throw new Exception("a near slot without a depth texture must be left alone");
+            if (ShadowResPatches.EffectiveNearMapSize != ShadowResPatches.EffectiveMapSize)
+                throw new Exception("until a resize has really happened the near map is the far map's size");
+            ShadowResPatches.NearMapSize = 0;
+
+            // Which cascade the texel snapping quantises for comes from the scale prefix,
+            // the one place that knows: the near map's grid is not the far map's any more.
+            double d = 39;
+            ShadowPatches.ScaleDistance(ref d, EnumFrameBuffer.ShadowmapNear);
+            if (ShadowPatches.PreparingFarCascade) throw new Exception("the near cascade was being prepared");
+            d = 255;
+            ShadowPatches.ScaleDistance(ref d, EnumFrameBuffer.ShadowmapFar);
+            if (!ShadowPatches.PreparingFarCascade) throw new Exception("the far cascade was being prepared");
+        });
+
+        Check("shadow pass solid half: the two disables and the first two texture binds are redirected", () =>
+        {
+            ShadowCullPatches.Apply(harmony, enabled: true, depthOnly: true);
+            MethodInfo render = AccessTools.Method(typeof(Vintagestory.Client.NoObf.ChunkRenderer), "RenderShadow", new[] { typeof(float) });
+            ForceJit(render);
+
+            var il = PatchProcessor.GetCurrentInstructions(render);
+            int begins = 0, ends = 0, disables = 0, solidTex = 0, engineTex = 0;
+            int beginAt = -1, endAt = -1, lastSolidTexAt = -1, firstEngineTexAt = int.MaxValue;
+            for (int i = 0; i < il.Count; i++)
+            {
+                if (il[i].operand is not MethodInfo m) continue;
+                if (m.Name == nameof(ShadowCullPatches.BeginSolidPasses)) { begins++; beginAt = i; }
+                else if (m.Name == nameof(ShadowCullPatches.EndSolidPasses)) { ends++; endAt = i; }
+                else if (m.Name == "GlDisableCullFace") disables++;
+                else if (m.Name == nameof(ShadowCullPatches.SetSolidTexture)) { solidTex++; lastSolidTexAt = i; }
+                else if (m.Name == "set_Tex2d2D") { engineTex++; firstEngineTexAt = Math.Min(firstEngineTexAt, i); }
+            }
+            if (begins != 1 || ends != 1) throw new Exception($"{begins} Begin / {ends} End calls, expected one each");
+            if (disables != 0) throw new Exception($"{disables} GlDisableCullFace calls left, expected none (both are redirected)");
+            if (solidTex != 2 || engineTex != 2) throw new Exception($"{solidTex} solid / {engineTex} engine texture binds, expected two each");
+            // the solid half is the first half: Begin, its two binds, End, then the engine's binds
+            if (!(beginAt < lastSolidTexAt && lastSolidTexAt < endAt && endAt < firstEngineTexAt))
+                throw new Exception("order must be Begin, solid binds, End, foliage binds");
+
+            // Any other method shape is refused - a body with a single disable is not
+            // RenderShadow, and culling the wrong pass would be shadows silently gone.
+            var one = new List<CodeInstruction>
+            {
+                new(OpCodes.Ldarg_0),
+                new(OpCodes.Callvirt, AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientPlatformAbstract), "GlDisableCullFace")),
+                new(OpCodes.Ret),
+            };
+            try
+            {
+                new List<CodeInstruction>(ShadowCullPatches.CullSolidPasses(one));
+                throw new Exception("a method with one disable must be refused");
+            }
+            catch (InvalidOperationException) { /* refused, as it must be */ }
+
+            // the depth-only fragment source is a complete, empty program body with a version
+            // line for the engine's prefix defines to land after
+            if (!ShadowCullPatches.DepthOnlyFragmentSource.StartsWith("#version") || !ShadowCullPatches.DepthOnlyFragmentSource.Contains("void main"))
+                throw new Exception("the depth-only fragment source is not a shader");
+            // without a client there is no program - and no crash: the hook must simply not
+            // switch (nothing to Stop, nothing to Use)
+            ShadowCullPatches.Game = null;
+            if (ShadowCullPatches.DepthOnlyLive) throw new Exception("no program can be live before the first shadow pass");
+            ShadowCullPatches.Enabled = false;
+            ShadowCullPatches.DepthOnly = false;
+        });
+
+        // The engine's own chicken: the shape that measured 11,9 ms of main-thread frame
+        // generation on first sight. It is read from the installed game rather than from a
+        // fixture on purpose - a hand-made shape would prove the warm-up against a shape only
+        // this test believes in. The price is that it needs the asset tree, which the CI runner
+        // does not have (it carries the assemblies, not the content), so there it is skipped
+        // with its reason rather than failing.
+        const string warmupCheck = "animation warm-up generates every frame of a real shape off the main thread, once";
+        string vsInstall = Environment.GetEnvironmentVariable("VS_INSTALL") ?? "/opt/vintagestory";
+        string roosterPath = System.IO.Path.Combine(vsInstall, "assets", "survival", "shapes",
+            "entity", "animal", "bird", "chicken", "chicken-rooster.json");
+        if (!System.IO.File.Exists(roosterPath))
+            Skip(warmupCheck, "no game assets at " + vsInstall + " - needs an installed game, "
+                            + "the runner has only the engine assemblies");
+        else
+        Check(warmupCheck, () =>
+        {
+            string shapePath = roosterPath;
+            var shape = Newtonsoft.Json.JsonConvert.DeserializeObject<Vintagestory.API.Common.Shape>(System.IO.File.ReadAllText(shapePath));
+            if (shape?.Animations == null || shape.Animations.Length < 5) throw new Exception("the chicken has no animations?");
+
+            var logger = System.Reflection.DispatchProxy.Create<Vintagestory.API.Common.ILogger, NoopLogger>();
+            int first = AnimationWarmup.Warm(shape, "chicken-rooster", null, new[] { "head" }, logger);
+            if (first != shape.Animations.Length) throw new Exception($"generated {first} of {shape.Animations.Length} animations");
+            foreach (var a in shape.Animations)
+                if (a.PrevNextKeyFrameByFrame == null || a.PrevNextKeyFrameByFrame.Length != a.QuantityFrames)
+                    throw new Exception($"animation {a.Code} has no frames after the warm-up");
+            if (shape.JointsById == null || shape.JointsById.Count == 0) throw new Exception("joints not resolved");
+            int second = AnimationWarmup.Warm(shape, "chicken-rooster", null, new[] { "head" }, logger);
+            if (second != 0) throw new Exception($"a second pass generated {second} animations again");
+
+            // the rules around it, without a worker: a shape already in use is never started,
+            // the requirement arguments mirror the engine's (head, plus the attribute)
+            AnimationWarmup.Reset();
+            AnimationWarmup.Enabled = true;
+            // the client properties' constructor wants behaviour configs; the warm-up reads
+            // only the shape fields, so the object is made without running it
+            var client = (Vintagestory.API.Common.Entities.EntityClientProperties)RuntimeHelpers.GetUninitializedObject(
+                typeof(Vintagestory.API.Common.Entities.EntityClientProperties));
+            client.LoadedShape = shape;
+            var props = new Vintagestory.API.Common.Entities.EntityProperties
+            {
+                Code = new AssetLocation("game:chicken-rooster"),
+                Client = client,
+            };
+            if (AnimationWarmup.ShapeFor(props, 7) != shape) throw new Exception("a type without alternates must map to its one shape");
+            if (AnimationWarmup.Start(props, 7, logger, _ => false)) throw new Exception("a shape with generated frames counts as in use and must not be started");
+            if (!AnimationWarmup.IsDone(shape)) throw new Exception("an in-use shape is recorded as done");
+            var fresh = Newtonsoft.Json.JsonConvert.DeserializeObject<Vintagestory.API.Common.Shape>(System.IO.File.ReadAllText(shapePath));
+            props.Client.LoadedShape = fresh;
+            if (AnimationWarmup.Start(props, 7, logger, _ => true)) throw new Exception("a shape a loaded entity uses must not be started");
+            var joints = AnimationWarmup.RequireJoints(props);
+            if (joints.Length != 1 || joints[0] != "head") throw new Exception("requireJoints must be exactly the engine's 'head' without the attribute");
+            if (AnimationWarmup.DisableElements(props) != null) throw new Exception("no attribute, no disabled elements");
+            AnimationWarmup.Enabled = false;
+            AnimationWarmup.Reset();
+        });
+
+        Check("the entity load drain steps over an entity whose shape is still being warmed", () =>
+        {
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+            var warming = new Vintagestory.API.Common.Shape();
+            var ev = AnimationWarmup.BlockForTest(warming);
+            EntityLoadPatches.HoldForTest(201, 0, warming: warming);   // nearest bin, but blocked
+            EntityLoadPatches.HoldForTest(202, 0);                     // same bin, free
+            EntityLoadPatches.HoldForTest(203, 3);                     // farther bin, free
+            var loaded = new List<long>();
+            EntityLoadPatches.Drain(100, p => { loaded.Add(p.Id); return 0.1; });
+            if (loaded.Count != 2 || loaded.Contains(201)) throw new Exception("the blocked entity must be stepped over, the free ones finished: " + string.Join(",", loaded));
+            if (!EntityLoadPatches.IsHeld(201)) throw new Exception("the blocked entity must still be held");
+            if (EntityLoadPatches.StatWarmupHolds == 0) throw new Exception("the hold must be counted");
+            AnimationWarmup.Release(warming);
+            loaded.Clear();
+            EntityLoadPatches.Drain(100, p => { loaded.Add(p.Id); return 0.1; });
+            if (loaded.Count != 1 || loaded[0] != 201) throw new Exception("once the worker is done the entity finishes");
+            if (!AnimationWarmup.Ready(warming) || !AnimationWarmup.IsDone(warming)) throw new Exception("released shape must read ready and done");
+            EntityLoadPatches.Reset();
+            EntityLoadPatches.ResetStats();
+        });
+
+        Check("shadow far-LOD skip fires per cell where the pool as a whole cannot", () =>
+        {
+            // Two clusters in one pool: parts around the player and parts out near the range
+            // limit, every LOD level in both. The pool's far corner is beyond lod2Bias, so the
+            // old whole-pool rule skips nothing; a cell holding only the near cluster is
+            // entirely inside, so its LOD 3 bucket goes - and every part that goes must be a
+            // LOD 3 whose centre the camera pass would draw as LOD 2, while every LOD 3 beyond
+            // the bias stays exactly as it was.
+            FastCuller.ForgetAllPools();
+            FrustumCulling culler = NewCuller();
+            double bias = 160.0;
+            culler.lod2BiasSq = bias * bias;
+            FastCuller.Parallel = false;
+
+            ConstructorInfo ctor = typeof(MeshDataPool).GetConstructor(
+                BindingFlags.NonPublic | BindingFlags.Instance, null,
+                new[] { typeof(int), typeof(int), typeof(int) }, null);
+            var pool = (MeshDataPool)ctor.Invoke(new object[] { 500000, 750000, 512 });
+            pool.indicesStartsByte = new int[1024];
+            pool.indicesSizes = new int[512];
+            var locations = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(pool);
+            for (int i = 0; i < 80; i++)
+            {
+                bool near = i < 40;
+                int gx = (i % 40) % 5, gz = (i % 40) / 5;
+                int x = near ? gx * 12 : 140 + gx * 12;
+                int z = near ? gz * 8 : 140 + gz * 8;
+                locations.Add(new ModelDataPoolLocation
+                {
+                    IndicesStart = i * 300,
+                    IndicesEnd = i * 300 + 300,
+                    LodLevel = i % 4,
+                    FrustumCullSphere = Sphere.BoundingSphereForCube(x, 128, z, 8)
+                });
+            }
+            // the premise: the pool's far corner is beyond the bias
+            double farCorner = 0;
+            foreach (var loc in locations)
+            {
+                var sp = loc.FrustumCullSphere;
+                double cx = Math.Abs(sp.x) + sp.radius, cz = Math.Abs(sp.z) + sp.radius;
+                farCorner = Math.Max(farCorner, cx * cx + cz * cz);
+            }
+            if (farCorner <= bias * bias) throw new Exception("test premise broken: the whole pool is inside the bias");
+
+            FastCuller.ShadowSkipRedundantLod = false;
+            pool.FrustumCull(culler, EnumFrustumCullMode.CullInstantShadowPassNear);
+            List<(int, int)> before = Drawn(pool);
+            int trisBefore = pool.RenderedTriangles;
+
+            FastCuller.ShadowSkipRedundantLod = true;
+            FastCuller.Invalidate(pool);
+            pool.FrustumCull(culler, EnumFrustumCullMode.CullInstantShadowPassNear);
+            List<(int, int)> after = Drawn(pool);
+            int trisAfter = pool.RenderedTriangles;
+            FastCuller.ShadowSkipRedundantLod = false;
+
+            if (trisAfter >= trisBefore)
+                throw new Exception($"nothing was saved: {trisBefore} triangles before, {trisAfter} after - the per-cell rule did not fire");
+
+            int dropped = 0;
+            foreach (ModelDataPoolLocation loc in locations)
+            {
+                bool drawnBefore = Covers(before, loc.IndicesStart * 4, (loc.IndicesEnd - loc.IndicesStart) * 4);
+                bool drawnAfter = Covers(after, loc.IndicesStart * 4, (loc.IndicesEnd - loc.IndicesStart) * 4);
+                var sp = loc.FrustumCullSphere;
+                double centreSq = sp.x * (double)sp.x + sp.z * (double)sp.z;
+                if (drawnAfter && !drawnBefore)
+                    throw new Exception($"LOD {loc.LodLevel} part appeared that vanilla did not draw");
+                if (drawnBefore && !drawnAfter)
+                {
+                    dropped++;
+                    if (loc.LodLevel != 3) throw new Exception($"dropped a LOD {loc.LodLevel} part - only the LOD 3 stand-in may go");
+                    if (centreSq > bias * bias) throw new Exception("dropped a LOD 3 part the camera pass draws (beyond the bias)");
+                }
+            }
+            if (dropped == 0) throw new Exception("triangles fell but no part was dropped?");
+
+            FastCuller.Parallel = true;
+            FastCuller.ForgetAllPools();
         });
 
         Check("prebuilt window is rejected when its neighbourhood was marked dirty", () =>
@@ -5158,6 +5717,38 @@ internal static class Program
             }
         });
 
+        Check("a foreign client is recognised by marker type, version string and mod id, and named in every text", () =>
+        {
+            // the verified game on disk is neither
+            ForeignClient.Scan(name => typeof(Vintagestory.Client.NoObf.ClientMain).Assembly.GetType(name),
+                Vintagestory.API.Config.GameVersion.LongGameVersion, _ => null);
+            if (ForeignClient.Findings.Count != 0) throw new Exception("the verified game was taken for " + ForeignClient.Describe());
+
+            // Optimum by its marker type, the version from the type's constant
+            ForeignClient.Scan(name => name == ForeignClient.OptimumMarkerType ? typeof(FakeOptimumInfo) : null, "v1.22.7 (Stable)", _ => null);
+            if (ForeignClient.Findings.Count != 1 || ForeignClient.Describe() != "Optimum v9.9.9" || !ForeignClient.Findings[0].How.StartsWith("marker type"))
+                throw new Exception("marker type: " + ForeignClient.Describe());
+            // ... and by the version string alone, for a build that renamed the type
+            ForeignClient.Scan(_ => null, "v1.22.7 (Stable) + Optimum v0.3.14", _ => null);
+            if (ForeignClient.Describe() != "Optimum v0.3.14" || ForeignClient.Findings[0].How != "game version string")
+                throw new Exception("version string: " + ForeignClient.Describe());
+            // OptiTime by its mod id; both together in a fixed order
+            ForeignClient.Scan(_ => null, "v1.22.7 (Stable) + Optimum v0.3.14",
+                id => id == ForeignClient.OptiTimeModId ? new ModInfo { Name = "OptiTime", Version = "1.5.16" } : null);
+            if (ForeignClient.Describe() != "Optimum v0.3.14, OptiTime v1.5.16") throw new Exception("both: " + ForeignClient.Describe());
+            // a lookup that throws is neither a detection nor a crash - this runs at client start
+            ForeignClient.Scan(_ => throw new InvalidOperationException("no"), null, _ => throw new InvalidOperationException("no"));
+            if (ForeignClient.Findings.Count != 0) throw new Exception("a throwing lookup produced a finding");
+
+            // every text the player reads names what was found
+            const string what = "Optimum v0.3.14";
+            foreach (var t in new[] { ForeignClient.DialogText(what), ForeignClient.ChatText(what) })
+                if (!t.Contains(what)) throw new Exception("text does not name the client: " + t);
+            if (string.IsNullOrWhiteSpace(ForeignClient.Title()) || string.IsNullOrWhiteSpace(ForeignClient.Button()))
+                throw new Exception("empty title or button");
+            ForeignClient.Findings.Clear();
+        });
+
         Check("the patch guard names foreign patches on komet's targets and on komet's own code", () =>
         {
             // Three foreign patches, three different verdicts: a cancelling prefix on a method
@@ -5286,7 +5877,6 @@ internal static class Program
             PatchGuard.Reset();
         });
 
-        if (!fingerprintMode)
         Check("every UI string has a key, and both language files carry exactly those keys", () =>
         {
             // The set of keys is read from the SOURCE, not from what this run happened to
@@ -5358,8 +5948,30 @@ internal static class Program
             // readable, and an unknown language file from blanking the HUD.
             if (Loc.T("komet:does-not-exist", "english fallback") != "english fallback")
                 throw new Exception("Loc must fall back to the English text when there is no translation");
+
+            // The contract that flooded a log: T(key, english) hands back the entry AS WRITTEN,
+            // placeholder included - formatting belongs to the overload with arguments and
+            // happens only there. (Lang.GetIfExists formats with zero arguments and throws on
+            // "{0}", which the engine catches and logs twice per call, per HUD refresh.)
+            var table = new Dictionary<string, string> { ["komet:probe"] = "warteschlange {0}" };
+            Loc.Lookup = k => table.TryGetValue(k, out var v) ? v : null;
+            try
+            {
+                if (Loc.T("komet:probe", "queue {0}") != "warteschlange {0}")
+                    throw new Exception("T(key, english) must return the raw entry, placeholder intact");
+                if (Loc.T("komet:probe", "queue {0}", 7) != "warteschlange 7")
+                    throw new Exception("T(key, english, args) must format the translation");
+                if (Loc.T("komet:absent", "queue {0}", 7) != "queue 7")
+                    throw new Exception("a missing entry formats the English text");
+            }
+            finally { Loc.Reset(); }
         });
 
+        // Skipped while regenerating: this is the check that says the table is stale, and
+        // the regeneration is the answer to it. (The guard sat on the language check for a
+        // day after 04.09. - a new patched method then made './build.sh fingerprint' refuse
+        // to write the very file that would have satisfied it.)
+        if (!fingerprintMode)
         Check("the engine fingerprint matches the game on disk (else: ./build.sh fingerprint)", () =>
         {
             // Last, because every earlier check has applied its patches by now - the set the
@@ -5439,12 +6051,79 @@ internal static class Program
             return 0;
         }
 
-        Console.WriteLine(failures == 0 ? "\nall checks passed" : $"\n{failures} check(s) failed");
+        var skippedNote = skipped == 0 ? "" : $" ({skipped} skipped, see above)";
+        Console.WriteLine(failures == 0
+            ? "\nall checks passed" + skippedNote
+            : $"\n{failures} check(s) failed" + skippedNote);
         return failures == 0 ? 0 : 1;
     }
 
     /// <summary>Records that it was called, so dispatch order and count can be checked.</summary>
     /// <summary>A named, slow tick listener: gives the tick profiler a method to name.</summary>
+    /// <summary>Stands in for another mod's code: what matters is that it is a ModSystem in an
+    /// assembly the fake mod entry claims, which is exactly how the real mapping works.</summary>
+    private sealed class ProbeModSystem : ModSystem
+    {
+    }
+
+    /// <summary>
+    /// A mod the loader never loaded. Mod.Info and Mod.Systems have internal setters, so they
+    /// are set by reflection - the alternative would be a fake IModLoader with thirty members,
+    /// and the profiler only ever needed the list.
+    /// </summary>
+    private static Mod FakeMod(string id, string name, IReadOnlyCollection<ModSystem> systems, bool core = false)
+    {
+        var mod = (Vintagestory.Common.ModContainer)RuntimeHelpers.GetUninitializedObject(
+            typeof(Vintagestory.Common.ModContainer));
+        AccessTools.Property(typeof(Mod), nameof(Mod.Info)).SetValue(mod,
+            new ModInfo { ModID = id, Name = name, Version = "1.0.0", CoreMod = core });
+        AccessTools.Property(typeof(Mod), nameof(Mod.Systems)).SetValue(mod, systems);
+        return mod;
+    }
+
+    /// <summary>
+    /// Plausible mods with plausible figures, for the layout preview. Hand-made on purpose:
+    /// the preview exists to show what the box looks like when it is FULL, and the machine
+    /// running './build.sh preview' has no mods installed at all.
+    /// </summary>
+    private static void BuildPreviewModIndex()
+    {
+        ModProfiler.Clear();
+        ModProfiler.BuildIndex(new List<Mod>
+        {
+            FakeMod("game", "Vintage Story", new List<ModSystem>(), core: true),
+            FakeMod("survival", "Survival Mode", new List<ModSystem> { new ProbeModSystem() }, core: true),
+            FakeMod("primitivesurvival", "Primitive Survival", new List<ModSystem> { new ProbeModSystem() }),
+            FakeMod("xskills", "XSkills", new List<ModSystem> { new ProbeModSystem() }),
+            FakeMod("carryon", "Carry On", new List<ModSystem> { new ProbeModSystem() }),
+            FakeMod("medievalexpansion", "Medieval Expansion", new List<ModSystem>()),
+        });
+
+        void Fill(string id, double render, double tick, int renderers, int listeners,
+                  int patched, int foreign, int transpilers, int blocks, double loadMs, string phase)
+        {
+            var e = ModProfiler.Find(id);
+            if (e == null) return;
+            e.RenderMs = render;
+            e.TickMs = tick;
+            e.Renderers = renderers;
+            e.Listeners = listeners;
+            e.PatchedMethods = patched;
+            e.PatchedForeign = foreign;
+            e.Transpilers = transpilers;
+            e.Blocks = blocks;
+            e.LoadMs = loadMs;
+            e.SlowestPhase = phase;
+            e.SlowestPhaseMs = loadMs * 0.8;
+        }
+
+        Fill("survival", 1.42, 0.61, 3140, 6, 0, 0, 0, 812, 4100, "assetsfinal");
+        Fill("primitivesurvival", 0.83, 0.12, 412, 2, 4, 4, 0, 96, 1350, "assets");
+        Fill("xskills", 0.06, 0.44, 1, 3, 28, 26, 3, 4, 940, "startside");
+        Fill("carryon", 0.02, 0.09, 0, 1, 11, 11, 1, 2, 210, "start");
+        Fill("medievalexpansion", 0.31, 0.03, 188, 0, 0, 0, 0, 240, 760, "assets");
+    }
+
     private sealed class TickProbe
     {
         public int Calls;

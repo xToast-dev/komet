@@ -84,6 +84,9 @@ public static class EntityLoadPatches
     private static long lastBoundaryTs;
     public static double StatWorstMs;
     public static string StatWorstCode;
+    /// <summary>Drain steps that stepped over an entity because its shape's animation
+    /// warm-up was still running.</summary>
+    public static long StatWarmupHolds;
     public static int PendingCount => pendingById.Count;
 
     internal sealed class Pending
@@ -93,6 +96,9 @@ public static class EntityLoadPatches
         public EntityProperties Type;
         public bool Spawn;
         public int Bin;
+        /// <summary>The shape a worker is generating animation frames for while this entity
+        /// waits (see Runtime.AnimationWarmup); null when nothing holds it back.</summary>
+        public Vintagestory.API.Common.Shape WarmingShape;
     }
 
     private static readonly List<Pending>[] bins = new List<Pending>[BinCount];
@@ -302,6 +308,10 @@ public static class EntityLoadPatches
         var distSq = plr == null || pos == null ? double.NaN
             : (pos.X - plr.X) * (pos.X - plr.X) + (pos.Y - plr.Y) * (pos.Y - plr.Y) + (pos.Z - plr.Z) * (pos.Z - plr.Z);
         var pend = new Pending { Id = p.EntityId, Entity = entity, Type = type, Spawn = spawn, Bin = BinOf(distSq) };
+        // The first held entity of a shape starts the animation warm-up; it and every later
+        // one of that shape stay held until the worker is done (Drain skips them).
+        if (Runtime.AnimationWarmup.Start(type, p.EntityId, g.Logger, shape => ShapeInUse(g, shape)))
+            pend.WarmingShape = Runtime.AnimationWarmup.ShapeFor(type, p.EntityId);
         bins[pend.Bin].Add(pend);
         pendingById[pend.Id] = pend;
 
@@ -320,9 +330,24 @@ public static class EntityLoadPatches
         entity.FromBytes(reader, isSync: true);
     }
 
+    /// <summary>Whether any loaded entity animates with this shape - then its animations may
+    /// be read on the main thread at any moment and a worker must not touch them.</summary>
+    private static bool ShapeInUse(ClientMain g, Vintagestory.API.Common.Shape shape)
+    {
+        try
+        {
+            foreach (var kv in g.LoadedEntities)
+                if (ReferenceEquals(kv.Value?.Properties?.Client?.LoadedShapeForEntity, shape)) return true;
+        }
+        catch (Exception) { return true; } // a changing dictionary: assume in use, the safe answer
+        return false;
+    }
+
     /// <summary>The deferred half: vanilla's remaining lines, in vanilla's order.</summary>
     private static void Finish(ClientMain g, Pending pend)
     {
+        // out-of-turn finishes (promote, flush) may arrive while the worker still runs
+        if (pend.WarmingShape != null) Runtime.AnimationWarmup.Wait(pend.WarmingShape);
         var entity = pend.Entity;
         var chunkIndex = g.WorldMap.ChunkIndex3D(entity.Pos);
         entity.Initialize(pend.Type.Clone(), g.Api, chunkIndex);
@@ -381,15 +406,25 @@ public static class EntityLoadPatches
         for (var b = 0; b < BinCount && ShouldLoad(spent, loaded, budgetMs, MinPerFrame); b++)
         {
             var bin = bins[b];
-            while (bin.Count > 0 && ShouldLoad(spent, loaded, budgetMs, MinPerFrame))
+            // from the top of the stack down; an entry whose shape is still being warmed on
+            // a worker is stepped over and stays where it is
+            var i = bin.Count - 1;
+            while (i >= 0 && ShouldLoad(spent, loaded, budgetMs, MinPerFrame))
             {
-                var pend = bin[bin.Count - 1];
-                bin.RemoveAt(bin.Count - 1);
+                var pend = bin[i];
+                if (pend.WarmingShape != null && !Runtime.AnimationWarmup.Ready(pend.WarmingShape))
+                {
+                    StatWarmupHolds++;
+                    i--;
+                    continue;
+                }
+                bin.RemoveAt(i);
                 pendingById.Remove(pend.Id);
                 var ms = finish(pend);
                 Book(pend, ms);
                 spent += ms;
                 loaded++;
+                if (i > bin.Count - 1) i = bin.Count - 1;
             }
         }
         if (pendingById.Count > 0) StatDeferredFrames++;
@@ -427,11 +462,13 @@ public static class EntityLoadPatches
         pendingById.Clear();
         game = null;
         lastBoundaryTs = 0;
+        Runtime.AnimationWarmup.Reset();
     }
 
     public static void ResetStats()
     {
-        StatLoaded = StatDeferredFrames = StatPromoted = StatDropped = StatUpdatedPending = StatStaleFlushes = 0;
+        StatLoaded = StatDeferredFrames = StatPromoted = StatDropped = StatUpdatedPending = StatStaleFlushes = StatWarmupHolds = 0;
+        Runtime.AnimationWarmup.ResetStats();
         StatWorstMs = 0;
         StatWorstCode = null;
     }
@@ -439,9 +476,9 @@ public static class EntityLoadPatches
     // ---- test seams -----------------------------------------------------------------------
 
     /// <summary>verify: holds a fake entry in a bin (optionally with an entity behind it).</summary>
-    internal static void HoldForTest(long id, int bin, Entity entity = null)
+    internal static void HoldForTest(long id, int bin, Entity entity = null, Vintagestory.API.Common.Shape warming = null)
     {
-        var pend = new Pending { Id = id, Bin = bin, Entity = entity };
+        var pend = new Pending { Id = id, Bin = bin, Entity = entity, WarmingShape = warming };
         bins[bin].Add(pend);
         pendingById[id] = pend;
     }

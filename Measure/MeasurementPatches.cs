@@ -159,7 +159,7 @@ public static class MeasurementPatches
                 postfix: OuterPostfix(nameof(NetAllocPostfix)));
         });
 
-        // How long SwapBuffers itself takes, so "ausserhalb" splits into the swap and the
+        // How long SwapBuffers itself takes, so "außerhalb" splits into the swap and the
         // rest of the event loop. Under mesa_glthread every stage timing above only measures
         // command *recording*; the driver thread's real work is paid wherever the queue must
         // drain, and the swap is the frame's one guaranteed drain point. A transpiler on the

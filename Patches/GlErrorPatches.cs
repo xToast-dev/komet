@@ -19,7 +19,7 @@ namespace Komet.Patches;
 ///
 /// The patch is always applied but gated on <see cref="SkipEnabled"/>, so '.komet toggle
 /// glerror' can A/B the two driver syncs live: watch the stage times and the swap share of
-/// "ausserhalb" move while the picture stays identical.
+/// "außerhalb" move while the picture stays identical.
 /// </summary>
 public static class GlErrorPatches
 {

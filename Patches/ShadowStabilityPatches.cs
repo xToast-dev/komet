@@ -109,9 +109,13 @@ public static class ShadowStabilityPatches
             // Shadow map resolution. Snapping to the wrong grid does not snap at all: the
             // offset lands on a boundary the sampler does not have, and the crawl this is
             // supposed to remove comes back as a sub-texel one. ShadowResPatches enlarges the
-            // framebuffer past what the setting alone implies, so its size wins when it is
-            // active; the engine's own formula is the fallback.
-            var mapSize = ShadowResPatches.EffectiveMapSize;
+            // far framebuffer past what the setting alone implies and shrinks the near one, so
+            // its sizes win when it is active; the engine's own formula is the fallback.
+            // The two cascades' maps can differ in size since 05.09. (the near one is
+            // usually the smaller), and each snaps to its own grid.
+            var mapSize = ShadowPatches.PreparingFarCascade
+                ? ShadowResPatches.EffectiveMapSize
+                : ShadowResPatches.EffectiveNearMapSize;
             if (!SnapOffset(lightView, cam.X, cam.Y, cam.Z, width, height, mapSize,
                             out var offsetX, out var offsetY))
                 return;

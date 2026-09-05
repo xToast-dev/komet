@@ -4,7 +4,8 @@ Client-side performance mod for **Vintage Story 1.22.0+** (built and verified ag
 1.22.7), based on Harmony patches.
 It reduces main-thread CPU time in the render loop — visibility sweep, occlusion
 culling, draw-range merging, chunk loading, shadows, VRAM pooling — and ships an
-F7 performance HUD with per-renderer timings, a hitch log and a built-in stress test.
+F7 performance HUD with per-renderer timings, a hitch log, a built-in stress test and a
+Shift+F7 mod profiler that attributes what is measured to the mod it came from.
 Gains grow with view distance.
 
 All patches are applied in memory when the game loads. No game files are modified,
@@ -24,7 +25,9 @@ In game:
 
 ```
 F7               toggle the performance HUD
+Shift+F7         toggle the mod profiler HUD: what the other mods cost and do
 .komet           the same numbers, compact, in chat
+.komet mods      per-mod costs, patches and load times as text
 .komet report    full diagnostic block written to client-main.log
 .komet safemode  every optimisation that changes what is drawn, off at once —
                  settles in seconds whether a visual glitch comes from this mod

@@ -700,7 +700,7 @@ Daraus folgen zwei Dinge, die man nicht verwechseln darf:
 * **GPU-Arbeit ist teuer.** Deshalb kostet die Schattenbox 0,72 ms und deshalb ist eine höhere
   Schattenauflösung hier keine gute Idee.
 
-Die Zeile `= ausserhalb ... davon swap` im HUD und die `[swap …]`-Spalte im Stresstest sind
+Die Zeile `= außerhalb ... davon swap` im HUD und die `[swap …]`-Spalte im Stresstest sind
 genau dafür da. Ein Delta von null mit großen gegenläufigen Anteilen ist kein „bringt nichts",
 sondern „die Arbeit wurde verschoben, nicht eingespart" — und sagt, wo die Wand steht.
 
@@ -1071,7 +1071,7 @@ ConditionalWeakTable-Lookup und sechs Ebenen-Skalarprodukte.
 
 Config `CullAnimatableRenderers` (Default an), `.komet toggle animcull`, Safemode schaltet
 es ab, Stress-Phase `animatable-gate aus (vanilla)`, HUD/Report `animatable-gate N von M
-aufrufen uebersprungen` (gedruckt, solange das Gate scharf ist — 0 von 0 ist korrekte Ruhe,
+Aufrufen übersprungen` (gedruckt, solange das Gate scharf ist — 0 von 0 ist korrekte Ruhe,
 keine Zeile wäre nicht von einem toten Prefix zu unterscheiden). Verify: die reine Regel
 (sichtbar bleibt, hinter der Kamera fällt, an der Frustumkante mit größerer Skalierung
 oder größerem Radius bleibt, NaN/Null-Skalierung oder -Radius geht an vanilla, Spiegelung
@@ -1145,7 +1145,7 @@ schaltet es ab, `toggle profiler` liefert weiterhin das volle Bild.
 Das HUD zeigte sieben von dreizehn Stages; `AfterOIT`, `AfterPostProcessing`,
 `AfterFinalComposition` und `AfterBlit` wurden die ganze Zeit gemessen, aber nie angezeigt —
 rund ein Fünftel des Frames war unsichtbar, und genau dort sitzen SSAO, God Rays und Color
-Grading. Sie stehen jetzt als `post/compose` in einer Zeile. Dazu `= ausserhalb`: die Zeit, die
+Grading. Sie stehen jetzt als `post/compose` in einer Zeile. Dazu `= außerhalb`: die Zeit, die
 zu keiner Stage und keinem Game-Tick gehört (Buffer-Swap, Treiber-Rückstau). Sie zu benennen
 verhindert, dass man sie für einen Messfehler hält.
 
@@ -1248,7 +1248,7 @@ und der Feuerstellen-Renderer springt von 0,62 auf 4,87 ms — bei identischen F
 dem Schirm. Wenn dort die GPU die Wand ist (Unterwasser-Vollbildeffekte), sind die
 Mehr-Millisekunden **Rückstau**, der sich dort ansammelt, wo die meisten GL-Aufrufe abgesetzt
 werden — und keine CPU-Optimierung der Welt ändert daran etwas. Bisher war das nicht
-entscheidbar: `= ausserhalb` fängt nur Wartezeit am Buffer-Swap, Rückstau *innerhalb* der
+entscheidbar: `= außerhalb` fängt nur Wartezeit am Buffer-Swap, Rückstau *innerhalb* der
 Stages war unsichtbar.
 
 `MeasureGpuTime` (Default an) spannt deshalb eine `GL_TIME_ELAPSED`-Query über jeden Frame
@@ -1559,15 +1559,15 @@ Client-Frame-Buchhaltung. Seit 1.32.0 bucht der Postfix nur noch, wenn die über
 `ClientMain` ist; die `game tick`-Zeile ist im Singleplayer jetzt ehrlicher (tendenziell
 kleiner), besonders während Chunk-Fluten.
 
-## „ausserhalb … davon swap": wo die Treiberzeit wirklich sitzt
+## „außerhalb … davon swap": wo die Treiberzeit wirklich sitzt
 
 Mit mesa_glthread (radeonsi-Default) messen alle Stage-Zeiten nur das **Einreihen** der
 GL-Befehle — der Treiber-Thread führt asynchron aus. Die echte Treiberarbeit wird dort
 bezahlt, wo die Queue leerlaufen muss, und der eine garantierte Drain-Punkt jedes Frames ist
-`SwapBuffers`. Ein `ausserhalb` von 2,5 ms bei 32 % GPU-Auslastung ist also entweder
+`SwapBuffers`. Ein `außerhalb` von 2,5 ms bei 32 % GPU-Auslastung ist also entweder
 Treiber-Thread-CPU (Befehle ausführen), Compositor-Gegendruck — oder schlicht die
 Event-Schleife. Seit 1.22.0 wird der Swap selbst gemessen: die HUD-Zeile zeigt
-`= ausserhalb … davon swap X`, und im Worst-Frame-Tail trennen sich `swap` und `draussen`
+`= außerhalb … davon swap X`, und im Worst-Frame-Tail trennen sich `swap` und `draussen`
 (= außerhalb minus swap: ProcessEvents, Maus, OpenTK-Dispatch).
 
 Gemessen wird per **Transpiler auf `window_RenderFrame`**, nicht per Patch auf
@@ -1831,6 +1831,24 @@ gleiche Profiler-Marks, Exceptions propagieren wie vorher). Der Frame behält Su
 schwerste Task (`tasks 9,1 (readpacket33 8,2)` in der Ruckler-Zeile), eine geglättete Tabelle
 je Code steht im Report (`hauptthread-tasks: …`). `.komet toggle mtt` gibt den Drain an Vanilla.
 
+**Der Lock ist nicht auf jedem Client vom selben Typ (05.09.).** Vanilla deklariert
+`ClientMain.MainThreadTasksLock` als `object` und nimmt ihn mit `Monitor`; der Optimum-Build
+(v0.3.14) als `System.Threading.Lock` und betritt ihn mit `EnterScope`. Eine kompilierte
+Feldreferenz trägt den Feldtyp in ihrer Signatur — die Vanilla-Bindung fand das Feld auf dem
+Fork nicht mehr (`MissingFieldException` im ersten Frame des Verbindungsbildschirms,
+1.2.0-pre.3). Die Transkription liest das Feld jetzt per Namen (einmal je Session, nicht je
+Frame) und nimmt es so, wie sein Typ es verlangt (`QueueLock`): `Monitor` auf dem Objekt,
+`Enter`/`Exit` auf dem `Lock`. Das ist keine Bequemlichkeit: `Monitor.Enter` auf einer
+`Lock`-Instanz ist ein *anderes* Lock als das, das `EnqueueMainThreadTask` auf dem
+Netzwerk-Thread hält — die Übergabe liefe ohne jede Exception gegen den Enqueue. Ein dritter
+Typ lässt den Drain bei Vanilla („could not enable"). Verify prüft beide Formen
+(`Monitor.IsEntered` bzw. `Lock.IsHeldByCurrentThread`, und dass der `Lock` *nicht* über
+Monitor genommen wurde) und lässt den ganzen Drain samt Suspend/Requeue gegen ein echtes
+`ClientMain` mit dem Feld der Engine laufen. Gefunden mit einem Bindungs-Check: jede Methode
+der gebauten Komet.dll einmal gegen Optimums Assemblies JIT-kompiliert
+(`RuntimeHelpers.PrepareMethod`) — genau zwei scheiterten, `Execute` und `Requeue`, beide an
+diesem Feld; sonst weicht die Bindung nicht ab.
+
 **`tick`** gehört den Tick-Listenern (`EventManager.GameTickListenersEntity`, ein paar Dutzend
 System- und Mod-Listener) plus allen Block-Entity-Ticks. `TickProfiler` wickelt jeden dieser
 Listener-Delegates in einen Timer — die Liste wird per Id verwaltet, Identität ist hier kein
@@ -2024,7 +2042,7 @@ das SDK hängt den vollen Hash an die InformationalVersion).
 Vollansicht: vier Blöcke statt einer flachen Liste: **Kopf** (fps, gpu-frame,
 schlechtester Frame mit Aufteilung, Ruckler), **frame-aufteilung** (jeder Bucket des
 Frames in der Reihenfolge und mit dem Vokabular des Hitch-Logs — inklusive game tick und
-`ausserhalb` summiert der Block auf 100 %), **gc** (Pausen, Alloc-Quellen, Modus) und
+`außerhalb` summiert der Block auf 100 %), **gc** (Pausen, Alloc-Quellen, Modus) und
 **welt & laden** (Draw Calls, Chunks, Tesselation, VRAM, Upload). Neben jedem
 Frame-Bucket steht ein Balken: zehn Zellen sind der ganze Frame, Achtel-Zellen über die
 Unicode-Blockelemente. Ob die Blockglyphen in der Monospace-Zelle des Systems wirklich
@@ -2287,6 +2305,17 @@ eine Zeile nicht von ihrem Eintrag wegdriften kann.
 Die Dateien liegen in `assets/komet/lang/{en,de}.json` und wandern per `build.sh release` ins
 ZIP. Die Schlüssel tragen ihre Domain selbst (`"komet:hud-fps"`), weil `TranslationService`
 einen Schlüssel mit `:` unverändert übernimmt und nur einen ohne die Domain voranstellt.
+
+**Der Eintrag wird unformatiert gelesen (05.09.).** `Lang.GetIfExists(key)` formatiert auch
+ohne Argumente, und ein Eintrag mit Platzhalter („warteschlange {0}") wirft dann in der Engine
+— die fängt das, loggt einen Error und eine Warning, und das bei jedem Aufruf. Bei einem
+HUD-Refresh pro Sekunde standen nach zehn Minuten dreitausend „Translation string format
+exception"-Zeilen im Log eines deutschen Clients. `Loc.T(key, english)` fragt seither
+`Lang.HasTranslation` (ohne Wildcard-Suche, ohne Log) und `Lang.GetUnformatted`; formatiert
+wird nur in der Überladung mit Argumenten, mit der Kultur des Clients. Der Lookup ist
+injizierbar (`Loc.Lookup`), und Verify hält mit einer eigenen Tabelle fest: ohne Argumente kommt
+der Eintrag samt `{0}` zurück, mit Argumenten die formatierte Übersetzung, für einen fehlenden
+Schlüssel der formatierte englische Text.
 
 Verify hält beides zusammen: es liest **die Quelldateien** (nicht das, was ein Lauf zufällig
 gedruckt hat), sammelt jedes `Loc.T`/`Loc.Hud` und verlangt, dass `en.json` und `de.json` exakt
@@ -2579,6 +2608,18 @@ Log-Zeile.
 
 `Guard/PatchGuard.cs` beantwortet beides, ohne Verhalten zu ändern — eine Kollision wird gemeldet,
 nie „aufgelöst", denn wer gewinnen soll, ist nicht Sache dieser Mod.
+
+**Optimum und OptiTime bekommen ein Popup (05.09.).** Beide ersetzen denselben Engine-Code wie
+Komets Transkriptionen, keine Seite weiß von der anderen — bisher fand man das per Bisect.
+`Guard/ForeignClient.cs` erkennt Optimum am Marker-Typ `Optimum.OptimumInfo` in VintagestoryLib
+(Version aus dessen Konstante; Fallback: der Versionsstring „… + Optimum v0.3.14"), OptiTime an
+der modid `optitime`. Gesucht wird beim Client-Start, die Log-Zeile kommt sofort; beim
+Weltbeitritt folgen 1,5 s nach `LevelFinalize` (dann ist der Ladebildschirm weg) ein Dialog
+(`ForeignClientDialog`, Layout wie der `GuiDialogConfirm` der Engine) und dieselbe Zeile im
+Chat, und der Report nennt den Client in seinem Kopf. Komet bleibt an — wer gewinnen soll,
+entscheidet der Spieler. Ein Lookup, der wirft, ist kein Fund und kein Absturz. Verify treibt die
+drei Erkennungswege ohne Spiel (injizierte Typ-, Versions- und Mod-Lookups) und prüft, dass jeder
+Text den Fund nennt.
 
 **Harmony-Kollisionen** kommen aus Harmonys eigenem Register (`Harmony.GetAllPatchedMethods` +
 `GetPatchInfo`): jede gepatchte Methode im Prozess mit Besitzern, Art und Priorität. Gemeldet
@@ -2873,3 +2914,371 @@ Ebenfalls aus dem Log: `readpacket11` ist UnloadServerChunk, der Tesselations-Th
 und Typ), und die 10 ms für den ersten Frame eines neuen Schweins sind der Animator-Aufbau je
 Shape (`pig-eurasian-adult-male` diesmal, vorher `-female`), ein Kandidat für einen Vorbau beim
 Entity-Laden.
+
+## GPU-Report gelesen: die nahe Kaskade zeichnet in 51 Millionen Texel (05.09.)
+
+Der erste Report mit `gpu je stage` auf der RX 9070 XT: `frame 9,77 ms | gpu 8,93 ms (99 %
+busy)` und darunter `schatten 7,7 (fern 1,9, nah 5,8) | opaque 0,2 | post 1,1`. Die GPU ist
+die Wand (`swap 3,8` ist Warten auf sie), und 86 % ihrer Zeit gehen in die zwei Schattenpässe.
+Davon die **nahe** Kaskade 5,8 ms — für ein paar Dutzend Chunks. Die ferne, die tausende
+zeichnet, kostet pro gezeichnetem Frame etwa dasselbe (die 1,9 sind der Mittelwert über die
+gedrosselten Frames; die Zeile sagt seit heute `= 5,7 wenn gezeichnet`).
+
+Das ist der Fingerabdruck eines **füllratengebundenen** Tiefenpasses: die Kosten hängen an
+Texeln mal Tiefenkomplexität, nicht an Geometrie. Beide Kaskaden schreiben in dieselbe
+Kartengröße — `ClientPlatformWindows` rechnet `Math.Max(4, quality+2) * 1024` ein einziges Mal
+und baut beide Framebuffer daraus, mit `ShadowMapExtraQuality 1` also 7168². Die ferne Karte
+spannt das über 488 Blöcke (14,7 Texel je Block). Die nahe über Vanillas 39-Block-Keil, rund
+60 × 34 Blöcke: **über hundert Texel je Block** auf der einen, über zweihundert auf der
+anderen Achse. Niemand sieht diesen Unterschied; die GPU bezahlt ihn jeden Frame, denn 7168²
+sind 51 Millionen Texel, die je Terrain-Schicht entlang des Lichtstrahls gelöscht, getestet
+und geschrieben werden — mit `discard` im Fragment-Shader auch noch ohne frühes Depth-Write.
+
+### `ShadowNearMapSize`: die nahe Karte bekommt ihre eigene Größe (Default 4096)
+
+`ShadowResPatches.ResizeNearMap` ist ein Postfix auf `SetupDefaultFrameBuffers`: die Engine hat
+die Tiefentextur der nahen Karte gerade angelegt, der Postfix spezifiziert **dasselbe
+Texturobjekt** mit einem `TexImage2D` in der konfigurierten Größe neu (gleiches Format
+`GL_DEPTH_COMPONENT32`, keine Daten), setzt `Width/Height` auf der `FrameBufferRef` (daraus
+setzt `ClearFrameBuffer` den Viewport) und prüft einmal die Vollständigkeit des Framebuffers —
+ein rückgabebehafteter GL-Aufruf pro Rebuild, nicht pro Frame; ist der Treiber nicht
+einverstanden, kommt die alte Größe zurück, bevor irgendwas hineinzeichnet. Die ferne Karte
+(Slot 11) bleibt unberührt: aus ihr nimmt `ShaderProgramBase` `shadowMapWidthInv` für **beide**
+Kaskaden. Die Folge für die nahe: die 3×3-PCF-Taps liegen jetzt 0,57 nahe Texel auseinander
+statt einem, der Kernel spannt gut zwei Texel statt drei — nahe Schattenkanten werden eine Spur
+härter, etwa wie Vanilla sie bei Qualität 2 zeichnet (4096-Karte über 33 Blöcke). Kein Shader
+wird angefasst.
+
+Die Größe geht quadratisch in die Kosten: 4096 ist ein Drittel von 7168, 3072 ein Fünftel. Der
+Default 4096 gibt der nahen Kaskade ~68 Texel je Block, immer noch das Vier- bis Fünffache der
+fernen. **Live:** `.komet shadownear 3072` (oder `off` = Engine-Größe) setzt die Größe und baut
+die Framebuffer um wie das Grafikmenü nach einer Änderung — ein Ruckler, dann die neue Zahl in
+`gpu je stage`. So lässt sich 7168 gegen 4096 gegen 3072 in einer Minute vergleichen statt mit
+einem Neustart pro Kandidat. Der erzwungene Rebuild beim Weltbeitritt (die Engine baut ihre
+Framebuffer vor jedem Mod) kennt jetzt beide Gründe, Extra-Stufe und nahe Karte, jeden mit
+eigenem „schon erledigt". Das Texel-Snapping fragt `ShadowPatches.PreparingFarCascade`, für
+welche Kaskade es quantisiert — zwei Karten, zwei Raster.
+
+HUD `nahe map 4096px 68,3 texel je block`, Report `near cascade: to 39 blocks (60 blocks
+wide) | map 4096px = 68,3 texels per block`. Die Spanne der nahen Box holt ein Postfix auf
+`OnRenderShadowNear`, genau wie `MatchFadeToBox` sie für die ferne holt.
+
+### Backface-Culling in den soliden Schattenpässen (`ShadowCullBackfaces`, Default an)
+
+`ChunkRenderer.RenderShadow` schaltet Culling für die ganze Methode aus und zeichnet vier
+Render-Pässe in die Schattenkarte: Opaque (0) und TopSoil (5), dann nach einem zweiten
+`GlDisableCullFace` BlendNoCull (2) und OpaqueNoCull (1). Die zweite Hälfte braucht das:
+Laub, Gras, Pflanzen sind einseitige Geometrie und müssen von beiden Seiten werfen. Die erste
+nicht — dieselben Pools werden im Kamera-Pass **mit** Culling gezeichnet (`RenderOpaque`
+schaltet es vor Pass 0 ein und erst vor Pass 2 aus), ihre Wicklung ist also konsistent und
+ihre Volumen sind geschlossen. Bei einem geschlossenen Volumen liegen die Rückseiten entlang
+jedes Strahls hinter den Vorderseiten, auch entlang des Lichtstrahls: **die Tiefenkarte ist
+dieselbe.** Gespart wird die Arbeit: die halben soliden Flächen in der Schattenbox, die sonst
+gerastert, getestet und — je nachdem, in welcher Reihenfolge die Pools kommen — geschrieben
+und wieder überschrieben werden, fallen am Primitiv weg, bevor ein Fragment existiert. Auf
+einem füllratengebundenen Pass ist das die billigste Einsparung, die es gibt.
+
+Wo die beiden Tiefenkarten abweichen können: offene Geometrie in einem soliden Pass, also eine
+Fläche, deren Rückseite das Einzige entlang des Lichtstrahls ist. So ein Block ist im
+Kamera-Bild von hinten schon unsichtbar — das *ist* die Definition „solider Pass"; die Kante
+der geladenen Welt ist der praktische Fall, und die liegt jenseits der Ausblendung. `GL_BACK`
+wird explizit gesetzt statt angenommen (die Engine setzt es beim Start und nach OIT, nichts im
+Spiel setzt FRONT, ein fremder Renderer könnte).
+
+Umgesetzt als Transpiler: der **erste** `GlDisableCullFace`-Aufruf in `RenderShadow` wird zu
+`ShadowCullPatches.BeginSolidPasses(platform)` (der Empfänger liegt schon auf dem Stack), das je
+nach Live-Flag Culling ein- oder ausschaltet; der zweite Aufruf bleibt und stellt No-Cull für
+die Laub-Pässe her wie zuvor. Genau zwei Aufrufe müssen es sein, sonst wirft der Patch — ein
+Engine-Build, der die Aufrufe verschoben hat, bekommt lieber Vanilla als den falschen Pass
+gecullt. `verify` liest die IL nach dem Patch: ein `BeginSolidPasses`, ein verbliebenes
+`GlDisableCullFace`, das erste vor dem zweiten; und füttert dem Transpiler eine Methode mit
+nur einem Disable, die er ablehnen muss. `.komet toggle shadowcull`, Stress-Phase „shadow
+backface cull off", Safemode aus, Report `solid backfaces culled`.
+
+### `ShadowSkipRedundantLod`: pro Zelle statt pro Pool, und jetzt Default an
+
+Die Option existiert seit 1.4x und hat im Feld nie etwas gespart — jeder Report las `lod3 in`,
+weil sie den **ganzen Pool** innerhalb der LOD-Grenze verlangte, und ein Pool hält Teile von
+überall her, sobald die Welt eingeströmt ist. Die Zellbox begrenzt jedes Teil in ihr; liegt
+ihre fernste Ecke näher als `lod2Bias`, liegt jedes Teil-Zentrum näher, und der Kamera-Pass
+zeichnet für alle davon LOD 2 statt 3 — dieselbe Exaktheit, auf einer Granularität, bei der die
+Regel tatsächlich greift. Zwei `abs`, zwei Multiplikationen je Zelle im Schattenmodus; die
+Überlauf-Teile außerhalb des Rasters prüfen ihre eigene Ecke. Default an, weil der Ersatz nur
+dort wegfällt, wo sein detaillierter Zwilling schon in der Karte liegt: der Schatten kann sich
+nur dem annähern, was die Kamera zeigt. Der neue `verify`-Test baut einen Pool aus zwei
+Clustern, dessen fernste Ecke jenseits der Grenze liegt (die alte Pool-Regel spart dort
+nichts), und verlangt, dass Dreiecke fallen, nur LOD 3 fällt, und nur solche, deren Zentrum die
+Kamera als LOD 2 zeichnet.
+
+### Was das bringen müsste, und was der nächste Report zeigt
+
+Nahe Kaskade 5,8 → ~2 ms (Karte), dazu die Rückseiten in beiden Kaskaden und das doppelte Laub
+— zusammen sollten aus `gpu 8,93` grob 4,5 bis 5,5 ms werden; da die CPU-Seite ohne Swap-Warten
+bei rund 5 ms liegt, wird der Frame dann wieder von beiden Seiten gleich begrenzt. Ob die
+Füllraten-These stimmt, entscheidet `gpu je stage` mit `.komet shadownear 7168` gegen `4096`
+in derselben Szene: skaliert `nah` mit dem Quadrat der Größe, war es Füllrate; bleibt es
+stehen, ist es Geometrie, und dann wäre die Tiefe der nahen Box (`ShadowBoxZExtend` 150-200
+Blöcke entlang des Lichts, alle Höhlenschichten unter dem Spieler) der nächste Kandidat.
+
+Nicht gebaut, bewusst: ein eigener Shadow-Shader ohne `discard` für die soliden Pässe (früher
+Depth-Write, kein Fragment-Shader — das wäre der nächste Hebel auf derselben These, braucht
+aber ein registriertes Shader-Programm samt SSBO-Variante und kollidiert mit jedem
+Shader-ersetzenden Mod); die nahe Kaskade zu drosseln (`ShadowNearUpdateInterval` bleibt 1 —
+der eigene Schatten würde beim Fliegen einen Frame hinterherhängen); Chunks nach
+Licht-Tiefe zu sortieren (Pools sind nicht licht-kohärent, und die Range-Zusammenfassung
+lebt von der Puffer-Reihenfolge).
+
+## Zweiter Report vom 05.09.: Depth-only-Shader, Animations-Vorbau, und was „enttess" wirklich war
+
+Der zweite Report (b260905.1133, Sichtweite 672, Flug mit 100-170 m/s durch ungenerierte
+Welt) war eine andere Szene: `frame 16,37 ms | gpu 9,70 ms (69 % busy)` — CPU-gebunden, mit
+`opaque 8,37` und 58 Rucklern, 47 davon mit GC-Pause. Im ruhigen HUD-Moment: 107 fps, GPU
+6,24 ms, `schatten 5,7` (vorher 8,93 / 7,7 in der ersten Szene). Die `gpu je stage`-Zeile
+zeigte `schatten 15,8 (fern 4,3 = 7,1 wenn gezeichnet, nah 11,6)` — eine Stage-Summe von 18 ms
+gegen 9,7 ms GPU-Spanne, was nicht sein kann: die Stempel-Ringe lesen einmal die Sekunde, die
+Elapsed-Query zweimal, und in einer Szene mit einem Ruckler alle 1,4 s dominieren ein paar
+35-ms-Frames einen EMA mit Gewicht 0,4. Die Zeile trägt jetzt `frame by stamps X ms`, damit
+man sieht, gegen welchen Frame die Stage-Zahlen zu lesen sind.
+
+### `enttess 9,7 ms (chicken-rooster)` war die GC-Pause, nicht das Huhn
+
+23 der 58 Ruckler buchten „before" mit `enttess 5-11 ms` und dem Namen eines Tiers, jedes Mal
+ein anderer Typ: Hahn, Hirsch, Hirschkalb, Wolf. Naheliegend: der Erstframe eines neuen Typs.
+Offline nachgemessen (`shapetime`, gegen die Shape-Dateien des Spiels): `InitForAnimations`
+0,3-0,4 ms, Animator-Aufbau 0,04-0,35 ms, `Shape.Clone` 1,7 ms — zusammen keine 3 ms. Und der
+Textur-Verdacht (`GetTextureSource`) löst sich im Code auf: der Entity-`TextureSource`
+mappt nur bereits gebackene Atlas-IDs. Der Blick zurück auf die Ruckler-Zeilen: in **jeder**
+steht neben `enttess` eine GC-Pause von fast derselben Größe (`gc 9,3 | enttess 9,7`,
+`gc 9,7 | enttess 10,7`, `gc 4,4 | enttess 5,9`). Die Pause fror die Klammer ein, in der sie
+landete — das steht so schon bei „schlechtester … davon". Die Erstframe-Kosten eines Typs
+sind real, aber sie liegen woanders:
+
+### `GenerateAllFrames`: 12 ms pro Tiertyp, auf einem Worker (`EntityAnimationPrewarm`)
+
+`ClientAnimator.AnimNowActive` ruft `Animation.GenerateAllFrames` beim ersten Start jeder
+Animation auf dem Hauptthread: Hahn 11,9 ms für 13 Animationen, „attack" allein 4,7 ms; der
+Report-Wert `anim … teuerste 53,1 ms (pig)` ist dieselbe Rechnung auf einer größeren Shape.
+Die Frames liegen auf den `Animation`-Objekten der **Shape**, geteilt von allen Entities des
+Typs: einmal pro Typ und Sitzung, immer in dem Frame, in dem eine neue Tierart zum ersten
+Mal ins Bild läuft.
+
+Das Fenster dafür existiert seit dem Entity-Lade-Budget: jede Entity liegt vor `Initialize`
+einige Frames in einem Distanz-Bin. `Runtime/AnimationWarmup.cs`: die erste gehaltene Entity
+einer Shape startet einen Worker, der exakt die Cache-Miss-Sequenz der Engine fährt
+(`InitForAnimations` mit denselben Argumenten — „head" plus `requireJointsForElements`,
+`disableElements` —, dann `GenerateAllFrames` für jede Animation); sie und jede spätere
+Entity derselben Shape bleiben gehalten, bis der Worker fertig ist (`Drain` steigt über sie
+hinweg, `StatWarmupHolds`). Der Hauptthread findet danach `PrevNextKeyFrameByFrame` gesetzt
+und generiert nichts; die Joint-IDs, die er in `ResolveAndFindJoints` neu ableitet, sind
+dieselben (deterministisch, idempotent auf einer initialisierten Shape).
+
+Thread-Sicherheit hängt an einer Regel: niemand sonst fasst die Shape an, solange ihr Worker
+läuft. Für später ankommende Entities garantiert das der Hold; für Shapes, die schon in der
+Welt sind, wird gar nicht erst gestartet — hat eine Animation schon Frames oder animiert
+eine geladene Entity mit der Shape (`LoadedShapeForEntity`-Scan über `LoadedEntities`),
+gilt sie als in Gebrauch, und der Lazy-Pfad der Engine bleibt. In `GenerateAllFrames` ist
+der einzige geteilte Zustand die statische Identitätsmatrix, die nur geklont wird, und die
+`jointsDone`-Sets pro Animation, die zur gewärmten Shape gehören;
+`CacheInverseTransformMatrix` weist nur zu, wenn noch null. Promote (ein Paket nennt eine
+gehaltene Entity) und der Disable-Flush warten auf einen laufenden Worker — Millisekunden,
+und selten (17 von 712 im Feld). Alternate-Shapes werden wie in der Engine per
+`MurmurHash3Mod` der Entity-ID gewählt, ohne die Klassen-Properties anzufassen.
+
+`verify` lädt den echten Hahn aus den Spiel-Assets, lässt den Worker-Körper laufen und
+verlangt: alle 13 Animationen haben `QuantityFrames` Frames, ein zweiter Lauf generiert
+nichts, eine Shape mit Frames oder mit geladener Entity wird nie gestartet, die
+Joint-Argumente sind exakt die der Engine; und der Drain steigt über eine blockierte Entity
+hinweg, erledigt die freien, und holt sie nach, sobald der Worker freigibt.
+
+### Depth-only-Shader für die soliden Schattenpässe (`ShadowDepthOnlySolidPasses`)
+
+`chunkshadowmap.fsh` ist ein Sampler-Fetch und `if (a < 0.02) discard` — für **jedes**
+Fragment **jedes** Passes, auch für die soliden Würfel, deren Texel nie transparent sind. Ein
+Fragment-Shader mit `discard` kostet mehr als seine Instruktionen: die Hardware darf die
+Tiefe nicht vor dem Shader schreiben, Fragmente hinter einer schon gezeichneten Fläche
+werden trotzdem noch shadiert (der Test läuft früh, das Hierarchical-Z-Update wartet), und
+jedes überlebende zahlt einen Textur-Fetch. Für die Pässe Opaque (0) und TopSoil (5) bindet
+Komet jetzt ein Programm mit **demselben** Vertex-Shader — Quelle mit aufgelösten Includes,
+Prefix-Defines (`USESSBO`, `WAVINGSTUFF` …), Include-Menge (an ihr hängt, welche Uniforms
+`Use()` setzt) und Attribut-Bindungen werden aus dem **laufenden** Engine-Programm kopiert,
+also auch ein von einem Shader-Mod ersetzter Vertex-Shader — und einem leeren
+Fragment-Shader. Der Dateiname muss mit „chunk" beginnen: `Shader.UsesSSBOs()` entscheidet
+am Namen, nicht am Code, ob die Version für den SSBO-Pfad auf 430 gehoben wird. Beide
+Varianten (USESSBO 0/1) wurden offline mit `glslangValidator` gelinkt.
+
+Der Transpiler auf `RenderShadow` ersetzt jetzt vier Aufrufe: das erste `GlDisableCullFace`
+→ `BeginSolidPasses` (Culling + Programmwechsel: `Stop()` auf dem Engine-Programm, weil
+`Use()` ein anderes laufendes Programm verweigert; dann `mvpMatrix` aus
+`ClientMain.shadowMvpMatrix` und die Subpixel-Paddings), das zweite → `EndSolidPasses`
+(No-Cull für Laub, Engine-Programm zurück), und die ersten zwei von genau vier
+`Tex2d2D`-Bindings → `SetSolidTexture`, das bei aktivem Depth-only-Programm nichts tut: die
+Uniform-Location des Engine-Programms auf unserem wäre ein GL-Fehler pro Pool. Zwei plus vier
+müssen es sein, in dieser Reihenfolge, sonst wirft der Patch. Das Programm entsteht beim
+ersten Schattenpass (Render-Thread, GL-Kontext), fällt bei jedem `ReloadShader`-Event und
+wird aus dem dann aktuellen Engine-Programm neu gebaut; scheitert der Compile, bleibt das
+Engine-Programm, und der Report sagt `depth-only shader NOT live (…)`. `.komet toggle
+shadowdepth`, Stress-Phase „shadow depth-only shader off", Safemode aus.
+
+### Was bleibt, und woran es hängt
+
+Die Ruckler dieser Szene sind GC: 111 ms/s Pausen, 25 gen0/s, `promoted 89 MB/s` bei
+196 MB/s Allokation, davon 92 auf dem Server (worldgen 28, chunkdb 25, tick 23) — die Kosten,
+mit 100 m/s in ungenerierte Welt zu fliegen. Die Launcher-Notiz vom 30.08. hat `GCgen0size`
+schon vermessen und verworfen (weniger, aber längere Pausen); der Hebel „weniger Überlebende"
+ist strukturell: Chunk-Daten überleben, weil sie leben. Im Hauptthread bleibt `opaque 4,1 ms`
+bei 1,2 ms Sweep unattribuiert — `.komet toggle profiler` nennt die Renderer, und der
+Sonnen-Occlusion-Sync (`SunOcclusionQueryInterval`, seit 1.28.3 auf 1) ist in einer
+CPU-gebundenen Szene der erste Kandidat: `.komet toggle sunquery` ist live.
+
+## Mod-Profiler: welcher Mod kostet was — und was tut er (05.09.)
+
+Jede Attribution in dieser Mod nennt bisher ein Stück **Engine**: eine Stage, einen Renderer,
+einen Tick-Listener, einen Task-Code. Keine davon beantwortet die Frage, die jemand mit vierzig
+installierten Mods tatsächlich stellt — *welcher von meinen ist es*. Die Namen in diesen
+Tabellen sind Typen, und ein Typ sagt nichts über seinen Absender, solange ihn niemand
+zurückbildet.
+
+Genau das ist der ganze Mechanismus: Ein Typ nennt seine Assembly, und der Mod-Loader weiß, zu
+welchem Mod jede Assembly gehört (`ModContainer.Assembly`, plus die Assemblies der ModSystems —
+ein Mod darf mehrere DLLs mitbringen). Aus `Renderer-Instanz → Typ → Assembly → Mod` wird eine
+Zuordnung, die kein Rätselraten ist.
+
+**Gemessen wird nichts Neues.** Die beiden Dekoratoren, die es schon gibt (`RendererProfiler`,
+`TickProfiler`), lösen beim Wickeln **einmal** ihren Mod auf und buchen ihre Ticks zusätzlich in
+dessen Bucket. Der Preis der kompletten Mod-Attribution ist damit ein Feld-Add pro gemessenem
+Aufruf — der Rest war ohnehin bezahlt. Die Faltung folgt der jeweiligen Kadenz: Render-Ticks
+werden nur auf gemessenen Frames gefaltet (der Renderer-Profiler misst jeden vierten), Tick-Ticks
+auf jedem. Andersherum stünde jeder Mod bei einem Viertel seiner Kosten.
+
+**Was der Profiler nicht sehen kann, steht auf dem HUD** statt weggelassen zu sein:
+
+* **Harmony-Patches.** Ein Patch läuft *innerhalb* der Methode, die er patcht — seine Zeit ist
+  Teil von deren Zeit, und es gibt keinen ehrlichen Weg, sie herauszurechnen, ohne jeden fremden
+  Patch selbst zu patchen. Deshalb steht die Patch-**Inventur** neben den Millisekunden: wie
+  viele Methoden ein Mod patcht, wie viele davon fremder Code sind, wie viele Transpiler
+  dabei sind. Ein Mod mit dreißig Transpilern in heißen Engine-Methoden ist ein Verdächtiger,
+  auch wenn seine gemessene Zeit 0,00 ms ist.
+* **Block-Entity-Ticks** (die tausenden Listener, die der Tick-Profiler bewusst in Ruhe lässt)
+  und alles, was ein Mod auf eigenen Threads tut.
+* **GUI-Dialoge**: die Engine zeichnet alle Dialoge in *einem* eigenen Renderer, ein Mod-Dialog
+  landet also unter `guimanager`.
+* Mit ausgeschaltetem Renderer-Profiler — dem Standard — ist überhaupt nur die Before-Stage
+  gewickelt. Das HUD sagt das in **beiden** Ansichten dazu, statt einen Bruchteil der Wahrheit
+  als ganze zu zeigen.
+
+### Ladezeit pro Mod
+
+Jeder ModSystem-Lebenszyklus-Aufruf geht durch eine einzige private Methode,
+`ModLoader.TryRunModPhase(mod, system, api, phase)`. Ein Prefix/Postfix-Paar darum ist die
+gesamte Messung — ein paar hundert Aufrufe pro Sitzung, zwei Stopwatch-Reads je Aufruf — und
+beantwortet „warum dauert der Ladebildschirm zwei Minuten" pro Mod und pro Phase. Gepatcht wird
+aus Komets eigenem `Start`, das selbst in so einem Aufruf steckt: Komet lädt bei
+`ExecuteOrder 0.05`, gemessen ist also alles danach; der Report sagt das dazu, statt die Tabelle
+als vollständig auszugeben. Der integrierte Server hat seinen eigenen Loader auf seinem eigenen
+Thread, und im Singleplayer wartet man auf den genauso — beide Seiten werden getrennt gebucht.
+Weil die Phasen laufen, *bevor* es einen Index gibt, werden sie unter Mod-Id geparkt und beim
+Indexbau übernommen; der Index selbst entsteht unter demselben Lock, weil sonst der Server-Thread
+in eine Dictionary schaut, die der Main-Thread gerade neu aufbaut.
+
+Harmony bindet Patch-Parameter **über den Namen**, die Schreibweise des Loaders ist damit Teil
+des Vertrags — verify pinnt sie (`mod,system,api,phase`), damit eine Umbenennung im nächsten
+Spiel-Update beim Bauen auffällt und nicht als „could not enable" im Log eines Spielers.
+
+### Das Mod-HUD
+
+Ein **zweites** Overlay in der gegenüberliegenden Bildschirmecke, **Shift+F7** in drei Stufen
+aus → kompakt → voll wie F7. Die shift-Variante der Taste, die diese Mod ohnehin besitzt, statt
+einer eigenen: die frei aussehenden Tasten sind nicht frei (F6 war zuerst gebunden und ist ein
+Minimap-Makro). Kollidieren können die beiden nicht — `HotKey.DidPress` vergleicht die
+Modifier **exakt**, und `HotkeyManager.TriggerHotKey` läuft diesen Durchgang über alle Hotkeys
+komplett durch, bevor überhaupt der Modifier-ignorierende Fallback-Durchgang startet; der
+erste exakte Treffer beendet die Auslieferung. Die Zyklus-Regel ist dieselbe wie bei F7
+(`DebugHud.CycleF7`, pur, von verify gepinnt) — zwei Overlays, die sich verschieden verhalten,
+wären die eigentliche Überraschung. `.komet mods hud` macht dasselbe für alle, die lieber
+tippen oder die Taste umbelegen. Es erbt die Maschinerie des Performance-HUDs unverändert
+(`DebugHud` ist jetzt Basisklasse, `ModHud` ersetzt nur `ComposeText` und `SampleWorld`):
+Cairo-Raster im Worker, adaptive Rebuild-Kadenz, die Zustandsmaschine gegen das Flackern beim
+Ansichtswechsel. Was pro Overlay ist, ist Instanz-Zustand (Textur, Surface, Kadenz); statisch
+blieb nur, was über die **Maschine** gilt — dass Cairo hier keinen Worker mag, was ein Rebuild
+hier kostet.
+
+Der Inhalt: `pro frame` (Anteil, ms, Balken, Quelle), `was sie tun` (Patches, fremde Patches,
+Transpiler, registrierte Klassen; in der Wertespalte `Renderer/Listener`), `beim laden`
+(Sekunden, teuerste Phase) und `nicht zugeordnet` — die Liste von oben. Vanilla-Inhalt
+(`survival`, `game`) steht mit `*` markiert in der Tabelle: er ist oft der teuerste Posten, aber
+Deinstallieren ist keine Option, die ein Spieler hat. `.komet mods` gibt dasselbe als Text aus
+(englisch, wie jedes Diagnose-Artefakt hier), `.komet report` trägt es mit, `ProfileMods` und
+`ModHudVisible` konfigurieren es (Config-Layout 14). Das Performance-HUD bekommt eine einzige
+Zeile `mods` mit der Summe und dem Verweis auf Shift+F7 — wer die Frame-Aufteilung liest, soll
+nie raten müssen, ob Mods in diesen Zahlen stecken.
+
+## Der Deckungsrand: warum die Schatten-Drossel beim Gehen nichts gespart hat (05.09.)
+
+Die ferne Kaskade wird seit 1.43.0 nur alle zwei bis vier Frames neu gezeichnet und dazwischen
+**exakt reprojiziert** (`OffsetShadowMatrix`, von verify gepinnt). Das klingt nach drei Vierteln
+Ersparnis und war keine. Der Kommentar in `ShadowThrottlePatches` sagt selbst, warum:
+
+> Compensating the sampling matrix keeps a retained map correctly *positioned*, but it cannot
+> extend what the map *covers*.
+
+Die behaltene Tiefentextur enthält genau das Volumen, für das sie gezeichnet wurde. Verlässt die
+Kamera dieses Volumen, laufen die Sample-Koordinaten aus `[0,03, 0,97]` heraus, und dort schneidet
+`shadowcoords.vsh` den Schatten hart ab, statt ihn auszublenden — eine sichtbare Kante, die beim
+nächsten Neuzeichnen springt. Deshalb erzwang `ShadowFarMoveThreshold = 0,15 Blöcke` ein
+Neuzeichnen, sobald sich jemand bewegt: bei 85 fps sind das beim Gehen etwa drei Frames, beim
+Fliegen (100 m/s ≈ 1,2 Blöcke je Frame) **jeder** Frame. Die Drossel sparte ausschließlich im
+Stand — also genau dann, wenn niemand sie braucht. Der Kommentar der Stress-Phase stand seit
+Monaten daneben und sagte es wörtlich: „While moving it saves nothing by design".
+
+### Die fehlende Größe ist Deckung, und die ist berechenbar
+
+Komets Box ist eine **Kugel um die Kamera** (`MakeBoxSymmetric`, Halbgröße
+`BoxRadiusFactor × R` = `0,90/0,94 × R`). Für Kugeln ist die Frage trivial: eine Kugel mit Radius
+`r + m` um C₀ enthält die Kugel mit Radius `r` um **jede** Kameraposition, die höchstens `m` von
+C₀ entfernt ist. Also wird die ferne Box um `ShadowFarBoxMargin` Blöcke breiter gezeichnet, und
+die Bewegungsgrenze der Drossel steigt im selben Zug auf `0,9 × m`
+(`ShadowThrottlePatches.MoveLimitFor`, pur, damit verify sie festnageln kann). Die ferne Kaskade
+aktualisiert dann bei `ShadowFarMaxSkip` — beim Stehen, beim Gehen und beim Fliegen gleichermaßen.
+
+Der Rand darf **nicht** in `ShadowBox.SHADOW_DISTANCE` fließen, und das ist der eine Fallstrick:
+`MatchFadeToBox` leitet die Fade-Reichweite des Shaders (`ShadowRangeFar`) genau daraus ab. Wächst
+die Box über die Distanz, wächst die Ausblendung mit — und die zusätzliche Deckung wird von der
+Ausblendung aufgefressen, die sie überleben sollte. Gerechnet: mit der Randbedingung
+`0,94 · Halbgröße ≥ 0,90 · R + d` bleibt bei mitwachsendem R exakt `d ≤ 0` übrig. Der Rand kommt
+deshalb erst in `MakeBoxSymmetric` dazu, und dann steht `d ≤ 0,94 m` da.
+
+Zwei Dinge mussten mitwachsen, sonst ist die Kante sofort da statt in vier Frames:
+
+* die **Cull-Reichweiten** des Sweeps. `PrepareForShadowRendering` setzt
+  `shadowRangeX/Z` aus der Schattendistanz — einen Schritt *bevor* der Box-Postfix die Box
+  verbreitert. Ohne Nachziehen wäre der Ring, den der Rand gerade hinzugefügt hat, leer gecullt.
+  Ein Postfix (`PadCullRange`) addiert den Rand auf beide Reichweiten.
+* der **Rand selbst muss mit der Box sterben**. `ShadowThrottlePatches.CoverageMargin` liest
+  `ShadowPatches.EffectiveFarBoxMargin` direkt statt eine Kopie zu halten: Safemode und
+  `.komet toggle shadowbox` stellen Vanillas Kegel wieder her, und eine Bewegungsgrenze, die ihre
+  Box überlebt, ist wieder genau die Abrisskante. `ToVanilla`/`ToConfigured` erzwingen zusätzlich
+  ein Neuzeichnen (`Invalidate`), weil die gerade behaltene Karte für die neue Boxgröße nicht mehr
+  passt.
+
+### Preis und Nachweis
+
+Der Preis ist Texeldichte: 16 Blöcke auf einer ~255-Block-Kaskade sind +6,6 % Boxbreite, also
+−6,2 % Texel je Block (14,7 → 13,8 bei 7168 px). Der zweite Posten ist der Tiefen-Bias:
+`fogandlight.fsh` zieht konstant 0,0009 in normalisierter Tiefe ab, also 0,0009 × Boxtiefe in
+Blöcken — die Boxtiefe wächst um dieselben 32 Blöcke, der Bias damit von ~0,56 auf ~0,59 Blöcke.
+Das ist die Größe, die 1.42.1 einmal Laub-Schatten gekostet hat, damals aber um den Faktor √3
+(die Würfelhülle), nicht um 5 %; unter der Dicke eines Laubblocks bleibt es mit Abstand. Dafür fällt die ferne Kaskade beim Bewegen von
+„jeder Frame" auf „jeder vierte" — bei den gemessenen 5,7 ms je gezeichnetem Frame ist das die
+mit Abstand größte verbliebene GPU-Position dieser Szene.
+
+Der verify-Test prüft die Eigenschaft, nicht die Zahl: 4000 Kamerapositionen auf und in der Kugel
+mit Radius `MoveLimit`, dazu je ein Punkt auf der Fade-Kugel um die **verschobene** Kamera, und
+alle müssen im Band `uv ∈ [0,03, 0,97]` der bei C₀ gezeichneten Box liegen. Dazu eine
+Gegenprobe: mit der ungeränderten Box muss dieselbe Bewegung das Band **verlassen**, sonst kauft
+der Rand nichts. Und drittens, dass `EffectiveFarBoxMargin` und damit `MoveLimit` nach
+`ToVanilla()` wieder auf dem nackten Schwellwert stehen.
+
+HUD: `schatten-takt … · neu nach 14,4 Blöcken`. Report: `far cadence: N von M Frames gezeichnet
+(X % gespart), every 2-4 frames, redraw after 14,4 blocks of camera movement (coverage margin
+16)`. Live: `.komet toggle shadowmargin`, Stress-Phase „far shadow coverage margin off (redraw on
+every step)" — die Phase ist die, die man **im Flug** liest, nicht im Stand.

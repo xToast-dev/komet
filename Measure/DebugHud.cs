@@ -17,6 +17,15 @@ namespace Komet.Measure;
 /// both report the same things the same way. A mod can append its own section through
 /// <see cref="ExtraSection"/>.
 ///
+/// It is also the overlay MACHINERY for the second HUD: <see cref="Komet.Measure.ModHud"/>
+/// derives from this and replaces only <see cref="ComposeText"/> and <see cref="SampleWorld"/>.
+/// Everything that was hard to get right here - the off-thread raster, the state machine that
+/// keeps a view change from flashing the previous view, the adaptive rebuild interval, the
+/// "an overlay must never become the stutter it reports" guard - is paid for once and holds
+/// for both. What is per-overlay is per-instance (texture, surface, cadence); only the
+/// conclusions that are about the MACHINE (cairo refused a worker thread, what a rebuild
+/// costs here) stayed static.
+///
 /// Renders in the Ortho stage just under the GUI manager, so it sits above the world but
 /// below dialogs. The text is regenerated a few times a second into a single reused texture -
 /// rebuilding it every frame would cost more than everything it reports.
@@ -37,6 +46,14 @@ public class DebugHud : IRenderer
 
     private readonly ICoreClientAPI capi;
     private readonly string title;
+
+    /// <summary>The overlay's heading - subclasses compose their own text and need it.</summary>
+    protected string Title => title;
+
+    /// <summary>Draw against the left screen edge instead of the right one. Two overlays on
+    /// the same edge would sit on top of each other, and the mod HUD is the one that moves:
+    /// the performance HUD's corner is what every screenshot in this project shows.</summary>
+    protected bool AnchorLeft;
 
     /// <summary>Extra rows appended after the built-in sections (full view only).</summary>
     public SectionWriter ExtraSection;
@@ -115,9 +132,17 @@ public class DebugHud : IRenderer
     private int lineHeight;
     private float metricsScale = -1;
 
-    // Static because the text sections that report them are static; there is only ever one
-    // overlay per process (the baseline refuses to load next to the mod).
-    private static float rebuildInterval = 0.25f;
+    /// <summary>How long until this overlay rebuilds its text, adapted to what a rebuild costs
+    /// (see <see cref="NextIntervalSeconds"/>). Per instance: the mod HUD's text is more
+    /// expensive to compose than the performance HUD's, and it must not slow the other one down.</summary>
+    private float rebuildInterval = 0.25f;
+
+    /// <summary>This overlay's own smoothed rebuild cost - what its cadence is derived from.</summary>
+    private double avgRebuildMs;
+
+    /// <summary>The cadence the report row prints, from whichever overlay last rebuilt. The row
+    /// is about the machine ("a rebuild costs 40 ms here"), not about one of the two boxes.</summary>
+    private static float lastInterval = 0.25f;
 
     /// <summary>What one text rebuild (world sample + Cairo raster + texture upload) costs
     /// on THIS machine, smoothed. On the dev box it is ~1-2 ms; a Windows tester's i7-4770 +
@@ -259,7 +284,7 @@ public class DebugHud : IRenderer
 
         if (texture.TextureId == 0) return;
 
-        float x = capi.Render.FrameWidth - texture.Width - 8;
+        float x = AnchorLeft ? 8 : capi.Render.FrameWidth - texture.Width - 8;
         capi.Render.Render2DTexturePremultipliedAlpha(texture.TextureId, x, 8, texture.Width, texture.Height);
     }
 
@@ -271,7 +296,7 @@ public class DebugHud : IRenderer
         var t0 = Stopwatch.GetTimestamp();
         SampleWorld();
         ProbeMetrics();
-        var text = Compose();
+        var text = ComposeText();
         if (text != lastText || texture.TextureId == 0)
         {
             lastText = text;
@@ -298,7 +323,7 @@ public class DebugHud : IRenderer
         var t0 = Stopwatch.GetTimestamp();
         SampleWorld();
         ProbeMetrics();
-        var text = Compose();
+        var text = ComposeText();
         if (text == lastText && texture.TextureId != 0)
         {
             var ms0 = ElapsedMs(t0);
@@ -357,9 +382,11 @@ public class DebugHud : IRenderer
     /// interval paces on, so a slow machine backs off whether or not it rasters off-thread.</summary>
     private void FoldRebuild(double totalMs)
     {
+        avgRebuildMs = avgRebuildMs <= 0 ? totalMs : avgRebuildMs * 0.8 + totalMs * 0.2;
         AvgRebuildMs = AvgRebuildMs <= 0 ? totalMs : AvgRebuildMs * 0.8 + totalMs * 0.2;
         StatRebuilds++;
-        rebuildInterval = (float)NextIntervalSeconds(AvgRebuildMs);
+        rebuildInterval = (float)NextIntervalSeconds(avgRebuildMs);
+        lastInterval = rebuildInterval;
     }
 
     private static double ElapsedMs(long fromTimestamp)
@@ -374,8 +401,9 @@ public class DebugHud : IRenderer
     public static double NextIntervalSeconds(double avgCostMs)
         => Math.Clamp(avgCostMs * 0.025, 0.25, 2.0);
 
-    /// <summary>Walks every mesh pool, so only worth doing a few times a second.</summary>
-    private void SampleWorld()
+    /// <summary>Walks every mesh pool, so only worth doing a few times a second. Virtual: an
+    /// overlay that reports something other than the terrain has nothing to sample here.</summary>
+    protected virtual void SampleWorld()
     {
         try
         {
@@ -477,7 +505,7 @@ public class DebugHud : IRenderer
         // Content sits in the surface's right-bottom-padded corner: right-anchored so the box
         // hugs the screen edge even though the surface is wider than the text, top-anchored
         // with transparent (invisible) slack below.
-        double xOff = surface.Width - width;
+        double xOff = AnchorLeft ? 0.0 : surface.Width - width;
         ctx.SetSourceRGBA(background.FillColor[0], background.FillColor[1],
             background.FillColor[2], background.FillColor[3]);
         GuiElement.RoundRectangle(ctx, xOff, 0.0, width, height, background.Radius);
@@ -644,7 +672,9 @@ public class DebugHud : IRenderer
         return sb.ToString();
     }
 
-    private string Compose()
+    /// <summary>The text this overlay shows. Virtual so a second overlay can be a different
+    /// instrument without a second copy of everything below it.</summary>
+    protected virtual string ComposeText()
         => Compact
             ? ComposeCompact(title, ExtraCompactSection)
             : Compose(title, drawCallsPerFrame, ClientSettings.ViewDistance, vramBytes, poolCount,
@@ -881,7 +911,7 @@ public class DebugHud : IRenderer
         if (AvgRebuildMs >= 0.05)
             Row(sb, Loc.Hud("hud rebuild"), null, Ms(AvgRebuildMs),
                 Loc.T("komet:hud-rebuild", "every {0} s · upload {1} ms",
-                    rebuildInterval.ToString("0.##", ci), AvgUploadMs.ToString("F1", ci))
+                    lastInterval.ToString("0.##", ci), AvgUploadMs.ToString("F1", ci))
                 + (BackgroundRaster && !rasterBroken ? Loc.T("komet:hud-raster-worker", " · raster in worker") : ""));
 
         extra?.Invoke(sb, frame);

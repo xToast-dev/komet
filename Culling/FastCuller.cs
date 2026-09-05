@@ -63,7 +63,17 @@ public static class FastCuller
     /// one by distance (LOD 3 only beyond lod2Bias, 640 blocks by default). The shadow passes
     /// apply no distance rule at all, so inside the shadow box - at most ~415 blocks - they
     /// rasterise *both* into the shadow map. This makes the shadow pass agree with the camera
-    /// pass. Off by default because it does change what vanilla draws.
+    /// pass.
+    ///
+    /// Decided per CELL since 05.09., not per pool: a pool holds parts from wherever they
+    /// were tesselated, so "the whole pool is nearer than lod2Bias" rarely held once the
+    /// world had streamed in, and the option saved nothing in the field ("lod3 in" on every
+    /// report). A cell's box bounds every part in it, so its farthest corner nearer than
+    /// lod2Bias means every part's centre is - the same exactness, at a granularity where it
+    /// actually fires. The CONFIG default is on since the same date (the stand-in is only ever
+    /// dropped where its detailed twin is already in the map, so the shadow can only get closer
+    /// to what the camera shows); the field itself starts off, so the harness and the bench
+    /// compare the sweep byte-identical against vanilla until a test opts in.
     /// </summary>
     public static bool ShadowSkipRedundantLod;
 
@@ -1721,16 +1731,19 @@ public static class FastCuller
         var farPass = mode == EnumFrustumCullMode.CullInstantShadowPassFar;
         var shadowMode = farPass || mode == EnumFrustumCullMode.CullInstantShadowPassNear;
 
-        // The LOD 3 stand-in is only ever drawn beyond lod2Bias. If the whole pool is nearer
+        // The LOD 3 stand-in is only ever drawn beyond lod2Bias. If a whole cell is nearer
         // than that, every LOD 3 part in it is geometry the camera pass does not draw, and
         // whose detailed counterpart (LOD 1 or LOD 2) is already in this shadow map. Testing
-        // the pool's farthest corner keeps it exact: one comparison for the whole sweep.
-        var skipLod3 = false;
-        if (shadowMode && ShadowSkipRedundantLod && c.HasBox)
+        // the box's farthest corner keeps it exact. The pool's box answers it for the whole
+        // sweep when it can; otherwise each cell asks for itself below - two abs and two
+        // multiplies per cell, against a whole bucket of parts rasterised twice.
+        var lod3Rule = shadowMode && ShadowSkipRedundantLod;
+        var skipLod3Pool = false;
+        if (lod3Rule && c.HasBox)
         {
             var fx = Math.Max(Math.Abs(px - c.MinX), Math.Abs(px - c.MaxX));
             var fz = Math.Max(Math.Abs(pz - c.MinZ), Math.Abs(pz - c.MaxZ));
-            skipLod3 = fx * fx + fz * fz <= culler.lod2BiasSq;
+            skipLod3Pool = fx * fx + fz * fz <= culler.lod2BiasSq;
         }
         float ppx = ppos.X, ppz = ppos.Z;
         var rangeX = culler.shadowRangeX;
@@ -1790,6 +1803,7 @@ public static class FastCuller
                 }
             }
 
+            var skipLod3 = skipLod3Pool;
             if (shadowMode)
             {
                 // nearest distance from the player to the cell box, per axis
@@ -1797,6 +1811,15 @@ public static class FastCuller
                 double nearZ = Math.Abs(ppz - ccz) - chz;
                 // one block of slack so rounding can never reject a cell that still has a part
                 if (nearX - 1.0 >= rangeX || nearZ - 1.0 >= rangeZ) { cellsSkipped++; continue; }
+
+                // the cell's farthest corner from the player, the same way the camera pass
+                // measures LOD (horizontal distance from the block position)
+                if (lod3Rule && !skipLod3)
+                {
+                    var farX = Math.Abs(px - ccx) + chx;
+                    var farZ = Math.Abs(pz - ccz) + chz;
+                    skipLod3 = farX * farX + farZ * farZ <= culler.lod2BiasSq;
+                }
             }
 
             double cellMinSq = 0, cellMaxSq = 0;
@@ -2000,7 +2023,14 @@ public static class FastCuller
             else if (shadowMode)
             {
                 if (farPass && lodLevel < 1) continue;
-                if (skipLod3 && lv == 3) continue;
+                if (lv == 3 && lod3Rule)
+                {
+                    // no cell to answer for it: the part's own far corner, same rule
+                    if (skipLod3Pool) continue;
+                    var farX = Math.Abs(px - x) + c.OverGeo[g + 3];
+                    var farZ = Math.Abs(pz - z) + c.OverGeo[g + 5];
+                    if (farX * farX + farZ * farZ <= culler.lod2BiasSq) continue;
+                }
                 visible = Math.Abs(ppx - x) < rangeX
                        && Math.Abs(ppz - z) < rangeZ
                        && (poolFullyInside

@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using OpenTK.Graphics.OpenGL;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
+using Vintagestory.API.Client;
 using Vintagestory.Client.NoObf;
 
 
@@ -44,6 +46,24 @@ namespace Komet.Patches;
 /// pointless rebuild of every framebuffer at world join). Fill rate on an integrated GPU is the
 /// one resource this patch spends, so it now spends it only where the player has already
 /// spent everything the menu offers.
+///
+/// Second job since 05.09.: the NEAR cascade gets a map of its own size. The engine allocates
+/// both cascades from one expression, so the near map is as large as the far one - 7168 px
+/// with one extra step - while it covers only the ~60 x 34 blocks of vanilla's near wedge
+/// (39 blocks at quality 4, FoV 70, 16:9). That is well over a hundred texels per block on an
+/// axis, against the far cascade's fifteen, and the GPU report priced it: `near 5,8 ms` of an
+/// 8,9 ms GPU frame, for a cascade that draws a few dozen chunks. A depth pass costs texels
+/// times depth complexity, not chunks, and 7168 squared is 51 million texels to clear, test
+/// and write for every frame. <see cref="NearMapSize"/> re-specifies the near depth texture
+/// after the engine built it - one TexImage2D on the texture the framebuffer already holds -
+/// and the near pass costs (size/7168)^2 of what it did: 4096 is a third, 3072 a fifth.
+///
+/// What stays the same: the PCF sample spacing. fogandlight.fsh takes shadowMapWidthInv from
+/// the FAR framebuffer for both cascades, so a smaller near map is sampled with taps that are
+/// less than a near texel apart and its 3x3 kernel spans a little over two near texels instead
+/// of three. The penumbra gets slightly crisper - at 4096 px it is about the width vanilla has
+/// at quality 2, which uses a 4096 map for a 33-block near range. The texel snapping is told
+/// which cascade it quantises for, since the two grids now differ.
 /// </summary>
 public static class ShadowResPatches
 {
@@ -74,16 +94,156 @@ public static class ShadowResPatches
     public static int EffectiveMapSize
         => ShadowMapSize > 0 ? ShadowMapSize : Math.Max(4, ClientSettings.ShadowMapQuality + 2) * 1024;
 
-    public static void Apply(Harmony harmony, int extraSteps)
+    // ---- the near cascade's own map ---------------------------------------------------
+
+    /// <summary>Edge length the near shadow map is re-specified to, in pixels. 0 = leave it at
+    /// the far map's size (exactly what the engine does). Live: <see cref="TryResizeNear"/>.</summary>
+    public static int NearMapSize;
+
+    /// <summary>Smallest and largest near map this will build. 512 is the floor below which a
+    /// 39-block cascade drops under a texel per centimetre-scale block detail; 16384 is a
+    /// common GL_MAX_TEXTURE_SIZE.</summary>
+    internal const int NearMapMin = 512, NearMapMax = 16384;
+
+    /// <summary>The rule, pure: the engine's size in, the size to allocate out. Rounded to a
+    /// multiple of 64 so the projection's texel arithmetic stays tidy, never below the floor,
+    /// never above the ceiling, and 0 (or anything below) means "as the engine built it".</summary>
+    internal static int NearSizeFor(int engineSize, int configured)
+    {
+        if (configured <= 0) return engineSize;
+        var size = Math.Clamp(configured, NearMapMin, NearMapMax);
+        return (size + 32) / 64 * 64;
+    }
+
+    /// <summary>Edge length the near map really has after the setup postfix ran, 0 while it
+    /// has not (then the near map is the engine's, i.e. the far map's size).</summary>
+    public static int NearMapSizeApplied { get; private set; }
+
+    /// <summary>True once the setup postfix has seen a framebuffer list - the proof the resize
+    /// had its chance, which the forced rebuild at world join needs to know.</summary>
+    public static bool NearSetupRan { get; private set; }
+
+    /// <summary>The near map's real edge length, patched or not. Same contract as
+    /// <see cref="EffectiveMapSize"/>, for the near cascade.</summary>
+    public static int EffectiveNearMapSize
+        => NearMapSizeApplied > 0 ? NearMapSizeApplied : EffectiveMapSize;
+
+    public static void Apply(Harmony harmony, int extraSteps, int nearMapSize = 0)
     {
         ExtraSteps = Math.Clamp(extraSteps, 0, 4);
-        if (ExtraSteps == 0) return;
+        NearMapSize = nearMapSize;
 
         var setup = AccessTools.Method(typeof(ClientPlatformWindows), "SetupDefaultFrameBuffers")
                     ?? throw new InvalidOperationException("SetupDefaultFrameBuffers not found");
 
-        harmony.Patch(setup, transpiler: new HarmonyMethod(
-            AccessTools.Method(typeof(ShadowResPatches), nameof(EnlargeShadowMaps))));
+        // The near-map postfix goes on whatever the config says: it is gated by NearMapSize at
+        // run time, and '.komet shadownear' has to be able to switch a size on in a session
+        // that started with 0 - a patch that was never applied cannot be enabled by a field
+        // write. The transpiler stays conditional: with no extra step it would rewrite the
+        // method to compute exactly what it computes anyway.
+        harmony.Patch(setup,
+            transpiler: ExtraSteps > 0
+                ? new HarmonyMethod(AccessTools.Method(typeof(ShadowResPatches), nameof(EnlargeShadowMaps)))
+                : null,
+            postfix: new HarmonyMethod(AccessTools.Method(typeof(ShadowResPatches), nameof(ResizeNearMap))));
+    }
+
+    /// <summary>
+    /// Runs after the engine built every framebuffer. The near shadow map (slot 12) is a
+    /// depth texture the engine allocated at the far map's size; re-specifying the same
+    /// texture object at the configured size keeps the framebuffer attachment (it refers to
+    /// the object, not to a size) and costs one TexImage2D. Width and Height on the ref are
+    /// what ClearFrameBuffer sets the viewport from, so they follow. The far map (slot 11) is
+    /// never touched: the shader takes its PCF spacing from it.
+    ///
+    /// Completeness is checked once, here at setup - that is one returning GL call per
+    /// rebuild, not per frame - and a framebuffer the driver will not accept at the new size
+    /// is put back to the engine's before anything renders into it.
+    /// </summary>
+    public static void ResizeNearMap(System.Collections.Generic.List<FrameBufferRef> __result)
+    {
+        NearSetupRan = true;
+        NearMapSizeApplied = 0;
+        if (NearMapSize <= 0 || __result == null || __result.Count <= (int)EnumFrameBuffer.ShadowmapNear) return;
+
+        var near = __result[(int)EnumFrameBuffer.ShadowmapNear];
+        // no near cascade at quality <= 1, no shadows at 0: nothing to resize
+        if (near == null || near.DepthTextureId == 0 || near.Width <= 0) return;
+
+        var target = NearSizeFor(near.Width, NearMapSize);
+        if (target == near.Width && target == near.Height)
+        {
+            NearMapSizeApplied = target;
+            return;
+        }
+
+        int oldW = near.Width, oldH = near.Height;
+        try
+        {
+            SpecifyDepthTexture(near.DepthTextureId, target, target);
+            near.Width = target;
+            near.Height = target;
+
+            // The engine's setup leaves this very framebuffer bound (it was the last one it
+            // attached to), and its LoadFrameBuffer rebinds unconditionally on every switch,
+            // so binding it here for the check changes no state anyone relies on.
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, near.FboId);
+            var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
+            if (status != FramebufferErrorCode.FramebufferComplete)
+            {
+                SpecifyDepthTexture(near.DepthTextureId, oldW, oldH);
+                near.Width = oldW;
+                near.Height = oldH;
+                LastNearError = $"framebuffer {status} at {target}px, kept {oldW}px";
+                return;
+            }
+            NearMapSizeApplied = target;
+            LastNearError = null;
+        }
+        catch (Exception e)
+        {
+            // never let a resize take the shadow pass down: back to the engine's size
+            try { SpecifyDepthTexture(near.DepthTextureId, oldW, oldH); } catch (Exception) { /* nothing more to do */ }
+            near.Width = oldW;
+            near.Height = oldH;
+            LastNearError = e.GetType().Name;
+        }
+    }
+
+    /// <summary>Why the last near-map resize was refused, for the log; null when it worked.</summary>
+    public static string LastNearError { get; private set; }
+
+    /// <summary>The engine's own allocation for a shadow depth texture, same format and no
+    /// data: GL_DEPTH_COMPONENT32 (33191), GL_DEPTH_COMPONENT (6402), GL_FLOAT (5126). The
+    /// sampler parameters (compare mode, clamp, border) live on the texture object and are
+    /// untouched by a re-specification.</summary>
+    private static void SpecifyDepthTexture(int textureId, int width, int height)
+    {
+        GL.BindTexture(TextureTarget.Texture2D, textureId);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, (PixelInternalFormat)33191, width, height, 0,
+            (PixelFormat)6402, (PixelType)5126, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// Changes the near map's size in a running session: sets the target and rebuilds the
+    /// framebuffers the way the engine does after a settings change, which runs the setup
+    /// postfix. Returns the outcome as a sentence for the chat.
+    /// </summary>
+    public static string TryResizeNear(ClientPlatformWindows platform, int size)
+    {
+        NearMapSize = size;
+        NearSetupRan = false;
+        if (platform == null) return "no platform - not in a world?";
+        if (ClientSettings.ShadowMapQuality <= 1)
+            return "no near cascade at shadow quality " + ClientSettings.ShadowMapQuality + " (needs 2 or higher) - the size is stored and applies once it exists";
+
+        var done = TryForceRebuild(platform, null, out var blockedBy);
+        if (!done) return "cannot rebuild the framebuffers right now (" + (blockedBy ?? "unknown") + ") - the size applies at the next rebuild";
+        if (!NearSetupRan) return "rebuild ran but the framebuffer setup was not reached - the size applies at the next rebuild";
+        if (LastNearError != null) return "near shadow map stays at " + EffectiveNearMapSize + "px: " + LastNearError;
+        return size <= 0
+            ? "near shadow map back to the engine's " + EffectiveNearMapSize + "px (same as the far map)"
+            : "near shadow map now " + NearMapSizeApplied + "px";
     }
 
     /// <summary>
@@ -152,21 +312,26 @@ public static class ShadowResPatches
     public static bool TryForceRebuild(ClientPlatformWindows platform, Action<string> log, out string blockedBy)
     {
         blockedBy = null;
-        if (ExtraSteps == 0 || ShadowMapSize > 0) return true;   // nothing to do / already real
-
-        // Below the slider's ceiling the transpiler would allocate the vanilla size anyway,
-        // so a forced rebuild - which recreates EVERY framebuffer, not just the shadow maps -
-        // would be a world-join hitch for nothing. Should the player raise the slider later,
-        // the engine's own rebuild runs the transpiler and the rule applies then.
         var quality = ClientSettings.ShadowMapQuality;
-        if (!AppliesAt(quality))
+
+        // Two reasons to rebuild, each with its own "already done" and its own gate. The
+        // extra step: below the slider's ceiling the transpiler would allocate the vanilla
+        // size anyway, so a forced rebuild - which recreates EVERY framebuffer, not just the
+        // shadow maps - would be a world-join hitch for nothing; should the player raise the
+        // slider later, the engine's own rebuild runs the transpiler and the rule applies
+        // then. The near map: only exists from quality 2, and only needs the rebuild once
+        // (NearSetupRan), whatever size it then decided on.
+        var stepsPending = ExtraSteps > 0 && ShadowMapSize == 0;
+        if (stepsPending && !AppliesAt(quality))
         {
             log?.Invoke(quality == 0
                 ? "shadows are off - the extra shadow map step waits until they are on and at quality 4"
                 : $"shadow quality {quality} is below the menu's ceiling (4), where the extra step applies - "
                   + $"raise the slider instead; the map stays at {Math.Max(4, quality + 2) * 1024}px");
-            return true;
+            stepsPending = false;
         }
+        var nearPending = NearMapSize > 0 && !NearSetupRan && quality > 1;
+        if (!stepsPending && !nearPending) return true;   // nothing to do / already real
         if (ShaderRegistry.SupressShaderAndBufferReloads)
         {
             blockedBy = "engine suppresses buffer reloads";
@@ -205,9 +370,14 @@ public static class ShadowResPatches
             return true;
         }
 
-        if (ShadowMapSize > 0)
+        if (ShadowMapSize > 0 || NearSetupRan)
         {
-            log?.Invoke($"shadow map framebuffers rebuilt at {ShadowMapSize}px (vanilla setup ran before the mod loaded)");
+            var near = NearMapSize > 0
+                ? (LastNearError != null
+                    ? $", near map stays {EffectiveNearMapSize}px ({LastNearError})"
+                    : $", near map {EffectiveNearMapSize}px")
+                : "";
+            log?.Invoke($"shadow map framebuffers rebuilt at {EffectiveMapSize}px{near} (vanilla setup ran before the mod loaded)");
             return true;
         }
         blockedBy = "rebuild ran but the shadow size expression was never reached";

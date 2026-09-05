@@ -12,7 +12,7 @@ namespace Komet.Measure;
 /// the firepit renderer from 0.6 to 4.9 ms - with the same firepits on screen. If the GPU is
 /// the bottleneck there, the extra milliseconds are back-pressure pooling wherever the most GL
 /// calls are issued, and no CPU work will fix them; if it is not, something CPU-side really
-/// did get five times slower. Until now the HUD's only GPU signal was "= ausserhalb", which
+/// did get five times slower. Until now the HUD's only GPU signal was "= außerhalb", which
 /// only catches waiting at the swap - back-pressure inside the stages was invisible.
 ///
 /// Mechanics: one GL_TIME_ELAPSED query spans each frame (begun in the Before stage, ended in
@@ -130,6 +130,30 @@ public static class GpuFrameTimer
     public static long StageSamples { get; private set; }
 
     /// <summary>
+    /// Asked at the end of every frame whether the far shadow cascade was actually drawn in
+    /// it. The mod hooks its throttle in here; without a hook every frame counts as drawn.
+    /// A throttled far cascade renders in one frame of two to four, and the plain per-stage
+    /// average then reads a third of the pass's real cost - "far 1,9" for a pass that takes
+    /// 5-6 ms whenever it runs. The report needs both numbers to judge the map size.
+    /// </summary>
+    public static Func<bool> FarCascadeDrawn;
+
+    /// <summary>Smoothed GPU milliseconds of the far cascade over the sampled frames in which
+    /// it was drawn, and how many such samples there were. 0 until one lands.</summary>
+    public static double FarDrawnGpuMs { get; private set; }
+    public static long FarDrawnSamples { get; private set; }
+
+    /// <summary>
+    /// The whole frame as the stamps see it: end stamp minus Before stamp, smoothed the same
+    /// way as the stages. The elapsed query and the stamps sample different frames (twice a
+    /// second against once), and in a hitching scene the two figures can drift apart - the
+    /// 05.09. report had the stage sum at 18 ms against an elapsed span of 9,7. Printed next
+    /// to the stage figures, this says whether they are to be read against the elapsed
+    /// figure at all, or against their own frame.
+    /// </summary>
+    public static double StampSpanMs { get; private set; }
+
+    /// <summary>
     /// The same ring idea for a set of timestamps per frame: which stages were stamped in
     /// each slot (a stage the engine skips this frame - the throttled far cascade, OIT off -
     /// simply has no stamp and no GPU time), and when a three-frames-old set is due.
@@ -143,6 +167,8 @@ public static class GpuFrameTimer
         private bool open;
         private double sinceRead;
         public readonly bool[][] Stamped = new bool[Depth][];
+        /// <summary>Per slot: whether the far cascade rendered in that frame (see <see cref="FarCascadeDrawn"/>).</summary>
+        public readonly bool[] FarDrawn = new bool[Depth];
 
         public StageRing()
         {
@@ -176,10 +202,11 @@ public static class GpuFrameTimer
         }
 
         /// <summary>Closes the frame with its end stamp. Returns the slot due for reading, or -1.</summary>
-        public int EndFrame(double dtSeconds)
+        public int EndFrame(double dtSeconds, bool farDrawn = true)
         {
             if (!open) return -1;
             Stamped[Slot][EndSlot] = true;
+            FarDrawn[Slot] = farDrawn;
             open = false;
             frame++;
             sinceRead += dtSeconds;
@@ -195,6 +222,7 @@ public static class GpuFrameTimer
             open = false;
             sinceRead = 0;
             for (var i = 0; i < Depth; i++) Array.Clear(Stamped[i]);
+            Array.Clear(FarDrawn);
         }
     }
 
@@ -262,7 +290,9 @@ public static class GpuFrameTimer
         {
             var slot = stages.Slot;
             GL.QueryCounter(stampQueries[slot * StageSlots + EndSlot], QueryCounterTarget.Timestamp);
-            var read = stages.EndFrame(dt);
+            var farDrawn = true;
+            try { farDrawn = FarCascadeDrawn?.Invoke() ?? true; } catch (Exception) { /* a hook must not cost the read */ }
+            var read = stages.EndFrame(dt, farDrawn);
             if (read < 0) return;
 
             var stamped = stages.Stamped[read];
@@ -280,6 +310,20 @@ public static class GpuFrameTimer
                 StageGpuMs[i] += (ms - StageGpuMs[i]) * 0.4;
             }
             StageSamples++;
+            if (stamped[StageRing.BeforeSlot] && stamped[EndSlot])
+            {
+                var span = (stampTimes[EndSlot] - stampTimes[StageRing.BeforeSlot]) / 1_000_000.0;
+                if (span >= 0 && span < 1000) StampSpanMs += (span - StampSpanMs) * 0.4;
+            }
+            if (stages.FarDrawn[read])
+            {
+                var far = (stageNs[(int)EnumRenderStage.ShadowFar] + stageNs[(int)EnumRenderStage.ShadowFarDone]) / 1_000_000.0;
+                if (far >= 0 && far < 1000)
+                {
+                    FarDrawnGpuMs += (far - FarDrawnGpuMs) * 0.4;
+                    FarDrawnSamples++;
+                }
+            }
         }
         catch (Exception)
         {
@@ -372,5 +416,8 @@ public static class GpuFrameTimer
         StatSamples = 0;
         StageSamples = 0;
         Array.Clear(StageGpuMs);
+        FarDrawnGpuMs = 0;
+        FarDrawnSamples = 0;
+        StampSpanMs = 0;
     }
 }

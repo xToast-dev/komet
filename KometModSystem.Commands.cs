@@ -92,6 +92,11 @@ public partial class KometModSystem
                 .WithArgs(api.ChatCommands.Parsers.Word("system"))
                 .HandleWith(args => TextCommandResult.Success(ToggleSystem(args[0] as string)))
             .EndSubCommand()
+            .BeginSubCommand("shadownear")
+                .WithDescription(Loc.T("komet:cmd-shadownear", "Size of the near shadow cascade's map in pixels (e.g. 4096), 'off' for the engine's; rebuilds the framebuffers live. No argument: show both maps"))
+                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
+                .HandleWith(args => TextCommandResult.Success(HandleShadowNear(args[0] as string)))
+            .EndSubCommand()
             .BeginSubCommand("stress")
                 .WithDescription(Loc.T("komet:cmd-stress", "Automatic measurement run, drift-proof by interleaving baselines - moving or flying is fine. Optional: seconds per slice (default 2), or 'stop'"))
                 .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
@@ -124,6 +129,33 @@ public partial class KometModSystem
                     return TextCommandResult.Success(text);
                 })
             .EndSubCommand()
+            .BeginSubCommand("mods")
+                .WithDescription(Loc.T("komet:cmd-mods", "What the other mods cost per frame and at load, and what they do (patches, registered classes). 'hud' cycles the overlay (same as Shift+F7), 'reset' clears the per-frame figures"))
+                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
+                .HandleWith(args =>
+                {
+                    var arg = args[0] as string;
+                    if (string.Equals(arg, "hud", StringComparison.OrdinalIgnoreCase))
+                        return TextCommandResult.Success(CycleModHud());
+                    if (string.Equals(arg, "reset", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ModProfiler.Reset();
+                        return TextCommandResult.Success(Loc.T("komet:msg-mods-reset", "per-mod counters cleared."));
+                    }
+                    if (!ModProfiler.Enabled)
+                        return TextCommandResult.Success(Loc.T("komet:msg-mods-off",
+                            "mod profiling is off (ProfileMods in komet.json)."));
+
+                    // A report is only worth reading with a fresh inventory behind it.
+                    ScanMods();
+                    var sb = new System.Text.StringBuilder(1200);
+                    ModProfiler.Write(sb, System.Globalization.CultureInfo.CurrentCulture, FrameStats.AvgFrameMs,
+                        Patches.RendererProfiler.Enabled, 10);
+                    var text = sb.ToString().TrimEnd('\n');
+                    Mod.Logger.Notification("mod profile:\n{0}", text);
+                    return TextCommandResult.Success(text);
+                })
+            .EndSubCommand()
             .BeginSubCommand("safemode")
                 .WithDescription(Loc.T("komet:cmd-safemode", "Every optimisation that changes what is drawn, on or off at once - settles in seconds whether a visual glitch comes from komet"))
                 .HandleWith(_ => TextCommandResult.Success(ToggleSafeMode()))
@@ -133,6 +165,35 @@ public partial class KometModSystem
                 .HandleWith(_ => { ResetStats(); return TextCommandResult.Success(Loc.T("komet:msg-counters-reset", "komet counters reset.")); })
             .EndSubCommand()
             .HandleWith(_ => TextCommandResult.Success(LoggedStats()));
+    }
+
+    /// <summary>
+    /// '.komet shadownear [px|off]': the near cascade's map size, live. A resize rebuilds
+    /// every framebuffer (what the graphics menu does on a change), so this is one hitch per
+    /// call and then the new size - the way to compare 7168 against 4096 against 3072 on the
+    /// GPU stage line within a minute instead of a restart per candidate.
+    /// </summary>
+    private string HandleShadowNear(string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+            return Loc.T("komet:msg-shadow-maps", "shadow maps: far {0}px, near {1}px ({2}px configured, 0 = as far)",
+                Patches.ShadowResPatches.EffectiveMapSize, Patches.ShadowResPatches.EffectiveNearMapSize,
+                Patches.ShadowResPatches.NearMapSize);
+
+        int size;
+        if (string.Equals(arg, "off", System.StringComparison.OrdinalIgnoreCase)
+            || string.Equals(arg, "far", System.StringComparison.OrdinalIgnoreCase))
+            size = 0;
+        else if (!int.TryParse(arg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out size)
+                 || size < Patches.ShadowResPatches.NearMapMin || size > Patches.ShadowResPatches.NearMapMax)
+            return Loc.T("komet:msg-shadownear-arg", "give a size in pixels (512-16384) or 'off'");
+
+        var platform = capi?.World is Vintagestory.Client.NoObf.ClientMain game
+            ? game.Platform as Vintagestory.Client.NoObf.ClientPlatformWindows
+            : null;
+        var result = Patches.ShadowResPatches.TryResizeNear(platform, size);
+        Mod.Logger.Notification("shadownear {0}: {1}", arg, result);
+        return result;
     }
 
     private string HandleStress(string arg)
@@ -233,13 +294,31 @@ public partial class KometModSystem
         new StressTest.Phase { Name = "shadow box off (vanilla wedge)",
             Enter = () => Patches.ShadowPatches.SymmetricBox = false,
             Exit = () => Patches.ShadowPatches.SymmetricBox = config.SymmetricShadowBox },
+        // The coverage margin is what makes the throttle work while MOVING, so this phase is
+        // the one to read during a flight: without it the far cascade is redrawn on almost
+        // every frame, with it at the staleness cap. Standing still it costs a few texels of
+        // density and saves nothing - the throttle was already skipping.
+        new StressTest.Phase { Name = "far shadow coverage margin off (redraw on every step)",
+            Enter = () => { Patches.ShadowPatches.FarBoxMargin = 0; Patches.ShadowThrottlePatches.Invalidate(); },
+            Exit = () => { Patches.ShadowPatches.FarBoxMargin = config.ShadowFarBoxMargin;
+                           Patches.ShadowThrottlePatches.Invalidate(); } },
         // Default-on since 1.43.0; the phase switches it off, so the delta reads as what the
-        // throttle SAVES in this scene. While moving it saves nothing by design (movement
-        // forces a redraw) - run the stress test standing still to see its real share.
+        // throttle SAVES in this scene. It used to save nothing while moving - the movement
+        // rule forced a redraw almost every frame - which is what the coverage margin above
+        // fixed; with the margin on, this phase reads the same standing still and flying.
         new StressTest.Phase { Name = "shadow throttle off (every frame)",
             Enter = () => Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1),
             Exit = () => Patches.ShadowThrottlePatches.SetIntervals(
                 config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval, config.ShadowFarMaxSkip) },
+        // Default-on since 05.09.; the phase draws every face again, so the delta is what the
+        // culled back faces cost in this scene. GPU work - visible only in a GPU-bound frame,
+        // which the report's "gpu" figure against the frame time tells apart.
+        new StressTest.Phase { Name = "shadow backface cull off (every face)",
+            Enter = () => Patches.ShadowCullPatches.Enabled = false,
+            Exit = () => Patches.ShadowCullPatches.Enabled = config.ShadowCullBackfaces },
+        new StressTest.Phase { Name = "shadow depth-only shader off (alpha test everywhere)",
+            Enter = () => Patches.ShadowCullPatches.DepthOnly = false,
+            Exit = () => Patches.ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses },
         // No phase for ShadowDistanceMultiplier any more: it has been 1.0 (vanilla) since
         // 1.40.0, so the phase set it to the value it already had and measured pure noise.
         // The grid's cell size, measured in the player's own scene rather than in the harness.
@@ -354,6 +433,21 @@ public partial class KometModSystem
                 Patches.EntityTessPatches.Enabled = !Patches.EntityTessPatches.Enabled;
                 state = "entity tesselation budget " + (Patches.EntityTessPatches.Enabled ? "ON" : "OFF (vanilla)");
                 break;
+            case "shadowmargin":
+                // Off means the retained far map covers only what the fade needs, and the
+                // throttle is back to redrawing on the first step anybody takes.
+                Patches.ShadowPatches.FarBoxMargin =
+                    Patches.ShadowPatches.FarBoxMargin > 0 ? 0.0 : Math.Max(0.0, config.ShadowFarBoxMargin);
+                Patches.ShadowThrottlePatches.Invalidate();
+                state = "far shadow coverage margin " + (Patches.ShadowPatches.EffectiveFarBoxMargin > 0
+                    ? "ON (" + Patches.ShadowPatches.EffectiveFarBoxMargin.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " blocks, redraw after "
+                      + Patches.ShadowThrottlePatches.MoveLimit.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
+                      + " blocks of camera movement)"
+                    : "OFF (redraw after " + Patches.ShadowThrottlePatches.MoveLimit.ToString("0.##", System.Globalization.CultureInfo.CurrentCulture)
+                      + " blocks - i.e. on nearly every frame while moving)"
+                      + (Patches.ShadowPatches.SymmetricBox ? "" : "; needs the symmetric box"));
+                break;
             case "shadowbox":
                 Patches.ShadowPatches.SymmetricBox = !Patches.ShadowPatches.SymmetricBox;
                 state = "symmetric shadow box " + (Patches.ShadowPatches.SymmetricBox
@@ -450,6 +544,25 @@ public partial class KometModSystem
                 FastCuller.ShadowSkipRedundantLod = !FastCuller.ShadowSkipRedundantLod;
                 state = "lod3 stand-ins in the shadow pass " + (FastCuller.ShadowSkipRedundantLod
                     ? "GONE (only the detailed version left)" : "IN (vanilla, both versions)");
+                break;
+            case "shadowcull":
+                Patches.ShadowCullPatches.Enabled = !Patches.ShadowCullPatches.Enabled;
+                state = "shadow pass back-face culling " + (Patches.ShadowCullPatches.Enabled
+                    ? "ON (solid passes draw front faces only into the shadow maps)"
+                    : "OFF (vanilla: every face of every pass)");
+                break;
+            case "shadowdepth":
+                Patches.ShadowCullPatches.DepthOnly = !Patches.ShadowCullPatches.DepthOnly;
+                state = "shadow pass depth-only shader for the solid passes " + (Patches.ShadowCullPatches.DepthOnly
+                    ? "ON" + (Patches.ShadowCullPatches.DepthOnlyState != null ? " (" + Patches.ShadowCullPatches.DepthOnlyState + ")" : "")
+                    : "OFF (vanilla: chunkshadowmap with alpha test for every pass)");
+                break;
+            case "animwarm":
+                Runtime.AnimationWarmup.Enabled = !Runtime.AnimationWarmup.Enabled && Patches.EntityLoadPatches.Enabled;
+                state = "animation frame warm-up " + (Runtime.AnimationWarmup.Enabled
+                    ? "ON (a worker generates a new shape's frames while its first entity is held)"
+                    : Patches.EntityLoadPatches.Enabled ? "OFF (vanilla: generated on the main thread when an animation first plays)"
+                                                        : "OFF - needs the entity load hold ('.komet toggle entload')");
                 break;
             case "shadowstab":
                 Patches.ShadowStabilityPatches.Enabled = !Patches.ShadowStabilityPatches.Enabled;
@@ -628,8 +741,8 @@ public partial class KometModSystem
                 return Loc.T("komet:msg-unknown-system", "unknown. Systems: ")
                      + "cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
                      + "prebuild, firepit, enttess, entload, minimap, minimapdirect, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
-                     + "beforeattr, tickprofiler, mtt, taskbudget, entbefore, animlod, serveralloc, clientalloc, allocsample, packetsrc, retess, hudraster, cullcheck, cellsize, shadowbox, shadowfade, "
-                     + "shadowdist, shadowlod, shadowstab, shadowthrottle, entsync, attrskip";
+                     + "beforeattr, tickprofiler, mtt, taskbudget, entbefore, animlod, serveralloc, clientalloc, allocsample, packetsrc, retess, hudraster, cullcheck, cellsize, shadowbox, shadowmargin, shadowfade, "
+                     + "shadowdist, shadowlod, shadowstab, shadowthrottle, shadowcull, shadowdepth, animwarm, entsync, attrskip";
         }
 
         var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} received, "
@@ -704,6 +817,8 @@ public partial class KometModSystem
         Patches.ShadowPatches.ToVanilla();
         Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1);
         Patches.ShadowStabilityPatches.Enabled = false;
+        Patches.ShadowCullPatches.Enabled = false;      // every face into the shadow maps again
+        Patches.ShadowCullPatches.DepthOnly = false;    // the engine's shader for every pass again
     }
 
     /// <summary>The exact inverse: everything back to what komet.json asked for.</summary>
@@ -726,7 +841,25 @@ public partial class KometModSystem
         Patches.ShadowThrottlePatches.SetIntervals(
             config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval, config.ShadowFarMaxSkip);
         Patches.ShadowStabilityPatches.Enabled = config.StabiliseShadowTexels;
+        Patches.ShadowCullPatches.Enabled = config.ShadowCullBackfaces;
+        Patches.ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses;
         SetCellTarget(config.PartsPerCellTarget);
+    }
+
+    /// <summary>
+    /// The mod HUD's three steps: off -> compact -> full -> off. The same rule the performance
+    /// HUD's F7 uses (DebugHud.CycleF7, pure and pinned by verify), driven by Shift+F7 and by
+    /// '.komet mods hud' - two boxes that cycle differently would be the real surprise.
+    /// </summary>
+    private string CycleModHud()
+    {
+        (var visible, var compact) = DebugHud.CycleF7(modHud.Visible, modHud.Compact);
+        modHud.Compact = compact;
+        modHud.Visible = visible;
+        if (!visible) return Loc.T("komet:msg-modhud-off", "mod HUD off");
+        return compact
+            ? Loc.T("komet:msg-modhud-on", "mod HUD on (Shift+F7 cycles compact / full / off)")
+            : Loc.T("komet:msg-modhud-full", "mod HUD: full view (Shift+F7 again turns it off)");
     }
 
     private static void ResetStats()
@@ -772,6 +905,7 @@ public partial class KometModSystem
         Patches.EdgeRetessPriorityPatches.StatBusySkips = 0;
         PoolReclaimer.Reset();
         Patches.RendererProfiler.Reset();
+        ModProfiler.Reset();
         FrameStats.Reset();
         HitchLog.Reset();
     }

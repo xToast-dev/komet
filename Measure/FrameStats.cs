@@ -600,7 +600,7 @@ public static class FrameStats
 
     // ---- stage aggregates ----------------------------------------------------------
     // Shared here so the HUD and the .komet text cannot drift apart on what "schatten" or
-    // "ausserhalb" means.
+    // "außerhalb" means.
 
     /// <summary>Both shadow cascades including their Done stages.</summary>
     public static double ShadowMs => StageSum(StageMs);

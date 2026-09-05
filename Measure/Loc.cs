@@ -26,6 +26,11 @@ public static class Loc
     /// and that no file carries a key the code never asks for.</summary>
     public static readonly Dictionary<string, string> Used = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The raw translation of a key, or null when the language has none. The engine's table
+    /// by default; verify swaps in its own to prove the contract without a game.
+    /// </summary>
+    internal static Func<string, string> Lookup = EngineLookup;
     /// <summary>Set false once the engine's Lang is unusable (no game, no assets), so the
     /// fallback path costs nothing but a bool after the first miss.</summary>
     private static bool langUsable = true;
@@ -41,16 +46,31 @@ public static class Loc
     public static string T(string key, string english)
     {
         Used[key] = english;
-        if (!langUsable) return english;
+        return Lookup(key) ?? english;
+    }
+
+    /// <summary>
+    /// The entry as written in the language file, never formatted. Lang.GetIfExists formats
+    /// even when it is given no arguments, and a template with a placeholder then throws
+    /// inside the engine - which logs an Error and a Warning for every call. Read on every
+    /// HUD refresh, that filled a German client's log with thousands of "Translation string
+    /// format exception" lines (05.09.). Formatting is the job of the overload below, with
+    /// the arguments it was actually given.
+    /// </summary>
+    private static string EngineLookup(string key)
+    {
+        if (!langUsable) return null;
         try
         {
-            return Vintagestory.API.Config.Lang.GetIfExists(key) ?? english;
+            return Vintagestory.API.Config.Lang.HasTranslation(key, findWildcarded: false, logErrors: false)
+                ? Vintagestory.API.Config.Lang.GetUnformatted(key)
+                : null;
         }
         catch (Exception)
         {
             // no game around this code (verify, bench): stop trying, keep the English text
             langUsable = false;
-            return english;
+            return null;
         }
     }
 
@@ -84,5 +104,6 @@ public static class Loc
     {
         Used.Clear();
         langUsable = true;
+        Lookup = EngineLookup;
     }
 }
