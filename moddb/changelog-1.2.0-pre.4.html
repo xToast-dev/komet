@@ -1,0 +1,55 @@
+<!-- Changelog for the ModDB file upload of Komet_v1.2.0-pre.4.zip. Paste into the file's
+     changelog field; works as plain text too if the field strips markup.
+     {{SHA256_KOMET}}, {{SHA256_BASELINE}} and {{COMMIT}} are filled in by ./build.sh release,
+     which writes the finished file to dist/ - the checksum cannot be committed here, because
+     committing it would change the commit and therefore the checksum. -->
+<p><em>Changes since 1.2.0-pre.3.</em> This release is mostly the GPU side of the frame. The
+first report that could measure it found the two shadow passes taking 86 % of a GPU-bound
+frame, and four of the five performance changes below come out of that one number.</p>
+<p><strong>Faster</strong></p>
+<ul>
+<li><strong>The far shadow map is no longer redrawn on every frame while you move.</strong> It was already kept for a few frames and re-projected exactly &mdash; but a re-projection can only keep a kept map correctly <em>positioned</em>, not extend what it <em>covers</em>, so any camera movement of 15 centimetres forced a redraw. Walking, and especially flying, meant the saving never happened; it existed only while standing still. The map is now drawn a little wider than the shadow fade needs (16 blocks by default), which is exactly the room the camera needs to move without leaving it, and the redraw threshold rises to about 14 blocks in step. The far cascade then updates at its normal cadence whatever you are doing. It costs about 6 % coarser far shadows; <code>ShadowFarBoxMargin</code> sets the trade, <code>.komet toggle shadowmargin</code> flips it live.</li>
+<li><strong>The near shadow cascade gets a map of its own size.</strong> The engine allocated both cascades from one expression, so the near map was as large as the far one &mdash; over a hundred texels per block for a cascade covering the ~39 blocks around you, against the far map's fifteen. It is now 4096 px by default, which is a third of the fill rate for a difference nobody can see; near shadow edges come out about as crisp as vanilla draws them one quality step lower. <code>.komet shadownear 3072</code> (or <code>off</code>) changes it while the game runs.</li>
+<li><strong>The solid parts of the shadow passes cost about half of what they did.</strong> They are now drawn with back-face culling (a closed block's back faces sit behind its front faces along the light ray too, so the depth map is identical) and with a shader that only writes depth instead of sampling the terrain texture for every fragment. Leaves and grass keep the engine's shader and cast from both sides, unchanged.</li>
+<li><strong>Far-detail stand-in geometry stays out of the shadow maps</strong> wherever the detailed version is already in them &mdash; the shadow pass had no distance rule at all and rasterised both. Decided per grid cell now, which is the granularity at which the rule actually fires.</li>
+<li><strong>A new creature type no longer costs a hitch the first time you see one.</strong> The engine builds an animation's frames on the main thread the moment it first plays; measured against the game's own shapes that is 12 ms for a rooster and 53 ms for a pig, always in the frame the animal comes into view. Those frames are now built on a worker while the entity is still being held back, and the main thread finds them ready.</li>
+</ul>
+<p><strong>New</strong></p>
+<ul>
+<li><strong>A mod profiler with its own HUD (Shift+F7).</strong> Every measurement this mod made so far named a part of the <em>engine</em> &mdash; a render stage, a renderer, a tick listener. None of them answered the question somebody with forty mods installed actually asks, which is <em>which of mine is it</em>. The new overlay lists your mods by what they cost per frame, what they do (how many engine methods each one patches, how many block/item/entity classes it registers) and what each one cost during loading, client and integrated server separately. <code>.komet mods</code> prints the same thing as text for a bug report.</li>
+<li>It also prints what it <em>cannot</em> see, rather than leaving it out: a Harmony patch runs inside the engine method it patches, so its time is booked to the engine &mdash; which is why the patch count sits next to the milliseconds &mdash; and block entity ticks, mod worker threads and GUI dialogs are not attributed at all.</li>
+<li><strong>A warning at world join when Optimum or OptiTime is present.</strong> Both replace the same engine code Komet does, each unaware of the other, and finding that out used to take a bisect. Now a dialog, a chat line and a log warning say so, and the report names the client in its header. Komet stays enabled &mdash; which side should win is your call.</li>
+</ul>
+<p><strong>Fixed</strong></p>
+<ul>
+<li><strong>Crash on the first frame with the Optimum client build</strong> (<code>MissingFieldException: ClientMain.MainThreadTasksLock</code>, reported with Optimum v0.3.14). The fork declares that field with a different type, so the mod's binding no longer resolved. It is now read by name and locked the way its type demands; anything unexpected leaves that part vanilla with the usual "could not enable" line instead of taking the client down.</li>
+<li><strong>German clients filled their log with "Translation string format exception"</strong> &mdash; an error and a warning per HUD refresh for every label containing a number, thousands per session. The translation is now read as written and only formatted where the arguments actually exist.</li>
+</ul>
+<p><strong>Changed</strong></p>
+<ul>
+<li><strong>Config layout is now version 15</strong> (eight new settings since pre.3, five of them shadow-related). An existing <code>komet.json</code> is backed up next to itself and regenerated with defaults &mdash; re-apply your custom values afterwards.</li>
+<li>Minimum game version stays 1.22.0. Built and verified against 1.22.7; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually.</li>
+</ul>
+<p><strong>Internals</strong></p>
+<ul>
+<li>The shadow margin is not a tuning value that looked good in one scene: the covered volume is a sphere around the camera, so a sphere drawn 16 blocks wider provably contains what the shader will sample from anywhere within 16 blocks of where it was drawn. The check suite verifies that against the shader's own fade and edge constants, including the counter-test that the un-widened box really does fall short.</li>
+<li>Release builds are still reproducible: the same commit produces the same bytes, so the checksum below can be recomputed rather than merely trusted.</li>
+</ul>
+<p><strong>Verify your download</strong></p>
+<p>SHA-256 of the files on this page:</p>
+<pre>{{SHA256_KOMET}}  Komet_v1.2.0-pre.4.zip
+{{SHA256_BASELINE}}  KometBaseline_v1.1.0.zip</pre>
+<p>Check it with <code>sha256sum Komet_v1.2.0-pre.4.zip</code> (Linux) or
+<code>Get-FileHash Komet_v1.2.0-pre.4.zip</code> (Windows PowerShell).</p>
+<p>This page is not the only place that asserts them.
+<a href="https://github.com/xToast-dev/komet/releases">github.com/xToast-dev/komet/releases</a>
+carries the same numbers in the release notes and as <code>.sha256</code> files next to the
+downloads, written by the build job rather than typed in by hand &mdash; so the checksum here
+and the checksum there have to agree, and neither was produced by whoever wrote this page.</p>
+<p>Beyond comparing, you can reproduce it: check out <code>{{COMMIT}}</code>, run
+<code>./build.sh release</code>, and the file comes out with exactly the checksum above &mdash;
+on any machine. Two things make that work, and both cost something: the SDK version is pinned
+in <code>global.json</code>, because a different patch level produces a different assembly; and
+the zip is stored rather than compressed, because identical data does not give identical
+deflate streams across zlib implementations. The download is about 2.5x larger for it. That
+seemed the better trade for a mod whose whole point is that its claims can be checked.</p>
