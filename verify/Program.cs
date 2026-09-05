@@ -21,6 +21,7 @@ using Vintagestory.API.MathTools;
 internal static class Program
 {
     private static int failures;
+    private static int skipped;
 
     /// <summary>Stands in for the Optimum fork's marker type: a constant named Version is all the detector reads.</summary>
     private static class FakeOptimumInfo { public const string Version = "9.9.9"; }
@@ -35,6 +36,24 @@ internal static class Program
     {
         try { a(); Console.WriteLine($"  ok    {what}"); }
         catch (Exception e) { failures++; Console.WriteLine($"  FAIL  {what}\n        {e.GetType().Name}: {e.Message}"); if (Environment.GetEnvironmentVariable("KOMET_TRACE") != null) Console.WriteLine(e.StackTrace); }
+    }
+
+    /// <summary>
+    /// A check that could not run here, with the reason - printed as a result and counted, not
+    /// silently left out. A suite that quietly shrinks on one machine is worth less than one
+    /// that says which part of itself did not run.
+    ///
+    /// The one legitimate reason so far: the game's ASSET tree. CI compiles against the engine
+    /// assemblies, which live in the repository because they are what every patch binds to -
+    /// but the content tree is hundreds of megabytes of game data, so a check that reads a real
+    /// shape file runs on a machine with the game installed and is skipped on the runner.
+    /// Never use this to step around a check that fails: a missing file is a reason, a red
+    /// check is a result.
+    /// </summary>
+    private static void Skip(string what, string why)
+    {
+        skipped++;
+        Console.WriteLine($"  skip  {what}\n        {why}");
     }
 
     /// <summary>Forces the JIT to compile the patched body; invalid IL surfaces here.</summary>
@@ -3918,15 +3937,23 @@ internal static class Program
             ShadowCullPatches.DepthOnly = false;
         });
 
-        Check("animation warm-up generates every frame of a real shape off the main thread, once", () =>
+        // The engine's own chicken: the shape that measured 11,9 ms of main-thread frame
+        // generation on first sight. It is read from the installed game rather than from a
+        // fixture on purpose - a hand-made shape would prove the warm-up against a shape only
+        // this test believes in. The price is that it needs the asset tree, which the CI runner
+        // does not have (it carries the assemblies, not the content), so there it is skipped
+        // with its reason rather than failing.
+        const string warmupCheck = "animation warm-up generates every frame of a real shape off the main thread, once";
+        string vsInstall = Environment.GetEnvironmentVariable("VS_INSTALL") ?? "/opt/vintagestory";
+        string roosterPath = System.IO.Path.Combine(vsInstall, "assets", "survival", "shapes",
+            "entity", "animal", "bird", "chicken", "chicken-rooster.json");
+        if (!System.IO.File.Exists(roosterPath))
+            Skip(warmupCheck, "no game assets at " + vsInstall + " - needs an installed game, "
+                            + "the runner has only the engine assemblies");
+        else
+        Check(warmupCheck, () =>
         {
-            // The engine's own chicken: the shape that measured 11,9 ms of main-thread frame
-            // generation on first sight. After the worker body every animation has its frames;
-            // a second pass generates nothing (the main thread's AnimNowActive would find them
-            // and skip too).
-            string install = Environment.GetEnvironmentVariable("VS_INSTALL") ?? "/opt/vintagestory";
-            string shapePath = System.IO.Path.Combine(install, "assets", "survival", "shapes", "entity", "animal", "bird", "chicken", "chicken-rooster.json");
-            if (!System.IO.File.Exists(shapePath)) throw new Exception("shape not found: " + shapePath);
+            string shapePath = roosterPath;
             var shape = Newtonsoft.Json.JsonConvert.DeserializeObject<Vintagestory.API.Common.Shape>(System.IO.File.ReadAllText(shapePath));
             if (shape?.Animations == null || shape.Animations.Length < 5) throw new Exception("the chicken has no animations?");
 
@@ -6024,7 +6051,10 @@ internal static class Program
             return 0;
         }
 
-        Console.WriteLine(failures == 0 ? "\nall checks passed" : $"\n{failures} check(s) failed");
+        var skippedNote = skipped == 0 ? "" : $" ({skipped} skipped, see above)";
+        Console.WriteLine(failures == 0
+            ? "\nall checks passed" + skippedNote
+            : $"\n{failures} check(s) failed" + skippedNote);
         return failures == 0 ? 0 : 1;
     }
 
