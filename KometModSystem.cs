@@ -32,6 +32,8 @@ public partial class KometModSystem : ModSystem
     private GCLatencyMode previousLatencyMode;
     private bool gcLatencyChanged;
     private DebugHud hud;
+    private ModHud modHud;
+    private long modScanListenerId = -1;
     private SmoothedCounter partsPerFrame, rawRangesPerFrame, rangesPerFrame, bridgedPerFrame, sweepsPerFrame, batchesPerFrame, rebuildsPerFrame, cellsSkippedPerFrame, rebuildTicksPerFrame;
     private PoolReclaimer.Renderer reclaimer;
     private GpuFrameTimer.BeginRenderer gpuBegin;
@@ -43,6 +45,9 @@ public partial class KometModSystem : ModSystem
     private int fbRebuildTries;
     private long guardListenerId = -1;
     private Action guardFinalize;
+    private Action foreignFinalize;
+    private long foreignCallbackId = -1;
+    private ForeignClientDialog foreignDialog;
     private Action cameraSampler;
     private Action firepitBoundary;
     private bool uploadBudgetHooked;
@@ -129,6 +134,11 @@ public partial class KometModSystem : ModSystem
     {
         capi = api;
 
+        // The depth-only shadow program needs the client (shadow MVP matrix, atlas padding)
+        // and has to follow every shader reload; both belong to this world.
+        Patches.ShadowCullPatches.Game = api.World as Vintagestory.Client.NoObf.ClientMain;
+        api.Event.ReloadShader += OnShadersReloaded;
+
         // reading and flipping allowPStorage needs the platform, which only exists client side
         Patch(() => Patches.PersistentMappingPatch.Probe(Mod.Logger), "persistent mapping probe");
         if (config.ExperimentalPersistentMapping)
@@ -138,6 +148,8 @@ public partial class KometModSystem : ModSystem
             Patch(() =>
             {
                 GpuFrameTimer.Enabled = true;
+                // the far cascade's per-drawn-frame cost needs to know which frames drew it
+                GpuFrameTimer.FarCascadeDrawn = () => Patches.ShadowThrottlePatches.FarDrawnThisFrame;
                 gpuBegin = new GpuFrameTimer.BeginRenderer();
                 gpuEnd = new GpuFrameTimer.EndRenderer();
                 api.Event.RegisterRenderer(gpuBegin, EnumRenderStage.Before, "kometgpu0");
@@ -254,6 +266,38 @@ public partial class KometModSystem : ModSystem
         };
         api.Event.RegisterRenderer(hud, EnumRenderStage.Ortho, "komethud");
 
+        // The mod profiler and its own overlay. The index is built here because this is the
+        // first moment every mod is loaded and the client API exists; the load times booked
+        // before it (by the phase patch, which has no index to write into yet) are merged in.
+        ModProfiler.Enabled = config.ProfileMods;
+        if (config.ProfileMods)
+        {
+            ModProfiler.BuildIndex(api.ModLoader?.Mods);
+            Mod.Logger.Notification("mod profiler: {0} mods indexed, {1} of them with code",
+                ModProfiler.ModCount, ModProfiler.CodeModCount);
+        }
+        modHud = new ModHud(api, "komet · mods")
+        {
+            Visible = config.ModHudVisible,
+            Compact = true,
+            // What this HUD can see depends on it, and the reader must not have to remember
+            AllRenderersWrapped = () => Patches.RendererProfiler.Enabled
+        };
+        api.Event.RegisterRenderer(modHud, EnumRenderStage.Ortho, "kometmodhud");
+        // Shift+F7, not a key of its own: this mod already owns F7, and the free-looking keys
+        // are not free (F6 was tried and is a minimap macro). The engine matches modifiers
+        // exactly and runs that pass over every hotkey BEFORE the modifier-ignoring fallback
+        // pass, so plain F7 and Shift+F7 cannot trigger each other - the first exact match ends
+        // the dispatch. Same three-step cycle as F7, and '.komet mods hud' does the same thing
+        // for anyone who rebinds or prefers typing.
+        api.Input.RegisterHotKey("kometmodhud", "komet: Mod-Profiler-HUD", GlKeys.F7,
+            HotkeyType.HelpAndOverlays, altPressed: false, ctrlPressed: false, shiftPressed: true);
+        api.Input.SetHotKeyHandler("kometmodhud", _ => { CycleModHud(); return true; });
+        // Patches and registered classes, rescanned on the patch guard's cadence and for the
+        // same reason: mods patch lazily, and an inventory nobody refreshes is a stale one.
+        if (config.ProfileMods)
+            modScanListenerId = api.Event.RegisterGameTickListener(_ => ScanMods(), 10000);
+
         api.Input.RegisterHotKey("komethud", "komet: Performance-HUD", GlKeys.F7, HotkeyType.HelpAndOverlays);
         api.Input.SetHotKeyHandler("komethud", _ =>
         {
@@ -291,11 +335,38 @@ public partial class KometModSystem : ModSystem
         api.Event.LevelFinalize += guardFinalize;
         guardListenerId = api.Event.RegisterGameTickListener(_ => RunPatchGuard(engineCheck: false), 10000);
 
+        // Optimum (a forked client) and OptiTime (a mod) replace the same engine code komet
+        // does, each unaware of the other. The player hears it at every world join: the log
+        // line now, chat line and dialog a moment after LevelFinalize, when the loading
+        // screen is gone. Komet stays on - which side should win is not this mod's call.
+        ForeignClient.Scan(name => typeof(Vintagestory.Client.NoObf.ClientMain).Assembly.GetType(name),
+            Vintagestory.API.Config.GameVersion.LongGameVersion,
+            id => api.ModLoader.GetMod(id)?.Info);
+        if (ForeignClient.Findings.Count > 0)
+        {
+            Mod.Logger.Warning("incompatible client: {0} - it replaces the same engine code komet does, each unaware of the other; run one or the other, not both",
+                ForeignClient.Describe());
+            foreignFinalize = () =>
+            {
+                if (foreignCallbackId >= 0) api.Event.UnregisterCallback(foreignCallbackId);
+                foreignCallbackId = api.Event.RegisterCallback(_ =>
+                {
+                    foreignCallbackId = -1;
+                    var what = ForeignClient.Describe();
+                    api.ShowChatMessage(ForeignClient.ChatText(what));
+                    foreignDialog?.TryClose();
+                    foreignDialog = new ForeignClientDialog(api, ForeignClient.Title(), ForeignClient.DialogText(what), ForeignClient.Button());
+                    foreignDialog.TryOpen();
+                }, 1500);
+            };
+            api.Event.LevelFinalize += foreignFinalize;
+        }
+
         // The enlarged shadow framebuffers have to be forced into existence: the engine builds
         // its framebuffers at window creation, before any mod loads, so the transpiler alone
         // reaches nothing on a normal launch (see ShadowResPatches.TryForceRebuild). Retried on
         // a slow tick because the engine suppresses buffer rebuilds while it is still loading.
-        if (config.ShadowMapExtraQuality > 0)
+        if (config.ShadowMapExtraQuality > 0 || config.ShadowNearMapSize > 0)
             fbRebuildListenerId = api.Event.RegisterGameTickListener(FbRebuildTick, 500);
 
         // 50 ms cadence: together with the per-tick cap this sets the drain capacity
@@ -316,6 +387,16 @@ public partial class KometModSystem : ModSystem
 
     private void ApplyPatches(ICoreAPI api)
     {
+        // First of everything, and that is the point: this times the ModSystem phases of every
+        // mod, and only the ones that run AFTER this line can be measured. Komet loads at
+        // ExecuteOrder 0.05, so "after this line" is nearly the whole load.
+        if (config.ProfileMods)
+            Patch(() =>
+            {
+                Patches.ModPhasePatches.Apply(harmony);
+                Patches.ModPhasePatches.Enabled = true;
+            }, "mod load time attribution (per mod, per phase)");
+
         // Measurement only: who on the client's worker threads and the thread pool allocates
         // - the report's "rest" (03.09.: 79 of 216 MB/s unnamed while 384 of 402 hitches sat on
         // a GC pause). Applied always, gated at runtime, sampled with the other rates.
@@ -356,16 +437,36 @@ public partial class KometModSystem : ModSystem
         if (config.BulkMeshUpload || config.ExperimentalPersistentMapping)
             Patch(() => Patches.MeshUploadPatches.Apply(harmony), "bulk chunk mesh upload");
 
-        // Must run before the framebuffers are built, i.e. before the first frame.
-        if (config.ShadowMapExtraQuality > 0)
-            Patch(() => Patches.ShadowResPatches.Apply(harmony, config.ShadowMapExtraQuality),
-                  $"shadow map +{config.ShadowMapExtraQuality} quality step(s)");
+        // Must run before the framebuffers are built, i.e. before the first frame. Always
+        // applied: the near-map size is gated at run time so '.komet shadownear' works in a
+        // session that started at 0; the extra step's transpiler goes on only when asked.
+        Patch(() => Patches.ShadowResPatches.Apply(harmony, config.ShadowMapExtraQuality, config.ShadowNearMapSize),
+              (config.ShadowMapExtraQuality > 0
+                  ? $"shadow map +{config.ShadowMapExtraQuality} quality step(s)"
+                  : "shadow map at the engine's size")
+              + (config.ShadowNearMapSize > 0 ? $", near cascade map {config.ShadowNearMapSize}px" : ", near cascade map as the far one"));
+
+        // Always applied, gated at runtime ('.komet toggle shadowcull'): culling on the solid
+        // passes of the shadow map draws the same depth map with half the solid faces.
+        Patch(() => Patches.ShadowCullPatches.Apply(harmony, config.ShadowCullBackfaces, config.ShadowDepthOnlySolidPasses),
+              "shadow pass solid passes: back-face culling " + (config.ShadowCullBackfaces ? "on" : "off")
+              + ", depth-only shader " + (config.ShadowDepthOnlySolidPasses ? "on" : "off"));
 
         // Always applied, gated at runtime, so a shadow artefact can be bisected while it is
         // on screen ('.komet toggle shadowbox|shadowfade|shadowdist', and safemode).
-        Patch(() => Patches.ShadowPatches.Apply(harmony, config.FixShadowFadeCutoff, config.ShadowDistanceMultiplier, config.SymmetricShadowBox),
+        Patch(() =>
+              {
+                  Patches.ShadowPatches.Apply(harmony, config.FixShadowFadeCutoff, config.ShadowDistanceMultiplier, config.SymmetricShadowBox);
+                  // The coverage margin and the throttle's movement limit are one decision in
+                  // two places: the box is drawn wider exactly so the camera may move that far
+                  // before the retained map has to be redrawn.
+                  Patches.ShadowPatches.FarBoxMargin = Math.Max(0.0, config.ShadowFarBoxMargin);
+              },
               $"shadow patches (fade fix {(config.FixShadowFadeCutoff ? "on" : "off")}, "
-              + $"distance x{config.ShadowDistanceMultiplier:0.##}, symmetric box {(config.SymmetricShadowBox ? "on" : "off")})");
+              + $"distance x{config.ShadowDistanceMultiplier:0.##}, symmetric box {(config.SymmetricShadowBox ? "on" : "off")}"
+              + (config.SymmetricShadowBox && config.ShadowFarBoxMargin > 0
+                  ? $", far coverage margin {config.ShadowFarBoxMargin:0.#} blocks"
+                  : ", no far coverage margin") + ")");
 
         // measurement first: the throttle and the HUD both hang off it. The optional
         // attribution brackets report themselves by name when an engine build changed the
@@ -530,6 +631,9 @@ public partial class KometModSystem : ModSystem
             Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 && MeasurementPatches.FrameBoundaryLive;
             MeasurementPatches.FrameBoundary += Patches.EntityLoadPatches.OnFrameBoundary;
             entityLoadHooked = true;
+            // the warm-up only has a window while entities are held
+            Runtime.AnimationWarmup.Log = msg => Mod.Logger.Warning(msg);
+            Runtime.AnimationWarmup.Enabled = config.EntityAnimationPrewarm && Patches.EntityLoadPatches.Enabled;
         }, config.EntityLoadBudgetMs <= 0
             ? "entity load budget off (vanilla: each entity finishes in its packet's task); '.komet toggle entload' enables it live"
             : MeasurementPatches.FrameBoundaryLive
@@ -790,6 +894,30 @@ public partial class KometModSystem : ModSystem
         }
     }
 
+    /// <summary>
+    /// Refreshes what the mods DO (patches, registered classes). Walks Harmony's registry and
+    /// the class registry, so it runs on a slow tick and switches itself off rather than
+    /// repeating a failure every ten seconds.
+    /// </summary>
+    private void ScanMods()
+    {
+        if (!ModProfiler.Enabled) return;
+        try
+        {
+            ModProfiler.ScanInventory();
+        }
+        catch (Exception e)
+        {
+            ModProfiler.Enabled = false;
+            if (modScanListenerId >= 0)
+            {
+                capi?.Event.UnregisterGameTickListener(modScanListenerId);
+                modScanListenerId = -1;
+            }
+            Mod.Logger.Error("mod inventory scan failed, mod profiling off:\n{0}", e);
+        }
+    }
+
     private void WrapRenderers()
     {
         WrapTickListeners();
@@ -971,6 +1099,23 @@ public partial class KometModSystem : ModSystem
             guardListenerId = -1;
         }
         PatchGuard.Reset();
+        if (foreignFinalize != null && capi != null)
+        {
+            capi.Event.LevelFinalize -= foreignFinalize;
+            foreignFinalize = null;
+        }
+        if (foreignCallbackId >= 0)
+        {
+            capi?.Event.UnregisterCallback(foreignCallbackId);
+            foreignCallbackId = -1;
+        }
+        if (foreignDialog != null)
+        {
+            try { foreignDialog.TryClose(); foreignDialog.Dispose(); }
+            catch (Exception) { /* a dialog mid-teardown has nothing left to close */ }
+            foreignDialog = null;
+        }
+        ForeignClient.Findings.Clear();
         if (gpuBegin != null && capi != null)
         {
             capi.Event.UnregisterRenderer(gpuBegin, EnumRenderStage.Before);
@@ -991,6 +1136,20 @@ public partial class KometModSystem : ModSystem
             hud.Dispose();
             hud = null;
         }
+        if (modScanListenerId >= 0)
+        {
+            capi?.Event.UnregisterGameTickListener(modScanListenerId);
+            modScanListenerId = -1;
+        }
+        if (modHud != null && capi != null)
+        {
+            capi.Event.UnregisterRenderer(modHud, EnumRenderStage.Ortho);
+            modHud.Dispose();
+            modHud = null;
+        }
+        // The index holds an entry per mod and a cache of every type ever resolved - none of
+        // it survives the session it was built for.
+        ModProfiler.Clear();
         harmony?.UnpatchAll(harmony.Id);
         base.Dispose();
     }
@@ -1002,13 +1161,33 @@ public partial class KometModSystem : ModSystem
     /// no-ops within the engine's 200 ms window), the prefetcher and the window prebuilder
     /// stop. From Dispose this was provably too late - the teardown NRE recurred there.
     /// </summary>
+    /// <summary>The engine rebuilt its programs: ours is rebuilt from the new one on the next shadow pass.</summary>
+    private bool OnShadersReloaded()
+    {
+        Patches.ShadowCullPatches.OnShadersReloaded();
+        return true;
+    }
+
     private void OnLeaveWorldEarly()
     {
         Patches.TesselationPatches.Shutdown();
         WindowPrebuilder.Shutdown();
+        // the depth-only shadow program was compiled for this world's context
+        try { capi?.Event.ReloadShader -= OnShadersReloaded; } catch (Exception) { /* event api gone */ }
+        Patches.ShadowCullPatches.Game = null;
+        Patches.ShadowCullPatches.OnShadersReloaded();
         // entities still held for the load budget were meant for this world; finishing them
         // into a disposing session would register renderers on a dying event manager
         Patches.EntityLoadPatches.Reset();
         Patches.EntityAnimPatches.Reset();
+        // the join warning belongs to the world that is ending: a callback still pending
+        // must not fire into the teardown, and the dialog was that session's
+        if (foreignCallbackId >= 0)
+        {
+            try { capi?.Event.UnregisterCallback(foreignCallbackId); }
+            catch (Exception) { /* an event manager already gone has nothing to unregister */ }
+            foreignCallbackId = -1;
+        }
+        foreignDialog = null;
     }
 }

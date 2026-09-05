@@ -70,6 +70,14 @@ public static class ShadowPatches
     /// </summary>
     private static bool farCascade;
 
+    /// <summary>
+    /// Which cascade PrepareForShadowRendering is currently building - true for the far one.
+    /// Valid inside that method (the shadow box update, the ortho matrix and its texel
+    /// snapping all run there); the texel snapping needs it now that the two cascades' maps
+    /// can differ in size, and a grid quantised to the wrong map is no snap at all.
+    /// </summary>
+    public static bool PreparingFarCascade => farCascade;
+
     // ---- how big the cube really has to be, read off shadowcoords.vsh ----------------
     //
     // The far cascade's weight is w = clamp(1.5 - 2d, 0, 1) with
@@ -99,6 +107,39 @@ public static class ShadowPatches
     /// <summary>Tell the shader the range the far map really covers.</summary>
     public static bool FadeFix = true;
 
+    /// <summary>
+    /// Extra blocks of far-cascade coverage, on top of what the fade needs - the room a
+    /// RETAINED shadow map needs to survive the camera moving.
+    ///
+    /// The throttle already keeps the far map for several frames and reprojects it exactly
+    /// (ShadowThrottlePatches.OffsetShadowMatrix), but compensation can only keep a map
+    /// correctly POSITIONED - it cannot extend what the map COVERS. So the throttle has to
+    /// redraw as soon as the camera has moved 0,15 blocks, which at 85 fps is every frame
+    /// while walking and every frame while flying: the whole saving existed only for a player
+    /// standing still, i.e. exactly when nobody needs it.
+    ///
+    /// This buys the missing room. The box is a sphere around the camera (see
+    /// MakeBoxSymmetric), so a box drawn with radius r+m at C0 contains the sphere of radius r
+    /// around every camera position within m of C0 - a containment property, not an estimate,
+    /// and verify pins it. The throttle's movement limit is raised to 0.9*m in step
+    /// (ShadowThrottlePatches.MoveLimitFor), so the far cascade then updates at the staleness
+    /// cap instead of every frame, whatever the player is doing.
+    ///
+    /// The price is texel density: the same map over a box that is m blocks wider per side.
+    /// At the default far distance that is about 6 % coarser shadows beyond the near cascade,
+    /// against roughly a quarter of the far cascade's GPU cost while moving. It deliberately
+    /// does NOT go into ShadowBox.SHADOW_DISTANCE: MatchFadeToBox derives the shader's fade
+    /// range from that, the fade would grow with the box, and the extra coverage would be
+    /// consumed by the very fade it is supposed to outlive.
+    ///
+    /// Only meaningful with the symmetric box - vanilla's cone has no containment property to
+    /// build on, and its shape depends on where the sun is.
+    /// </summary>
+    public static double FarBoxMargin;
+
+    /// <summary>The margin that is actually in effect - zero without the symmetric box.</summary>
+    public static double EffectiveFarBoxMargin => SymmetricBox && FarBoxMargin > 0 ? FarBoxMargin : 0.0;
+
     /// <summary>Report what the far cascade ended up covering, for the HUD.</summary>
     public static double ShadowDistance { get; private set; }
     public static double ShadowRangeUniform { get; private set; }
@@ -115,6 +156,12 @@ public static class ShadowPatches
     /// at 45-65 and 397 in the zenith, against the sphere box's constant 488.
     /// </summary>
     public static double ShadowBoxSpan { get; private set; }
+
+    /// <summary>The near cascade's range and light-space footprint, captured the same way
+    /// right after its pass - the pair the HUD's "near map ... texels per block" row needs.
+    /// 0 until the near cascade has rendered once (quality 2 and up).</summary>
+    public static double NearShadowDistance { get; private set; }
+    public static double NearBoxSpan { get; private set; }
 
     public static void Apply(Harmony harmony, bool fadeFix, double distanceMultiplier, bool symmetricBox)
     {
@@ -133,13 +180,40 @@ public static class ShadowPatches
         var prepare = AccessTools.Method(type, "PrepareForShadowRendering",
                           [typeof(double), typeof(EnumFrameBuffer), typeof(float)])
                       ?? throw new InvalidOperationException("PrepareForShadowRendering not found");
-        harmony.Patch(prepare, prefix: new HarmonyMethod(
-            AccessTools.Method(typeof(ShadowPatches), nameof(ScaleDistance))));
+        harmony.Patch(prepare,
+            prefix: new HarmonyMethod(AccessTools.Method(typeof(ShadowPatches), nameof(ScaleDistance))),
+            postfix: new HarmonyMethod(AccessTools.Method(typeof(ShadowPatches), nameof(PadCullRange))));
 
         var far = AccessTools.Method(type, "OnRenderShadowFar", [typeof(float)])
                   ?? throw new InvalidOperationException("OnRenderShadowFar not found");
         harmony.Patch(far, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowPatches), nameof(MatchFadeToBox))));
+
+        var near = AccessTools.Method(type, "OnRenderShadowNear", [typeof(float)])
+                   ?? throw new InvalidOperationException("OnRenderShadowNear not found");
+        harmony.Patch(near, postfix: new HarmonyMethod(
+            AccessTools.Method(typeof(ShadowPatches), nameof(CaptureNearBox))));
+    }
+
+    /// <summary>
+    /// Runs after the near cascade prepared its box, which is the only moment the box fields
+    /// hold the NEAR box (the far one overwrote them a stage earlier and will again next
+    /// frame). Pure bookkeeping for the HUD; nothing about the pass changes.
+    /// </summary>
+    public static void CaptureNearBox(SystemRenderShadowMap __instance)
+    {
+        try
+        {
+            var box = ShadowBoxRef(__instance);
+            if (box == null) return;
+            var span = Math.Max(box.Width, box.Height);
+            if (span > 0 && !double.IsNaN(span))
+            {
+                NearBoxSpan = span;
+                NearShadowDistance = ShadowBox.SHADOW_DISTANCE;
+            }
+        }
+        catch (Exception) { /* a missing span only costs a HUD row */ }
     }
 
     /// <summary>Hands every shadow behaviour back to vanilla in one call (safemode).</summary>
@@ -148,6 +222,10 @@ public static class ShadowPatches
         SymmetricBox = false;
         FadeFix = false;
         DistanceMultiplier = 1.0;
+        // EffectiveFarBoxMargin follows SymmetricBox on its own, so the throttle's movement
+        // limit drops back with it - but the map currently retained was drawn for the wide
+        // box, and the next one will not be. One forced redraw, and the two agree again.
+        ShadowThrottlePatches.Invalidate();
     }
 
     /// <summary>Restores whatever komet.json configured.</summary>
@@ -156,6 +234,7 @@ public static class ShadowPatches
         SymmetricBox = symmetricBox;
         FadeFix = fadeFix;
         DistanceMultiplier = ConfiguredMultiplier;
+        ShadowThrottlePatches.Invalidate();
     }
 
     /// <summary>
@@ -195,7 +274,9 @@ public static class ShadowPatches
             var camera = CameraRef(__instance);
             var origin = camera?.OriginPosition;
             var lightView = __instance.lightViewMatrix;
-            var r = ShadowBox.SHADOW_DISTANCE * BoxRadiusFactor;
+            // The fade needs BoxRadiusFactor x R; the margin is the room on top of it that a
+            // retained map needs while the camera moves (see FarBoxMargin).
+            var r = ShadowBox.SHADOW_DISTANCE * BoxRadiusFactor + EffectiveFarBoxMargin;
             if (origin == null || lightView == null || lightView.Length < 16 || r <= 0) return;
 
             SymmetricLightSpaceBounds(lightView, origin.X, origin.Y, origin.Z, r,
@@ -249,6 +330,29 @@ public static class ShadowPatches
         minX = cx - r; maxX = cx + r;
         minY = cy - r; maxY = cy + r;
         minZ = cz - r; maxZ = cz + r;
+    }
+
+    /// <summary>
+    /// Lets the sweep see the margin ring too.
+    ///
+    /// PrepareForShadowRendering derives the culler's shadowRangeX/Z from the shadow distance,
+    /// a step BEFORE the box postfix widens the box - so without this, every part in the ring
+    /// the margin just added would be culled away and the ring would be empty. An empty ring
+    /// is the exact cut-off line the margin exists to prevent, only immediately instead of
+    /// after a few frames.
+    ///
+    /// The engine's own values are the tight ones for a box without margin, so adding the
+    /// margin is the same widening on both sides of the same box.
+    /// </summary>
+    public static void PadCullRange(ClientMain ___game, EnumFrameBuffer fb)
+    {
+        if (fb != EnumFrameBuffer.ShadowmapFar) return;
+        var margin = EffectiveFarBoxMargin;
+        if (margin <= 0) return;
+        var culler = ___game?.frustumCuller;
+        if (culler == null) return;
+        culler.shadowRangeX += margin;
+        culler.shadowRangeZ += margin;
     }
 
     /// <summary>Only the far cascade is stretched; the near one is already tight around the player.</summary>

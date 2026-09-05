@@ -116,6 +116,11 @@ public static class RendererProfiler
         }
 
         int total = 0, wrapped = 0;
+        // Who owns how many renderers, recounted from zero on every pass (see
+        // ModProfiler.BeginRendererCount). Only while the mod profiler is on: the count is a
+        // dictionary lookup per renderer, and at view distance 1536 there are thousands.
+        var countMods = Measure.ModProfiler.Enabled;
+        if (countMods) Measure.ModProfiler.BeginRendererCount();
         for (var stage = first; stage <= last; stage++)
         {
             var list = manager.renderersByStage[stage];
@@ -127,7 +132,14 @@ public static class RendererProfiler
                 var handler = list[i];
                 if (handler?.Renderer == null) continue;
                 total++;
-                if (handler.Renderer is Timed) { wrapped++; wrappedHere++; continue; }
+                if (handler.Renderer is Timed already)
+                {
+                    // the wrapper's own type is komet's, so the count has to ask the renderer
+                    // inside it who it belongs to
+                    if (countMods) already.Mod.Renderers++;
+                    wrapped++; wrappedHere++; continue;
+                }
+                if (countMods) Measure.ModProfiler.Of(handler.Renderer.GetType()).Renderers++;
 
                 handler.Renderer = new Timed(handler.Renderer, handler.ProfilingName ?? "?", (EnumRenderStage)stage);
                 wrapped++;
@@ -244,10 +256,21 @@ public static class RendererProfiler
         /// </summary>
         private readonly Entry entry;
 
+        /// <summary>
+        /// The mod this renderer came out of, resolved once from the wrapped instance's type.
+        ///
+        /// Resolved here rather than looked up per frame for the same reason the profiling
+        /// bucket is: a type's assembly, and therefore its mod, never changes, while there are
+        /// thousands of instances and this runs inside the frame. The whole per-mod attribution
+        /// costs one field add per measured call because of this line.
+        /// </summary>
+        internal readonly Measure.ModProfiler.Entry Mod;
+
         public Timed(IRenderer inner, string name, EnumRenderStage stage)
         {
             Inner = inner;
             entry = Bucket(name, stage);
+            Mod = Measure.ModProfiler.Of(inner.GetType());
         }
 
         public double RenderOrder => Inner.RenderOrder;
@@ -267,7 +290,9 @@ public static class RendererProfiler
 
             var t0 = Stopwatch.GetTimestamp();
             Inner.OnRenderFrame(dt, renderStage);
-            entry.Ticks += Stopwatch.GetTimestamp() - t0;
+            var spent = Stopwatch.GetTimestamp() - t0;
+            entry.Ticks += spent;
+            Mod.RenderTicks += spent;
         }
 
         public void Dispose() => Inner.Dispose();
@@ -303,6 +328,12 @@ public static class RendererProfiler
             e.Ms += (ms - e.Ms) * Alpha;
             e.Ticks = 0;
         }
+
+        // The mod buckets are fed by the decorators above, so they fold on exactly the
+        // cadence the decorators measure on - BEFORE the flag below decides the next frame.
+        // Folding them every frame instead would blend three zeros into every average and
+        // report every mod at a quarter of its cost.
+        if (measuringThisFrame) Measure.ModProfiler.FoldRender();
 
         measuringThisFrame = ++frameIndex % SampleEveryNthFrame == 0;
     }

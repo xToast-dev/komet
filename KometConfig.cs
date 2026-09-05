@@ -19,7 +19,7 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "11";
+    public const string Current = "15";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
@@ -394,11 +394,58 @@ public class KometConfig
     /// block into the shadow map. Skipping the stand-in there leaves the *more* detailed mesh
     /// in place, so shadows should be unchanged or marginally more accurate.
     ///
-    /// Off by default because it is a real change to what vanilla draws and the effect can
-    /// only be judged by looking at shadows in your world - turn it on, look at foliage and
-    /// fences, turn it off again if anything looks thinner.
+    /// On by default since 05.09. (it was off for a week as "a real change to what vanilla
+    /// draws"): the stand-in is only ever dropped where its detailed twin is already in the
+    /// map, so the shadow can only move closer to what the camera shows - and the rule is now
+    /// decided per grid cell, where it actually fires in a streamed-in world. Look at foliage
+    /// and fences in shadow; '.komet toggle shadowlod' flips it live if anything looks thinner.
     /// </summary>
-    public bool ShadowSkipRedundantLod { get; set; }
+    public bool ShadowSkipRedundantLod { get; set; } = true;
+
+    /// <summary>
+    /// Edge length of the NEAR shadow cascade's map in pixels. 0 = the engine's size, which is
+    /// the far map's (6144 at quality 4, 7168 with ShadowMapExtraQuality 1).
+    ///
+    /// The near cascade covers vanilla's 39-block wedge - about 60 x 34 blocks at FoV 70 - so
+    /// a 7168 px map spends over a hundred texels per block on it while the far map, which
+    /// shadows everything beyond 45 blocks, has fifteen. The GPU report priced the near pass
+    /// at 5,8 ms of an 8,9 ms GPU frame for a few dozen chunks: a depth pass costs texels
+    /// times depth complexity, not geometry, and this is the one number that sets the texels.
+    /// The cost goes with the square of this value; 4096 makes the near pass a third of what
+    /// it was, 3072 a fifth. The map's sampling in the shader is unchanged (the PCF spacing
+    /// comes from the far map), so near shadow edges come out a touch crisper rather than
+    /// blurrier - at 4096 about as vanilla renders them at quality 2.
+    ///
+    /// '.komet shadownear 3072' (or any size, 'off' for the engine's) changes it live and
+    /// rebuilds the framebuffers, the same thing the graphics menu does on a change.
+    /// </summary>
+    public int ShadowNearMapSize { get; set; } = 4096;
+
+    /// <summary>
+    /// Back-face culling for the solid chunk passes (Opaque and TopSoil) while they are drawn
+    /// into the shadow maps. Vanilla draws the whole shadow pass without culling; the foliage
+    /// passes (OpaqueNoCull, BlendNoCull) keep that, they must cast from either side. The solid
+    /// passes are drawn WITH culling in the camera pass, so their volumes are closed and their
+    /// back faces always lie behind their front faces along the light too - the depth map is
+    /// the same, the GPU skips half the solid faces before a fragment exists. On a fill-bound
+    /// shadow pass that is the cheapest saving available. '.komet toggle shadowcull' flips it.
+    /// </summary>
+    public bool ShadowCullBackfaces { get; set; } = true;
+
+    /// <summary>
+    /// Draw the solid chunk passes (Opaque and TopSoil) into the shadow maps with a depth-only
+    /// shader: the engine's own vertex shader, and a fragment shader that does nothing. The
+    /// engine's chunkshadowmap.fsh samples the terrain texture and discards below alpha 0.02
+    /// for every fragment of every pass - the solid cubes included, whose texels are never
+    /// transparent. A shader with `discard` in it forbids the early depth write, so fragments
+    /// behind an already drawn surface are still shaded, and every surviving one pays a texture
+    /// fetch. Without it the GPU writes depth first and never shades what is hidden. The foliage
+    /// passes keep the engine's shader; they need the alpha test. The program is built from the
+    /// engine's live shader (SSBO mode, wind, a shader mod's replacement all reproduced) and
+    /// rebuilt on every shader reload; if it fails to compile the engine's stays in use and the
+    /// report says why. '.komet toggle shadowdepth' flips it.
+    /// </summary>
+    public bool ShadowDepthOnlySolidPasses { get; set; } = true;
 
     /// <summary>
     /// Shortest gap, in frames, between two renders of the far shadow cascade. The shadow
@@ -448,6 +495,33 @@ public class KometConfig
     public double ShadowFarMoveThreshold { get; set; } = 0.15;
 
     /// <summary>
+    /// Extra blocks of coverage the far shadow cascade is drawn with, so the retained map
+    /// survives the camera moving. 0 = off (exactly the box as before).
+    ///
+    /// This is the setting that makes the throttle above worth anything while playing. The
+    /// far map is kept for several frames and reprojected exactly, but a reprojection cannot
+    /// extend what the map covers - so ShadowFarMoveThreshold (0,15 blocks) forced a redraw
+    /// almost every frame as soon as anybody walked, and the whole saving existed only for a
+    /// player standing still. Drawing the box m blocks wider means the retained map still
+    /// covers everything the shader samples until the camera has moved m blocks, and the
+    /// movement limit rises to 0.9 x m in step: the far cascade then updates at
+    /// ShadowFarMaxSkip instead of every frame, moving or not.
+    ///
+    /// The trade is texel density, and it is worth stating in both directions: 16 blocks on a
+    /// ~255 block cascade is about 6 % coarser far shadows, for roughly a quarter of the far
+    /// cascade's GPU cost while moving (a depth pass costs texels times depth complexity, and
+    /// the cost per drawn frame does not change - the number of drawn frames does). The HUD's
+    /// `shadow map` row shows the resulting texels per block, the `shadow cadence` row shows
+    /// how many frames are actually saved, and '.komet toggle shadowmargin' plus the stress
+    /// phase price both in your scene rather than in this comment.
+    ///
+    /// Needs the symmetric box (SymmetricShadowBox): the containment argument is that a sphere
+    /// of radius r+m around the old camera contains the sphere of radius r around every camera
+    /// position within m of it. Vanilla's cone has no such property.
+    /// </summary>
+    public double ShadowFarBoxMargin { get; set; } = 16.0;
+
+    /// <summary>
     /// Same for the near cascade. Left at 1 by default: it covers the ground right around you,
     /// where any lag is much easier to see. When set above 1 it is phase-shifted against the
     /// far cascade so the two never skip on the same frame.
@@ -487,6 +561,29 @@ public class KometConfig
 
     /// <summary>Show the on-screen performance overlay right away. Toggle in game with F7.</summary>
     public bool DebugHudVisible { get; set; }
+
+    /// <summary>
+    /// Attribute what is measured to the MOD it came from, and collect what each mod does
+    /// (Harmony patches, registered block/item/entity classes, time spent in its load phases).
+    ///
+    /// It rides on the two profilers that already exist: each renderer and tick listener
+    /// wrapper resolves its owning mod once when it is wrapped and books its ticks into that
+    /// mod's bucket as well, so the per-frame price is one field add per measured call. What it
+    /// costs on top of that is a periodic scan of Harmony's registry and the class registry
+    /// (every ten seconds, like the patch guard's) and a prefix/postfix pair around the mod
+    /// loader's phase call, which runs a few hundred times per session.
+    ///
+    /// Read the caveats on the HUD, not just the numbers: a Harmony patch runs inside the
+    /// engine method it patches, so its time is booked to the engine - which is why the patch
+    /// COUNT is reported next to the milliseconds.
+    /// </summary>
+    public bool ProfileMods { get; set; } = true;
+
+    /// <summary>Show the mod profiler overlay right away. It sits in the opposite screen corner
+    /// from the performance HUD; Shift+F7 (or '.komet mods hud') cycles it off / compact / full.
+    /// Shift+F7 rather than a key of its own: this mod already owns F7, and the keys that look
+    /// unused are not.</summary>
+    public bool ModHudVisible { get; set; }
 
     /// <summary>
     /// Raster the HUD text on a worker thread instead of inside the frame. The full rebuild
@@ -784,6 +881,20 @@ public class KometConfig
     /// live (off flushes everything held).
     /// </summary>
     public double EntityLoadBudgetMs { get; set; } = 1.5;
+
+    /// <summary>
+    /// Generate an entity shape's animation frames on a worker thread before the first entity
+    /// of that shape enters the world. The engine builds them lazily on the main thread the
+    /// first time each animation starts - measured against the game's own shape files:
+    /// chicken-rooster 11,9 ms for its 13 animations, "attack" alone 4,7 ms; the report's "anim
+    /// most expensive 53,1 ms (pig)" is that cost on a bigger shape - once per creature type
+    /// per session, always in the frame a new kind of animal first moves. With the load hold in
+    /// place (EntityLoadBudgetMs above 0) the first held entity of a shape starts a worker, the
+    /// entity waits the few milliseconds the worker needs, and the main thread finds the frames
+    /// ready. A shape that is already in use by a loaded entity is never touched off-thread.
+    /// Needs the entity load hold; without it there is no window. '.komet toggle animwarm'.
+    /// </summary>
+    public bool EntityAnimationPrewarm { get; set; } = true;
 
     /// <summary>
     /// Time every main-thread task (ClientMain.ExecuteMainThreadTasks: every non-chunk server

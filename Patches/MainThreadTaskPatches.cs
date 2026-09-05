@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
+using System.Threading;
 using HarmonyLib;
 using Komet.Guard;
 using Vintagestory.API.Common;
@@ -94,10 +96,57 @@ public static class MainThreadTaskPatches
     private static readonly AccessTools.FieldRef<ClientMain, bool> SuspendRef =
         AccessTools.FieldRefAccess<ClientMain, bool>("SuspendMainThreadTasks");
 
+    /// <summary>
+    /// The lock the network thread's enqueue and this drain share - resolved by NAME, because
+    /// its type is not the same on every client. Vanilla declares it <c>object</c> and takes
+    /// it with Monitor; the Optimum fork (v0.3.14) declares it <c>System.Threading.Lock</c> and
+    /// enters it with EnterScope. A field reference compiled into IL carries the field's type,
+    /// so the vanilla binding threw MissingFieldException on the first frame of the fork
+    /// (1.2.0-pre.3 crashed in the connecting screen). Read once per game instance, never per
+    /// frame: the object is created with the ClientMain and never replaced.
+    /// </summary>
+    internal static readonly FieldInfo LockField = AccessTools.Field(typeof(ClientMain), "MainThreadTasksLock");
+
+    /// <summary>
+    /// Takes the queue lock the way its type demands. This is not a convenience: Monitor on a
+    /// <see cref="Lock"/> instance is a DIFFERENT lock than the one the fork's
+    /// EnqueueMainThreadTask holds, so a plain <c>lock (obj)</c> would leave the handover
+    /// racing the network thread without any exception to say so.
+    /// </summary>
+    internal readonly struct QueueLock
+    {
+        private readonly Lock typed;
+        private readonly object monitor;
+
+        /// <summary>From the field's value: a <see cref="Lock"/> is entered as one, anything
+        /// else is a Monitor lock (vanilla's plain object).</summary>
+        public QueueLock(object instance)
+        {
+            typed = instance as Lock;
+            monitor = typed == null ? instance : null;
+        }
+
+        public bool IsTyped => typed != null;
+
+        public void Enter()
+        {
+            if (typed != null) typed.Enter();
+            else Monitor.Enter(monitor);
+        }
+
+        public void Exit()
+        {
+            if (typed != null) typed.Exit();
+            else Monitor.Exit(monitor);
+        }
+    }
+
     // The two delegates RunTasks takes are cached per game instance rather than allocated
     // per frame - a closure per frame is small, but this runs every frame for the life of
-    // the session and the point of the patch is to remove garbage, not add it.
+    // the session and the point of the patch is to remove garbage, not add it. The lock
+    // rides along: one reflection read per session instead of one per frame.
     private static ClientMain cachedGame;
+    private static QueueLock cachedLock;
     private static Func<bool> cachedSuspended;
     private static Action cachedRequeue;
 
@@ -105,6 +154,13 @@ public static class MainThreadTaskPatches
     {
         var target = AccessTools.Method(typeof(ClientMain), nameof(ClientMain.ExecuteMainThreadTasks), [typeof(float)])
                      ?? throw new InvalidOperationException("ClientMain.ExecuteMainThreadTasks not found");
+        // A lock of a third kind is a client this transcription has not seen: the drain stays
+        // vanilla's (the caller logs "could not enable") rather than guessing how to take it.
+        if (LockField == null)
+            throw new InvalidOperationException("ClientMain.MainThreadTasksLock not found");
+        if (LockField.FieldType != typeof(object) && LockField.FieldType != typeof(Lock))
+            throw new InvalidOperationException("ClientMain.MainThreadTasksLock is a " + LockField.FieldType.FullName
+                + " - this drain knows object (vanilla) and System.Threading.Lock (Optimum), nothing else");
         harmony.Patch(target, prefix: new HarmonyMethod(typeof(MainThreadTaskPatches), nameof(Prefix)));
     }
 
@@ -128,21 +184,32 @@ public static class MainThreadTaskPatches
         }
         if (SuspendRef(game)) return;
 
+        if (!ReferenceEquals(cachedGame, game))
+        {
+            cachedGame = game;
+            cachedLock = new QueueLock(LockField.GetValue(game));
+            var l = cachedLock;
+            cachedSuspended = () => SuspendRef(game);
+            cachedRequeue = () => Requeue(game, l);
+        }
+
         var reversed = ReversedRef(game);
-        lock (game.MainThreadTasksLock)
+        Handover(game, reversed, cachedLock);
+        RunTasks(reversed, cachedSuspended, cachedRequeue, game.extendedDebugInfo ? profiler : null);
+        profiler.Mark("doneMTT");
+    }
+
+    /// <summary>The handover under the shared lock: everything the network thread queued since
+    /// the last frame moves to the drain's private queue, in order.</summary>
+    private static void Handover(ClientMain game, Queue<ClientTask> reversed, QueueLock l)
+    {
+        l.Enter();
+        try
         {
             var tasks = game.MainThreadTasks;
             while (tasks.Count > 0) reversed.Enqueue(tasks.Dequeue());
         }
-
-        if (!ReferenceEquals(cachedGame, game))
-        {
-            cachedGame = game;
-            cachedSuspended = () => SuspendRef(game);
-            cachedRequeue = () => Requeue(game);
-        }
-        RunTasks(reversed, cachedSuspended, cachedRequeue, game.extendedDebugInfo ? profiler : null);
-        profiler.Mark("doneMTT");
+        finally { l.Exit(); }
     }
 
     /// <summary>
@@ -187,17 +254,19 @@ public static class MainThreadTaskPatches
 
     /// <summary>ClientMain.requeueTasks, transcribed: what is left goes back to the front of
     /// the shared queue, ahead of anything that arrived meanwhile.</summary>
-    private static void Requeue(ClientMain game)
+    private static void Requeue(ClientMain game, QueueLock l)
     {
         var reversed = ReversedRef(game);
         var holding = HoldingRef(game);
-        lock (game.MainThreadTasksLock)
+        l.Enter();
+        try
         {
             var tasks = game.MainThreadTasks;
             while (tasks.Count > 0) holding.Enqueue(tasks.Dequeue());
             while (reversed.Count > 0) tasks.Enqueue(reversed.Dequeue());
             while (holding.Count > 0) tasks.Enqueue(holding.Dequeue());
         }
+        finally { l.Exit(); }
     }
 
     /// <summary>Books one finished task into the frame and into its code's smoothed entry.</summary>
@@ -294,6 +363,7 @@ public static class MainThreadTaskPatches
     {
         WorldReady = false;
         cachedGame = null;
+        cachedLock = default;
         cachedSuspended = null;
         cachedRequeue = null;
     }

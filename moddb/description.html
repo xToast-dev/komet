@@ -1,152 +1,140 @@
 <!-- ============================================================================
-  Komet — ModDB description with the Vanilla-vs-Komet metrics panel.
+  Komet - ModDB description, sleek rewrite for 1.2.0-pre.3.
   Paste-ready for mods.vintagestory.at (TinyMCE editor -> Tools/View: Source code).
   Inline styles only: the ModDB strips <style>/<script>, but keeps style="",
   tables and headings (verified against live mod pages). Every visual element
   degrades to plain text + tables if a style is stripped.
+
+  Changes over the previous version of this file:
+    - Sleeker: the per-row bar charts are gone, the big sweep panel is now a
+      four-tile headline strip, sections are shorter. Numbers carry the page.
+    - The bench table is three columns: vanilla -> 1.0.0 -> 1.2.0-pre.3.
+    - Optimum is listed as NOT compatible, with a recommendation to look at it.
+
   Data sources (nothing estimated):
-    - in-game stress test / .komet report (client-main.log), Aug 2026
-    - ./build.sh bench of 2026-08-30 (byte-identical culling verified, then timed)
+    - 1.0.0 column: ./build.sh bench of 2026-08-30, the run published on the
+      1.0.0 page. (Repo note: that bench ran on the code released as 1.0.0/1.1.0;
+      the repo's oldest commit is the 1.1.0 one, so nothing older can be re-run.)
+    - 1.2.0-pre.3 column: ./build.sh bench of 2026-09-05, same machine.
+    - in-game rows: stress test / .komet report (client-main.log), Aug 2026;
+      not re-measured for pre.3, and the table says so.
+  Every bench run measures its own vanilla baseline, so the vanilla column
+  carries both figures - the drift between them is machine noise, and each
+  Komet figure is compared against the vanilla of its own run.
   Comparison rule: x-factor = vanilla / Komet; percentages = (vanilla-Komet)/vanilla.
-  SYNC NOTE 2026-08-30: the live page was hand-edited by xToast (intro wording, Todo
-  section, "Direct Compatibility to Mods" table). This file mirrors that state and is
-  the paste source; repairs over the live version: the legend's escaped comment
-  (rendered as literal text) removed, the legend colour swatches restored, and the
-  edge-retess-priority feature added to the chunk-loading bullet.
-  2026-08-30 (later): game dependency relaxed to 1.22.0 (modinfo.json via build.sh);
-  the Install paragraph states the requirement and that 1.22.7 is the verified build.
-  1.1.0: KometBaseline is packed as its own zip by build.sh release and the page now
-  calls it a separate download; changelog for the file upload: changelog-1.1.0.html.
 ============================================================================= -->
 
-<p><strong>Komet</strong> is a client-side performance mod. It rewrites the hot paths of the render loop &mdash; the visibility sweep, occlusion culling, draw-range batching, and smooths the rest of the experience: chunk loading, stutter from GC pressure and driver syncs, shadow artefacts, VRAM held by empty pools. All without changing what ends up on screen: on every build the culling core is verified <strong>byte-identical against vanilla</strong> (3,120/3,120 checks) before anything is timed. The render-loop gains grow with view distance &mdash; which is why the measurements below were taken at view distance 1536, where vanilla struggles most.</p>
-<p>Every number below was <strong>measured, not estimated,</strong>&nbsp;either in-game with the mod's built-in stress test and <code>.komet report</code>, or in the mod's benchmark on real game data structures. Where a vanilla figure does not exist, this page says so instead of inventing one.</p>
-<h3>Same scene, one switch: the visibility sweep</h3>
-<p style="margin: 4px 0 10px 0;">The built-in stress test flips one feature at a time back to the vanilla code path, in the same loaded scene (view distance 1536, standing), with interleaved baselines so scene drift cancels out. The biggest single item is the <strong>visibility sweep</strong> &mdash; the per-frame test of which mesh parts are on screen; at this view distance the engine tests several hundred thousand of them per frame:</p>
-<div style="border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 14px 16px; max-width: 680px;">
-<div style="margin-bottom: 10px; font-size: 90%; color: #6f6f6f;"><span style="display: inline-block; width: 10px; height: 10px; background: #a9772f; border-radius: 2px;">&nbsp;</span> Vanilla code path&nbsp;&nbsp;&nbsp; <span style="display: inline-block; width: 10px; height: 10px; background: #2e6bb2; border-radius: 2px;">&nbsp;</span> Komet</div>
-<table style="width: 100%; border-collapse: collapse;">
-<tbody>
-<tr>
-<td style="padding: 3px 10px 3px 0; white-space: nowrap; color: #333; font-size: 92%;">Vanilla sweep</td>
-<td style="width: 55%; padding: 3px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 16px;">
-<div style="width: 100%; height: 16px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
+<p style="max-width: 820px; font-size: 108%;"><strong>Komet</strong> is a client-side performance mod. It rewrites the hot paths of the render loop &mdash; the visibility sweep, occlusion culling, draw-range batching &mdash; and smooths the rest: chunk loading, stutter from GC pressure and driver syncs, shadow artefacts, VRAM held by empty pools. Without changing what ends up on screen: on every build the culling core is verified <strong>byte-identical against vanilla</strong> before anything is timed.</p>
+
+<p style="max-width: 820px; color: #6f6f6f;">Every number on this page was <strong>measured, not estimated</strong> &mdash; in the mod's benchmark on real game data structures, or in-game with the built-in stress test and <code>.komet report</code>. Where a vanilla figure does not exist, this page says so instead of inventing one. Gains grow with view distance, which is why the measurements were taken at view distance&nbsp;1536.</p>
+
+<div style="max-width: 820px; margin: 18px 0 6px 0;">
+<div style="display: inline-block; border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 12px 16px; margin: 0 6px 8px 0; min-width: 148px; vertical-align: top;">
+<div style="font-size: 190%; font-weight: 600; color: #2e6bb2; line-height: 1.1;">2.8&times;</div>
+<div style="font-size: 88%; color: #333; margin-top: 2px;">frame rate, same scene</div>
+<div style="font-size: 82%; color: #6f6f6f;">16.8 &rarr; 6.1 ms/frame</div>
 </div>
-</td>
-<td style="padding: 3px 0 3px 10px; white-space: nowrap; color: #333; font-variant-numeric: tabular-nums;"><strong>16.8&nbsp;ms</strong>/frame &nbsp;<span style="color: #6f6f6f;">&asymp;&nbsp;60&nbsp;fps</span></td>
-</tr>
-<tr>
-<td style="padding: 3px 10px 3px 0; white-space: nowrap; color: #333; font-size: 92%;">Komet sweep</td>
-<td style="padding: 3px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 16px;">
-<div style="width: 36%; height: 16px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
+<div style="display: inline-block; border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 12px 16px; margin: 0 6px 8px 0; min-width: 148px; vertical-align: top;">
+<div style="font-size: 190%; font-weight: 600; color: #2e6bb2; line-height: 1.1;">5.9&times;</div>
+<div style="font-size: 88%; color: #333; margin-top: 2px;">visibility sweep</div>
+<div style="font-size: 82%; color: #6f6f6f;">177,000 mesh parts</div>
 </div>
-</td>
-<td style="padding: 3px 0 3px 10px; white-space: nowrap; color: #333; font-variant-numeric: tabular-nums;"><strong>6.1&nbsp;ms</strong>/frame &nbsp;<span style="color: #6f6f6f;">&asymp;&nbsp;164&nbsp;fps</span></td>
-</tr>
-</tbody>
-</table>
-<p style="margin: 10px 0 0 0;"><span style="color: #468847; font-weight: bold;">▼ &minus;64 % frame time &mdash; 2.8&times; the frame rate</span></p>
-<p style="margin: 6px 0 0 0; font-size: 85%; color: #6f6f6f;">In-game, Aug&nbsp;2026. Both phases are the same session and scene; only the sweep is switched. Noise floor of a phase: &plusmn;0.3&nbsp;ms.</p>
+<div style="display: inline-block; border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 12px 16px; margin: 0 6px 8px 0; min-width: 148px; vertical-align: top;">
+<div style="font-size: 190%; font-weight: 600; color: #2e6bb2; line-height: 1.1;">3.4&times;</div>
+<div style="font-size: 88%; color: #333; margin-top: 2px;">chunk load throughput</div>
+<div style="font-size: 82%; color: #6f6f6f;">82 &rarr; 279 chunks/s</div>
 </div>
-<h3>Todo:</h3>
-<p>- Add more language support regarding the F7 Hud</p>
-<h3><span style="font-size: 16px;">Vanilla vs. Komet, subsystem by subsystem</span></h3>
-<p style="margin: 4px 0 8px 0; font-size: 90%; color: #6f6f6f;">Bars are scaled to the vanilla value of each row &mdash; shorter is better. <strong>V</strong>&nbsp;= vanilla code path, <strong>K</strong>&nbsp;= Komet.</p>
+<div style="display: inline-block; border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 12px 16px; margin: 0 6px 8px 0; min-width: 148px; vertical-align: top;">
+<div style="font-size: 190%; font-weight: 600; color: #468847; line-height: 1.1;">3,120/3,120</div>
+<div style="font-size: 88%; color: #333; margin-top: 2px;">identical to vanilla</div>
+<div style="font-size: 82%; color: #6f6f6f;">checked on every build</div>
+</div>
+</div>
+<p style="font-size: 85%; color: #6f6f6f; max-width: 820px; margin-top: 0;">Frame rate: in-game stress test, one feature switched back to the vanilla code path in the same loaded scene, interleaved baselines so scene drift cancels out. The rest: see the tables below.</p>
+
+<h3>Vanilla &rarr; 1.0.0 &rarr; 1.2.0-pre.3</h3>
+<p style="margin: 4px 0 10px 0; max-width: 820px;">The mod's own benchmark runs the real culling code on real game data structures and proves the output byte-identical to vanilla before it times anything. It re-measures vanilla in every run, so both baselines are shown &mdash; each Komet figure is compared against the vanilla of its own run.</p>
+
 <div style="overflow-x: auto;">
 <table style="border-collapse: collapse; min-width: 620px; max-width: 820px; width: 100%;">
 <tbody>
 <tr style="color: #6f6f6f; font-size: 82%; text-transform: uppercase; letter-spacing: 0.04em;">
-<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px 6px 0;">Subsystem</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px 6px 0;">Benchmark, view distance 1536</td>
 <td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px; text-align: right;">Vanilla</td>
-<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px; text-align: right;">Komet</td>
-<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px;">Change</td>
-<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 0; width: 150px;">V over K</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px; text-align: right;">Komet 1.0.0</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 0 6px 8px; text-align: right;">Komet 1.2.0-pre.3</td>
 </tr>
 <tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Visibility sweep, per frame <span style="color: #6f6f6f; font-size: 85%;">(bench&sup1;, 177,000 mesh parts)</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;">9.61&nbsp;ms</td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>1.96&nbsp;ms</strong></td>
-<td style="padding: 8px; white-space: nowrap;"><span style="color: #468847; font-weight: bold;">▼ 4.9&times; faster</span></td>
-<td style="padding: 8px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 12px;">
-<div style="width: 100%; height: 12px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
-</div>
-<div style="background: #efe6d2; border-radius: 4px; height: 12px; margin-top: 2px;">
-<div style="width: 20%; height: 12px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
-</div>
-</td>
+<td style="padding: 10px 8px 10px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Visibility sweep, per frame<br /><span style="color: #6f6f6f; font-size: 85%;">in-game pool shape, 177,000 mesh parts</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">9.61&nbsp;ms<br /><span style="font-size: 85%;">8.99&nbsp;ms</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>1.96&nbsp;ms</strong><br /><span style="color: #468847; font-size: 85%;">4.9&times;</span></td>
+<td style="padding: 10px 0 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>1.54&nbsp;ms</strong><br /><span style="color: #468847; font-size: 85%;">5.9&times;</span></td>
 </tr>
 <tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Occlusion pass at view distance 1536 <span style="color: #6f6f6f; font-size: 85%;">(bench&sup1;, 74,034 rays; Komet also moves it off the main thread)</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;">85.0&nbsp;ms</td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>4.3&nbsp;ms</strong></td>
-<td style="padding: 8px; white-space: nowrap;"><span style="color: #468847; font-weight: bold;">▼ 19.8&times; faster</span></td>
-<td style="padding: 8px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 12px;">
-<div style="width: 100%; height: 12px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
-</div>
-<div style="background: #efe6d2; border-radius: 4px; height: 12px; margin-top: 2px;">
-<div style="width: 5%; height: 12px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
-</div>
-</td>
+<td style="padding: 10px 8px 10px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Occlusion pass, per frame<br /><span style="color: #6f6f6f; font-size: 85%;">74,034 rays; Komet also moves it off the main thread</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">85.0&nbsp;ms<br /><span style="font-size: 85%;">71.1&nbsp;ms</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>4.3&nbsp;ms</strong><br /><span style="color: #468847; font-size: 85%;">19.8&times;</span></td>
+<td style="padding: 10px 0 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>4.2&nbsp;ms</strong><br /><span style="color: #468847; font-size: 85%;">16.8&times;</span></td>
 </tr>
 <tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Draw ranges handed to the GPU, per pass at 1536 <span style="color: #6f6f6f; font-size: 85%;">(bench&sup1;; fewer, larger batches)</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;">4,424</td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>2,541</strong></td>
-<td style="padding: 8px; white-space: nowrap;"><span style="color: #468847; font-weight: bold;">▼ &minus;43&nbsp;%</span></td>
-<td style="padding: 8px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 12px;">
-<div style="width: 100%; height: 12px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
-</div>
-<div style="background: #efe6d2; border-radius: 4px; height: 12px; margin-top: 2px;">
-<div style="width: 57%; height: 12px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
-</div>
-</td>
+<td style="padding: 10px 8px 10px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Draw ranges handed to the GPU, per pass<br /><span style="color: #6f6f6f; font-size: 85%;">fewer, larger batches; deterministic, hence unchanged</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">4,424</td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>2,541</strong><br /><span style="color: #468847; font-size: 85%;">&minus;43&nbsp;%</span></td>
+<td style="padding: 10px 0 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>2,541</strong><br /><span style="color: #468847; font-size: 85%;">&minus;43&nbsp;%</span></td>
 </tr>
 <tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Chunk tesselation cost during world load at 1536 <span style="color: #6f6f6f; font-size: 85%;">(in-game⁴; adaptive inflow + loading pipeline)</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;">12&nbsp;ms/chunk<br /><span style="color: #6f6f6f; font-size: 85%;">82&nbsp;chunks/s</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>3.4&nbsp;ms/chunk</strong><br /><span style="color: #6f6f6f; font-size: 85%;">279&nbsp;chunks/s</span></td>
-<td style="padding: 8px; white-space: nowrap;"><span style="color: #468847; font-weight: bold;">▲ 3.4&times; throughput</span></td>
-<td style="padding: 8px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 12px;">
-<div style="width: 100%; height: 12px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
-</div>
-<div style="background: #efe6d2; border-radius: 4px; height: 12px; margin-top: 2px;">
-<div style="width: 28%; height: 12px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
-</div>
-</td>
-</tr>
-<tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Scene full of block-entity renderers (firepits, signs &hellip;) at 1536 <span style="color: #6f6f6f; font-size: 85%;">(in-game&sup3;; vanilla never distance-culls them)</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;">21.7&nbsp;ms<br /><span style="color: #6f6f6f; font-size: 85%;">46&nbsp;fps</span></td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>13.2&nbsp;ms</strong><br /><span style="color: #6f6f6f; font-size: 85%;">76&nbsp;fps</span></td>
-<td style="padding: 8px; white-space: nowrap;"><span style="color: #468847; font-weight: bold;">▲ +65&nbsp;% fps</span></td>
-<td style="padding: 8px 0;">
-<div style="background: #efe6d2; border-radius: 4px; height: 12px;">
-<div style="width: 100%; height: 12px; background: #a9772f; border-radius: 4px;">&nbsp;</div>
-</div>
-<div style="background: #efe6d2; border-radius: 4px; height: 12px; margin-top: 2px;">
-<div style="width: 61%; height: 12px; background: #2e6bb2; border-radius: 0 4px 4px 0;">&nbsp;</div>
-</div>
-</td>
-</tr>
-<tr>
-<td style="padding: 8px 8px 8px 0; color: #333;">Driver syncs while chunks stream in <span style="color: #6f6f6f; font-size: 85%;">(in-game&sup2;, per-frame GL error checks skipped)</span></td>
-<td style="padding: 8px; text-align: right; color: #6f6f6f;">&mdash;</td>
-<td style="padding: 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>&minus;2.3&nbsp;ms</strong>/frame</td>
-<td style="padding: 8px; white-space: nowrap; color: #6f6f6f; font-size: 90%;">(&plusmn;1.5&nbsp;ms)</td>
-<td style="padding: 8px 0; color: #6f6f6f; font-size: 85%;">no vanilla base &mdash; delta only</td>
+<td style="padding: 10px 8px 10px 0; color: #333;">Sweep at a small load, per frame<br /><span style="color: #6f6f6f; font-size: 85%;">24,000 parts, three sweeps (opaque + both shadow passes)</span></td>
+<td style="padding: 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f;">1.19&nbsp;ms</td>
+<td style="padding: 10px 8px; text-align: right; color: #6f6f6f; font-size: 85%;">not published</td>
+<td style="padding: 10px 0 10px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>0.66&nbsp;ms</strong><br /><span style="color: #468847; font-size: 85%;">1.8&times;</span></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p style="font-size: 85%; color: #6f6f6f; margin-top: 6px;">&sup1; Mod benchmark (<code>./build.sh bench</code>, Aug&nbsp;30&nbsp;2026) on real game data structures; output is verified byte-identical to vanilla before anything is timed.&nbsp; &sup2; Measured in-game; the vanilla figure is the same session with that feature switched to the vanilla code path.&nbsp; &sup3; Same scene, distance culling off vs. on; &ldquo;off&rdquo; equals vanilla behaviour, which ignores the renderers&rsquo; own <code>RenderRange</code> entirely. Komet&rsquo;s other optimisations were active in both measurements &mdash; a pure vanilla frame of this scene would be slower still.&nbsp; ⁴ In-game, same world and load scenario, measured before vs. after the adaptive inflow shipped &mdash; not a same-session A/B.</p>
+<p style="font-size: 85%; color: #6f6f6f; max-width: 820px; margin-top: 6px;">1.0.0 column: benchmark run of 30&nbsp;Aug&nbsp;2026, as published on the 1.0.0 page. pre.3 column: run of 5&nbsp;Sep&nbsp;2026, same machine. The occlusion pass got no faster between the two &mdash; its factor moved because the vanilla baseline in the newer run came out faster, which is exactly why both baselines are printed rather than one. The sweep did get faster: same work, 1.96&nbsp;ms &rarr; 1.54&nbsp;ms.</p>
+
+<h3>Measured in the running game</h3>
+<p style="margin: 4px 0 10px 0; max-width: 820px;">These come from the stress test and <code>.komet report</code>, not the benchmark. They were taken in Aug&nbsp;2026 and have <strong>not been re-measured for pre.3</strong>, so they carry no version column &mdash; nothing in pre.3 touched these paths, but an unrepeated measurement should not be reprinted as a new one.</p>
+<div style="overflow-x: auto;">
+<table style="border-collapse: collapse; min-width: 560px; max-width: 820px; width: 100%;">
+<tbody>
+<tr style="color: #6f6f6f; font-size: 82%; text-transform: uppercase; letter-spacing: 0.04em;">
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px 6px 0;">In-game, view distance 1536</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px; text-align: right;">Vanilla path</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 8px; text-align: right;">Komet</td>
+<td style="border-bottom: 1px solid #ddd2bc; padding: 6px 0 6px 8px;">Change</td>
+</tr>
+<tr>
+<td style="padding: 9px 8px 9px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Visibility sweep, stress test<span style="color: #6f6f6f; font-size: 85%;"> &mdash; same session, only the sweep switched</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">16.8&nbsp;ms<br /><span style="font-size: 85%;">&asymp;&nbsp;60&nbsp;fps</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>6.1&nbsp;ms</strong><br /><span style="color: #6f6f6f; font-size: 85%;">&asymp;&nbsp;164&nbsp;fps</span></td>
+<td style="padding: 9px 0 9px 8px; white-space: nowrap; color: #468847; font-weight: bold; border-bottom: 1px solid #f0e9d9;">&minus;64&nbsp;% frame time</td>
+</tr>
+<tr>
+<td style="padding: 9px 8px 9px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Chunk tesselation during world load<span style="color: #6f6f6f; font-size: 85%;"> &mdash; adaptive inflow + loading pipeline</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">12&nbsp;ms/chunk<br /><span style="font-size: 85%;">82&nbsp;chunks/s</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>3.4&nbsp;ms/chunk</strong><br /><span style="color: #6f6f6f; font-size: 85%;">279&nbsp;chunks/s</span></td>
+<td style="padding: 9px 0 9px 8px; white-space: nowrap; color: #468847; font-weight: bold; border-bottom: 1px solid #f0e9d9;">3.4&times; throughput</td>
+</tr>
+<tr>
+<td style="padding: 9px 8px 9px 0; color: #333; border-bottom: 1px solid #f0e9d9;">Scene full of block-entity renderers<span style="color: #6f6f6f; font-size: 85%;"> &mdash; firepits, signs &hellip;; vanilla never distance-culls them</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #6f6f6f; border-bottom: 1px solid #f0e9d9;">21.7&nbsp;ms<br /><span style="font-size: 85%;">46&nbsp;fps</span></td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333; border-bottom: 1px solid #f0e9d9;"><strong>13.2&nbsp;ms</strong><br /><span style="color: #6f6f6f; font-size: 85%;">76&nbsp;fps</span></td>
+<td style="padding: 9px 0 9px 8px; white-space: nowrap; color: #468847; font-weight: bold; border-bottom: 1px solid #f0e9d9;">+65&nbsp;% fps</td>
+</tr>
+<tr>
+<td style="padding: 9px 8px 9px 0; color: #333;">Driver syncs while chunks stream in<span style="color: #6f6f6f; font-size: 85%;"> &mdash; per-frame GL error checks skipped</span></td>
+<td style="padding: 9px 8px; text-align: right; color: #6f6f6f;">&mdash;</td>
+<td style="padding: 9px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: #333;"><strong>&minus;2.3&nbsp;ms</strong>/frame</td>
+<td style="padding: 9px 0 9px 8px; white-space: nowrap; color: #6f6f6f; font-size: 90%;">no vanilla base &mdash; delta only (&plusmn;1.5&nbsp;ms)</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p style="font-size: 85%; color: #6f6f6f; max-width: 820px; margin-top: 6px;">The block-entity row compares distance culling off vs. on; &ldquo;off&rdquo; equals vanilla behaviour, which ignores the renderers&rsquo; own <code>RenderRange</code> entirely. Komet&rsquo;s other optimisations were active in both, so a pure vanilla frame of that scene would be slower still. The chunk-load row is the same world and scenario measured before vs. after the adaptive inflow shipped, not a same-session A/B.</p>
+
 <h3>A real session, straight from <code>.komet report</code></h3>
-<p style="margin: 4px 0 10px 0;">Komet ships its own measurement layer &mdash; an F7 HUD, a hitch log, a per-renderer profiler and the <code>.komet report</code> command, which writes one complete diagnostic block to <code>client-main.log</code>. This is such a block, unedited, while flying over <strong>streaming terrain</strong> at view distance 1536 (v1.51.8, Aug&nbsp;30&nbsp;2026):</p>
+<p style="margin: 4px 0 10px 0; max-width: 820px;">Komet ships its own measurement layer &mdash; an F7 HUD, a hitch log, a per-renderer profiler and <code>.komet report</code>, which writes one complete diagnostic block to <code>client-main.log</code>. This is such a block, unedited, while flying over <strong>streaming terrain</strong> at view distance 1536:</p>
 <div style="max-width: 820px;">
 <div style="display: inline-block; border: 1px solid #ddd2bc; border-radius: 6px; background: #ffffff; padding: 10px 14px; margin: 0 6px 8px 0; min-width: 118px; vertical-align: top;">
 <div style="font-size: 80%; color: #6f6f6f; text-transform: uppercase; letter-spacing: 0.04em;">Frame rate</div>
@@ -179,55 +167,66 @@
 <div style="font-size: 85%; color: #6f6f6f;">14 % of the frame</div>
 </div>
 </div>
-<p style="font-size: 90%; color: #6f6f6f; max-width: 820px;">This snapshot is <strong>Komet-side only</strong> &mdash; a matching vanilla recording of the same flight does not exist, so no vanilla column is shown. <strong>KometBaseline</strong> is a separate download on this page &mdash; a measurement-only twin built from the same source files: disable Komet, enable the baseline, press F7, and read the same numbers for vanilla on your own world.</p>
-<div style="border: 1px solid #ddd2bc; border-left: 3px solid #a9772f; border-radius: 4px; background: #faf6ec; padding: 10px 14px; max-width: 820px;"><strong style="color: #333;">Not measured, therefore not shown:</strong> <span style="color: #333;">GPU utilisation in percent (the report reads GPU frame <em>time</em>), RAM footprint vanilla vs. Komet, and a full-frame vanilla twin of the session above. Where a number does not exist, this page says so instead of estimating one.</span></div>
+<p style="font-size: 90%; color: #6f6f6f; max-width: 820px;">Komet-side only &mdash; a matching vanilla recording of the same flight does not exist, so no vanilla column is shown. <strong>KometBaseline</strong> is a separate download on this page: a measurement-only twin built from the same source files. Disable Komet, enable the baseline, press F7, and read the same numbers for vanilla on your own world.</p>
+
+<div style="border: 1px solid #ddd2bc; border-left: 3px solid #a9772f; border-radius: 4px; background: #faf6ec; padding: 10px 14px; max-width: 820px;"><strong style="color: #333;">Not measured, therefore not shown:</strong> <span style="color: #333;">GPU utilisation in percent (the report reads GPU frame <em>time</em>), RAM footprint vanilla vs. Komet, and a full-frame vanilla twin of the session above.</span></div>
+
 <h3>Why you can trust the numbers</h3>
 <ul style="max-width: 820px;">
-<li><strong>3,120/3,120</strong> culling test sweeps produce byte-identical triangles, in identical order, to vanilla &mdash; checked on every build.</li>
-<li><strong>2,304/2,304</strong> gap-merge checks stay pixel-equivalent.</li>
-<li>Every optimisation is <strong>individually toggleable</strong> in <code>komet.json</code>; <code>.komet safemode</code> flips everything that affects what is drawn back to vanilla, live, for A/B checks mid-session.</li>
-<li>Stress-test deltas use <strong>interleaved neighbour baselines</strong>, so linear scene drift cancels out exactly; deltas smaller than their &plusmn; spread are reported as noise.</li>
+<li><strong>3,120/3,120</strong> culling sweeps produce byte-identical triangles, in identical order, to vanilla &mdash; checked on every build, alongside <strong>2,304/2,304</strong> pixel-equivalent gap-merge checks.</li>
+<li>Every optimisation is <strong>individually toggleable</strong> in <code>komet.json</code>; <code>.komet safemode</code> flips everything that affects what is drawn back to vanilla, live, mid-session.</li>
+<li>Stress-test deltas use <strong>interleaved neighbour baselines</strong>, so linear scene drift cancels out; deltas smaller than their &plusmn; spread are reported as noise.</li>
+<li>Release builds are <strong>reproducible</strong>: the same commit produces the same bytes, and the SHA-256 on this page is also written by the build job onto the GitHub release &mdash; so it can be recomputed rather than trusted.</li>
 </ul>
 <p style="font-size: 85%; color: #6f6f6f; max-width: 820px;"><strong>How the comparison is computed:</strong> &times;-factors are vanilla&nbsp;&divide;&nbsp;Komet; percentages are (vanilla&nbsp;&minus;&nbsp;Komet)&nbsp;&divide;&nbsp;vanilla for times and (Komet&nbsp;&minus;&nbsp;vanilla)&nbsp;&divide;&nbsp;vanilla for rates and fps. Test machine: 12-thread CPU, AMD Radeon RX&nbsp;9070&nbsp;XT, Linux/Mesa, Vintage Story 1.22.7, view distance 1536 unless stated. Absolute numbers scale with view distance and hardware: the render-loop gains grow with view distance, while the loading, stutter and GC improvements apply at any distance.</p>
+
 <h3>What Komet actually changes</h3>
 <ul style="max-width: 820px;">
-<li>Visibility sweep: spatial grid per mesh pool, AVX2 kernel, own worker threads, bit-identical results.</li>
-<li>Occlusion culling: parallelised and moved off the main thread.</li>
-<li>Draw-range merging incl. bridging over frustum-clipped gaps &rarr; fewer, larger GPU batches.</li>
-<li>Distance culling for block-entity renderers, the engine ignores their own <code>RenderRange</code>.</li>
-<li>Chunk loading: adaptive inflow brake, tesselation-thread tuning, neighbour prefetch, window pipelining &mdash; and visible border holes are repaired first, ahead of not-yet-visible chunks.</li>
-<li>Shadows: texel snapping against crawling shadow edges, optional distance/quality knobs.</li>
-<li>VRAM: empty mesh pools are reclaimed; GC pressure reduced (mesh buffer recycler, clone compaction).</li>
-<li>Measurement built in: F7 HUD, hitch log, per-renderer profiler, stress test, <code>.komet report</code>.</li>
+<li><strong>Visibility sweep</strong> &mdash; spatial grid per mesh pool, AVX2 kernel, own worker threads, bit-identical results.</li>
+<li><strong>Occlusion culling</strong> &mdash; parallelised and moved off the main thread.</li>
+<li><strong>Draw-range merging</strong> incl. bridging over frustum-clipped gaps &rarr; fewer, larger GPU batches.</li>
+<li><strong>Distance culling for block-entity renderers</strong>, whose own <code>RenderRange</code> the engine ignores.</li>
+<li><strong>Chunk loading</strong> &mdash; adaptive inflow brake, tesselation-thread tuning, neighbour prefetch, window pipelining; visible border holes are repaired first.</li>
+<li><strong>Shadows</strong> &mdash; texel snapping against crawling shadow edges, optional distance/quality knobs.</li>
+<li><strong>VRAM and GC</strong> &mdash; empty mesh pools reclaimed, mesh buffer recycler, clone compaction.</li>
+<li><strong>Measurement built in</strong> &mdash; F7 HUD, hitch log, per-renderer profiler, stress test, <code>.komet report</code>.</li>
 </ul>
+
 <h3>Compatibility</h3>
 <ul style="max-width: 820px;">
-<li><strong>A plain Harmony mod, zero setup.</strong> Komet patches the stock engine in memory when it loads &mdash; no forked client, no separate installer, no downloaded or decompiled game data (in contrast to fork-based optimisers such as Optimum, which install a separate patched client). Drop the zip into <code>Mods</code>; delete it to uninstall.</li>
-<li><strong>Shader mods (e.g. Sheydermod).</strong> Komet replaces no shader or asset files &mdash; its changes are engine-side code patches, so shader packs keep their visuals on top of it.</li>
-<li><strong>Server-side optimisers (e.g. Tungsten).</strong> Komet works the client&rsquo;s render loop; server-side mods work the server tick, different halves of the game, so they are expected to combine cleanly. Not yet formally tested together &mdash; reports welcome.</li>
+<li><strong>A plain Harmony mod, zero setup.</strong> Komet patches the stock engine in memory when it loads &mdash; no forked client, no separate installer, no downloaded or decompiled game data. Drop the zip into <code>Mods</code>; delete it to uninstall.</li>
+<li><strong>Shader mods.</strong> Komet replaces no shader or asset files; its changes are engine-side code patches, so shader packs keep their visuals on top of it.</li>
+<li><strong>Server-side optimisers.</strong> Komet works the client&rsquo;s render loop, server-side mods work the server tick &mdash; different halves of the game.</li>
+<li>Komet <strong>names conflicts instead of hiding them</strong>: it reports when another mod patches the same engine method, with a severity and a reason, and fingerprints the engine at world start. <code>.komet conflicts</code> lists it.</li>
 </ul>
-<h3>Direct Compatibility to Mods</h3>
-<table style="border-collapse: collapse; width: 25.2636%; height: 150.312px;" border="1">
+
+<table style="border-collapse: collapse; max-width: 560px; width: 100%;" border="1">
 <tbody>
-<tr style="height: 30.0625px;">
-<td style="width: 33.9228%; height: 30.0625px; text-align: center;"><strong><span style="color: #236fa1;"><a style="color: #236fa1;" href="https://mods.vintagestory.at/sheydermod">Sheydermod</a></span></strong></td>
-<td style="width: 66.0772%; height: 30.0625px; text-align: center;">
-<p><span style="color: #2dc26b;">Fully compatible and supported!</span></p>
-</td>
+<tr>
+<td style="padding: 7px 10px; width: 34%;"><strong><a style="color: #236fa1;" href="https://mods.vintagestory.at/sheydermod">Sheydermod</a></strong></td>
+<td style="padding: 7px 10px;"><span style="color: #2dc26b;">Fully compatible and supported</span></td>
 </tr>
-<tr style="height: 30.0625px;">
-<td style="width: 33.9228%; height: 30.0625px; text-align: center;"><strong><span style="color: #236fa1;"><a style="color: #236fa1;" href="https://mods.vintagestory.at/tungsten">Tungsten</a></span></strong></td>
-<td style="width: 66.0772%; height: 30.0625px; text-align: center;"><span style="color: #2dc26b;">Fully compatible and supported!</span></td>
+<tr>
+<td style="padding: 7px 10px;"><strong><a style="color: #236fa1;" href="https://mods.vintagestory.at/tungsten">Tungsten</a></strong></td>
+<td style="padding: 7px 10px;"><span style="color: #2dc26b;">Fully compatible and supported</span></td>
 </tr>
-<tr style="height: 30.0625px;">
-<td style="width: 33.9228%; height: 30.0625px; text-align: center;"><strong><span style="color: #236fa1;"><a style="color: #236fa1;" href="https://mods.vintagestory.at/optimum">Optimum</a></span></strong></td>
-<td style="width: 66.0772%; height: 30.0625px; text-align: center;"><span style="color: #f1c40f;">Partially supported, but the support is not actively maintained</span></td>
+<tr>
+<td style="padding: 7px 10px;"><strong><a style="color: #236fa1;" href="https://mods.vintagestory.at/optimum">Optimum</a></strong></td>
+<td style="padding: 7px 10px;"><span style="color: #e03e2d;">Not compatible &mdash; pick one</span></td>
 </tr>
-<tr style="height: 30.0625px;">
-<td style="width: 33.9228%; height: 30.0625px; text-align: center;"><strong><span style="color: #236fa1;"><a style="color: #236fa1;" href="https://mods.vintagestory.at/optitime">Optitime</a></span></strong></td>
-<td style="width: 66.0772%; height: 30.0625px; text-align: center;"><span style="color: #e03e2d;">Unsupported</span></td>
+<tr>
+<td style="padding: 7px 10px;"><strong><a style="color: #236fa1;" href="https://mods.vintagestory.at/optitime">Optitime</a></strong></td>
+<td style="padding: 7px 10px;"><span style="color: #e03e2d;">Unsupported</span></td>
 </tr>
 </tbody>
 </table>
-<p style="max-width: 820px;">&nbsp;</p>
-<p style="max-width: 820px;"><strong>Install:</strong> drop the zip into your <code>Mods</code> folder. Needs Vintage Story <strong>1.22.0 or newer</strong>; built and verified against 1.22.7 &mdash; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually, the game keeps running vanilla in that spot. <strong>In game:</strong> <code>F7</code> toggles the performance HUD, <code>.komet</code> prints the numbers in chat, <code>.komet report</code> writes the full diagnostic block to the log, <code>.komet safemode</code> reverts all visual changes live. HUD and chat output are currently German. Client-side; safe to add or remove at any time.</p>
+
+<div style="border: 1px solid #ddd2bc; border-left: 3px solid #2e6bb2; border-radius: 4px; background: #f6f8fb; padding: 12px 16px; max-width: 820px; margin-top: 12px;">
+<p style="margin: 0 0 8px 0; color: #333;"><strong>About Optimum &mdash; and why you should still go look at it.</strong></p>
+<p style="margin: 0 0 8px 0; color: #333;"><a style="color: #236fa1;" href="https://mods.vintagestory.at/optimum">Optimum</a> ships a separate patched client instead of patching the stock one in memory. That means both mods rewrite the same hot paths of the render loop in two different ways, and they cannot be run together: earlier versions of this page called that &ldquo;partially supported&rdquo;, which was too generous. Treat it as <strong>not compatible</strong> and run one or the other.</p>
+<p style="margin: 0; color: #333;">That is a technical statement, not a verdict on the project. Optimum is serious, ambitious work, it goes places a Harmony mod cannot follow, and its author has been at this longer than Komet has existed. If a patched client is a trade you are willing to make, <strong>check it out</strong> &mdash; and if you want an ordinary mod you can drop in and delete again, that is what Komet is for.</p>
+</div>
+
+<h3>Install</h3>
+<p style="max-width: 820px;">Drop the zip into your <code>Mods</code> folder. Needs Vintage Story <strong>1.22.0 or newer</strong>; built and verified against 1.22.7 &mdash; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually, and the game keeps running vanilla in that spot. Client-side; safe to add or remove at any time.</p>
+<p style="max-width: 820px;"><strong>In game:</strong> <code>F7</code> toggles the performance HUD &middot; <code>.komet</code> prints the numbers in chat &middot; <code>.komet report</code> writes the full diagnostic block to the log &middot; <code>.komet safemode</code> reverts all visual changes live. The HUD and the chat replies follow the game language; English and German ship with the mod. Logs and reports stay English on purpose &mdash; they end up in bug reports.</p>

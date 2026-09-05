@@ -65,6 +65,33 @@ public static class ShadowThrottlePatches
     /// </summary>
     public static double MoveThreshold = 0.15;
 
+    /// <summary>
+    /// Extra coverage the far cascade was drawn with, in blocks - read straight from
+    /// <see cref="ShadowPatches.EffectiveFarBoxMargin"/> rather than copied, so the two can
+    /// never disagree. Safemode and '.komet toggle shadowbox' put the vanilla cone back, and a
+    /// movement limit that outlived the box it was derived from would be exactly the cut-off
+    /// line the margin exists to prevent.
+    /// </summary>
+    public static double CoverageMargin => ShadowPatches.EffectiveFarBoxMargin;
+
+    /// <summary>
+    /// How much of the margin is actually spent before a redraw. The containment is exact up
+    /// to 0.94 x margin (the shader's UV safe band is 94 % of the box), so 0.9 keeps a band
+    /// that no rounding, no mid-frame camera step and no odd field of view can eat into.
+    /// </summary>
+    internal const double MarginSafety = 0.9;
+
+    /// <summary>
+    /// The distance the camera may drift from the retained map before it must be redrawn.
+    /// Pure, because it is the one number that decides whether the map still covers what the
+    /// shader will sample from it - and the whole saving hangs off it being right.
+    /// </summary>
+    internal static double MoveLimitFor(double threshold, double margin)
+        => margin > 0 ? Math.Max(threshold, margin * MarginSafety) : threshold;
+
+    /// <summary>The limit in effect, for the report and the HUD.</summary>
+    public static double MoveLimit => MoveLimitFor(MoveThreshold, CoverageMargin);
+
     /// <summary>Interval for the near cascade. 1 = every frame.</summary>
     public static int NearInterval = 1;
 
@@ -108,6 +135,11 @@ public static class ShadowThrottlePatches
     private static bool renderFar = true;
     private static bool renderNear = true;
 
+    /// <summary>Whether the far cascade was drawn in the current frame - the GPU stage timer
+    /// reads it at the frame's end, so its "far" figure can be told per drawn frame and not
+    /// only as an average that the skipped frames dilute.</summary>
+    public static bool FarDrawnThisFrame => renderFar;
+
     /// <summary>Cosine of the light rotation that counts as "the sun has moved" (~0.1 degrees).</summary>
     private const float LightEpsilon = 0.9999985f;
 
@@ -117,6 +149,18 @@ public static class ShadowThrottlePatches
         FarInterval = Math.Max(1, farInterval);
         NearInterval = Math.Max(1, nearInterval);
         FarMaxSkip = Math.Max(FarInterval, farMaxSkip);
+    }
+
+    /// <summary>
+    /// Forgets the retained map's reference, so the next frame redraws the far cascade.
+    /// Needed whenever the box GEOMETRY changes under a retained map - switching the margin
+    /// on makes the map that is currently held too small for the new movement limit.
+    /// </summary>
+    public static void Invalidate()
+    {
+        haveReference = false;
+        haveFarSnap = false;
+        lastFarFrame = -1;
     }
 
     /// <summary>Whether any skipping can currently happen - the toggle's state line.</summary>
@@ -313,8 +357,12 @@ public static class ShadowThrottlePatches
 
         if (known)
         {
+            // MoveLimit, not MoveThreshold: a far cascade drawn with a coverage margin still
+            // covers what the shader samples until the camera has spent that margin, and
+            // spending it is the entire point of drawing the margin.
+            var limit = MoveLimit;
             double dx = x - refX, dy = y - refY, dz = z - refZ;
-            if (dx * dx + dy * dy + dz * dz >= MoveThreshold * MoveThreshold) return true;
+            if (dx * dx + dy * dy + dz * dz >= limit * limit) return true;
         }
 
         if (since < FarInterval) return false;

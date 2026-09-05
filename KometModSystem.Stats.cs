@@ -59,6 +59,18 @@ public partial class KometModSystem
         // against - the two questions a field report from a modified client has to answer
         // before any of its numbers mean anything.
         sb.Append(PatchGuard.ReportLines());
+        // Optimum or OptiTime next to komet: two sides replacing the same engine code, each
+        // undoing the other - a report from such a client has to say so before its numbers.
+        if (ForeignClient.Findings.Count > 0)
+        {
+            sb.Append("client: ").Append(ForeignClient.Describe()).Append(" - INCOMPATIBLE with komet (");
+            for (var i = 0; i < ForeignClient.Findings.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(ForeignClient.Findings[i].How);
+            }
+            sb.Append("); the figures below do not describe komet alone\n");
+        }
 
         // Display pacing, because a field report showed 36 fps at 7% CPU with the GPU just
         // over the refresh budget - vsync quantising into half-rate frames looks exactly like
@@ -139,6 +151,15 @@ public partial class KometModSystem
                 Patches.RendererProfiler.StatWrapped + "/" + Patches.RendererProfiler.StatTotal);
         }
 
+        // One row, not a section: what every OTHER mod together costs of this frame, and where
+        // the list behind it is. The mod HUD is the instrument; this is the pointer to it, so a
+        // player reading the performance HUD never has to guess whether mods are in these
+        // numbers - they are, and this says how much.
+        if (ModProfiler.Enabled && ModProfiler.Indexed && ModProfiler.TotalMs > 0.01)
+            DebugHud.Row(sb, Loc.Hud("mods"), DebugHud.Pct(ModProfiler.TotalMs, frameMs),
+                DebugHud.Ms(ModProfiler.TotalMs),
+                Loc.T("komet:hud-mods-cmd", "{0} loaded · Shift+F7", ModProfiler.ModCount));
+
         DebugHud.Section(sb, "komet");
         WriteKometWarnings(sb, frameMs);
 
@@ -175,7 +196,11 @@ public partial class KometModSystem
             DebugHud.Row(sb, Loc.Hud("shadow cadence"),
                 "1/" + Patches.ShadowThrottlePatches.FarInterval + "-1/" + Patches.ShadowThrottlePatches.FarMaxSkip, null,
                 (100.0 * Patches.ShadowThrottlePatches.FarSkipped / shadowFrames).ToString("F0", CultureInfo.CurrentCulture)
-                + Loc.T("komet:hud-far-cascades-saved", " % far cascades saved"));
+                + Loc.T("komet:hud-far-cascades-saved", " % far cascades saved")
+                // The movement limit is what decides that percentage while anybody is moving,
+                // so it belongs next to it rather than in a config file.
+                + Loc.T("komet:hud-redraw-after", " · redraw after {0} blocks",
+                    Patches.ShadowThrottlePatches.MoveLimit.ToString("0.##", CultureInfo.CurrentCulture)));
         if (Patches.ShadowPatches.ShadowDistance > 0)
         {
             DebugHud.Row(sb, Loc.Hud("shadows to"), DebugHud.N(Patches.ShadowPatches.ShadowDistance), null,
@@ -186,6 +211,11 @@ public partial class KometModSystem
             // still casts a shadow - map edge over the box's world size
             DebugHud.Row(sb, Loc.Hud("shadow map"), Patches.ShadowResPatches.EffectiveMapSize + "px", null,
                 ShadowTexelsPerBlock().ToString("F1", CultureInfo.CurrentCulture) + Loc.T("komet:hud-texels-per-block", " texels per block"));
+            // the near cascade's own map since 05.09. - the row that shows the fill the near
+            // pass is really spending, which used to be hidden behind one shared size
+            if (Patches.ShadowPatches.NearBoxSpan > 0)
+                DebugHud.Row(sb, Loc.Hud("near map"), Patches.ShadowResPatches.EffectiveNearMapSize + "px", null,
+                    NearShadowTexelsPerBlock().ToString("F1", CultureInfo.CurrentCulture) + Loc.T("komet:hud-texels-per-block", " texels per block"));
         }
 
         // -- uploads and the loading pipeline --
@@ -275,6 +305,17 @@ public partial class KometModSystem
                 + (Patches.EntityLoadPatches.StatStaleFlushes > 0
                     ? Loc.T("komet:hud-no-frame-boundary", " · {0}x without frame boundary", DebugHud.N(Patches.EntityLoadPatches.StatStaleFlushes)) : "")
                 + (Patches.EntityLoadPatches.Enabled ? "" : Loc.T("komet:hud-off", " (OFF)")));
+        // the frames a new creature type's animations used to cost the main thread, now on a worker
+        if (Runtime.AnimationWarmup.Enabled || Runtime.AnimationWarmup.StatShapes > 0)
+            DebugHud.Row(sb, Loc.Hud("anim prewarm"), DebugHud.N(Runtime.AnimationWarmup.StatShapes), null,
+                Loc.T("komet:hud-shapes-anims-workers", "{0} shapes, {1} animations, {2} ms on workers",
+                    DebugHud.N(Runtime.AnimationWarmup.StatShapes), DebugHud.N(Runtime.AnimationWarmup.StatAnimations),
+                    Runtime.AnimationWarmup.StatWorkerMs.ToString("F0", CultureInfo.CurrentCulture))
+                + (Runtime.AnimationWarmup.StatWorstMs >= 1
+                    ? Loc.T("komet:hud-slowest", " · slowest {0} ms", Runtime.AnimationWarmup.StatWorstMs.ToString("F0", CultureInfo.CurrentCulture))
+                      + (Runtime.AnimationWarmup.StatWorstShape != null ? " (" + Runtime.AnimationWarmup.StatWorstShape + ")" : "")
+                    : "")
+                + (Runtime.AnimationWarmup.Enabled ? "" : Loc.T("komet:hud-off", " (OFF)")));
         if (Patches.MinimapPatches.Enabled || Patches.MinimapPatches.StatTicks > 0)
             DebugHud.Row(sb, Loc.Hud("minimap"), Patches.MinimapPatches.Cap + "/tick", DebugHud.Ms(Patches.MinimapPatches.AvgTickMs),
                 Loc.T("komet:hud-upload-ticks", "{0} upload ticks", DebugHud.N(Patches.MinimapPatches.StatTicks))
@@ -402,6 +443,13 @@ public partial class KometModSystem
         return Patches.ShadowResPatches.EffectiveMapSize / span;
     }
 
+    /// <summary>Same for the near cascade: its own map over its own box.</summary>
+    private static double NearShadowTexelsPerBlock()
+    {
+        var span = Patches.ShadowPatches.NearBoxSpan;
+        return span <= 0 ? 0 : Patches.ShadowResPatches.EffectiveNearMapSize / span;
+    }
+
     /// <summary>
     /// Milliseconds a frame spent rebuilding pool caches, i.e. the share of "sichtbarkeit"
     /// that is not the sweep at all. The counter is ticks since start, so the per-frame value
@@ -459,8 +507,8 @@ public partial class KometModSystem
         // Where the GPU's milliseconds go, stage by stage: the figure that decides whether the
         // shadow map step, the far cascade's LOD or a post-processing mod is the lever.
         if (GpuFrameTimer.StageSamples > 0)
-            sb.AppendFormat(ci, "  gpu per stage: before {0:F1} | shadow {1:F1} (far {2:F1}, near {3:F1}) | opaque {4:F1} | "
-                + "oit {5:F1} | post {6:F1} | ortho {7:F1} | done {8:F1} ms ({9} samples, GPU span per stage)\n",
+            sb.AppendFormat(ci, "  gpu per stage: before {0:F1} | shadow {1:F1} (far {2:F1}{10}, near {3:F1}) | opaque {4:F1} | "
+                + "oit {5:F1} | post {6:F1} | ortho {7:F1} | done {8:F1} ms ({9} samples, GPU span per stage; frame by stamps {11:F1} ms)\n",
                 GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Before],
                 GpuFrameTimer.StageSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone, EnumRenderStage.ShadowNear, EnumRenderStage.ShadowNearDone),
                 GpuFrameTimer.StageSum(EnumRenderStage.ShadowFar, EnumRenderStage.ShadowFarDone),
@@ -470,7 +518,14 @@ public partial class KometModSystem
                 GpuFrameTimer.StageSum(EnumRenderStage.AfterOIT, EnumRenderStage.AfterPostProcessing, EnumRenderStage.AfterFinalComposition, EnumRenderStage.AfterBlit),
                 GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Ortho],
                 GpuFrameTimer.StageGpuMs[(int)EnumRenderStage.Done],
-                GpuFrameTimer.StageSamples);
+                GpuFrameTimer.StageSamples,
+                // the average above counts the throttle's skipped frames as zero; this is the
+                // pass's cost in the frames that actually drew it - the number a map size is
+                // judged by
+                GpuFrameTimer.FarDrawnSamples > 0
+                    ? string.Format(ci, " = {0:F1} when drawn", GpuFrameTimer.FarDrawnGpuMs)
+                    : "",
+                GpuFrameTimer.StampSpanMs);
         // The per-thread allocation split lived only in the F7 overlay until 01.09. - the
         // one field report that was supposed to decide the network-decompression question
         // arrived without it, because reports come from '.komet report', not screenshots.
@@ -537,6 +592,10 @@ public partial class KometModSystem
         // main-thread task drain) and "tick" (its listeners). Printed whenever armed.
         if (Patches.MainThreadTaskPatches.Enabled) Patches.MainThreadTaskPatches.Write(sb, 5, ci);
         if (Patches.TickProfiler.Enabled) Patches.TickProfiler.Write(sb, 6, ci, FrameStats.GameTickMs);
+        // The same measurements, attributed to the mod they came out of, plus what each mod
+        // does and what it cost to load. '.komet mods' prints this block on its own.
+        if (ModProfiler.Enabled && ModProfiler.Indexed)
+            ModProfiler.Write(sb, ci, FrameStats.AvgFrameMs, Patches.RendererProfiler.Enabled);
         if (Patches.EntityAnimPatches.Enabled || Patches.EntityAnimPatches.StatAnimated > 0) Patches.EntityAnimPatches.Write(sb, ci);
 
         var shadows = FrameStats.ShadowMs;
@@ -612,15 +671,46 @@ public partial class KometModSystem
         // The shadow line only lived in the F7 overlay until 1.40.0, which meant every log the
         // shadow work was judged from arrived without a single shadow figure in it.
         if (Patches.ShadowPatches.ShadowDistance > 0)
+        {
             sb.AppendFormat(ci, "shadows: to {0:F0} blocks, box {1} ({2:F0} blocks wide), fade {3}, "
-                + "distance x{4:0.##} | map {5}px = {6:F1} texels per block, lod3 {7}\n",
+                + "distance x{4:0.##} | map {5}px = {6:F1} texels per block, lod3 {7}, solid backfaces {8}\n",
                 Patches.ShadowPatches.ShadowDistance,
                 Patches.ShadowPatches.SymmetricBox ? "sphere" : "vanilla wedge",
                 Patches.ShadowPatches.ShadowBoxSpan,
                 Patches.ShadowPatches.FadeFix ? "fix" : "vanilla",
                 Patches.ShadowPatches.DistanceMultiplier,
                 Patches.ShadowResPatches.EffectiveMapSize, ShadowTexelsPerBlock(),
-                FastCuller.ShadowSkipRedundantLod ? "out" : "in");
+                FastCuller.ShadowSkipRedundantLod ? "out" : "in",
+                (Patches.ShadowCullPatches.Enabled ? "culled" : "drawn (vanilla)")
+                + (Patches.ShadowCullPatches.DepthOnly
+                    ? Patches.ShadowCullPatches.DepthOnlyLive
+                        ? ", depth-only shader"
+                        : ", depth-only shader NOT live (" + (Patches.ShadowCullPatches.DepthOnlyState ?? "?") + ")"
+                    : ", engine shader"));
+            // What the far cascade actually costs is frames drawn, not milliseconds per draw -
+            // and that is decided by the coverage margin and the movement limit it buys.
+            var farFrames = Patches.ShadowThrottlePatches.FarRendered + Patches.ShadowThrottlePatches.FarSkipped;
+            if (farFrames > 0)
+                sb.AppendFormat(ci, "  far cadence: {0:N0} of {1:N0} frames drawn ({2:F0} % saved), "
+                    + "every {3}-{4} frames, redraw after {5:0.##} blocks of camera movement "
+                    + "(coverage margin {6:0.#})\n",
+                    Patches.ShadowThrottlePatches.FarRendered, farFrames,
+                    100.0 * Patches.ShadowThrottlePatches.FarSkipped / farFrames,
+                    Patches.ShadowThrottlePatches.FarInterval, Patches.ShadowThrottlePatches.FarMaxSkip,
+                    Patches.ShadowThrottlePatches.MoveLimit,
+                    Patches.ShadowPatches.EffectiveFarBoxMargin);
+
+            // The near cascade's own line: its box and its map, since the two maps can differ.
+            if (Patches.ShadowPatches.NearBoxSpan > 0)
+                sb.AppendFormat(ci, "  near cascade: to {0:F0} blocks ({1:F0} blocks wide) | map {2}px = {3:F1} texels per block"
+                    + "{4}\n",
+                    Patches.ShadowPatches.NearShadowDistance, Patches.ShadowPatches.NearBoxSpan,
+                    Patches.ShadowResPatches.EffectiveNearMapSize, NearShadowTexelsPerBlock(),
+                    Patches.ShadowResPatches.NearMapSize > 0 && Patches.ShadowResPatches.NearMapSizeApplied == 0
+                        ? " (configured " + Patches.ShadowResPatches.NearMapSize + "px not applied yet"
+                          + (Patches.ShadowResPatches.LastNearError != null ? ": " + Patches.ShadowResPatches.LastNearError : "") + ")"
+                        : "");
+        }
 
         sb.AppendFormat(ci, "upload {0:F2} ms (max {1:F1}), throttle {2:P0}{3}, prio budget {4} "
             + "({5:N0} chunks, {6:N0}x spread) | occlusion {7:F1} ms on the worker, {8:N0} chunks\n",
@@ -714,6 +804,15 @@ public partial class KometModSystem
                 Patches.EntityLoadPatches.StatWorstMs,
                 Patches.EntityLoadPatches.StatWorstCode != null ? " (" + Patches.EntityLoadPatches.StatWorstCode + ")" : "",
                 Patches.EntityLoadPatches.Enabled ? "" : Loc.T("komet:hud-off", " (OFF)"));
+        if (Runtime.AnimationWarmup.Enabled || Runtime.AnimationWarmup.StatShapes > 0)
+            sb.AppendFormat(ci, "  anim prewarm: {0:N0} shapes, {1:N0} animations, {2:F0} ms on workers, slowest {3:F1} ms{4}, "
+                + "{5:N0} skipped (shape in use), {6:N0} waits ({7:F1} ms), {8:N0} drain holds{9}\n",
+                Runtime.AnimationWarmup.StatShapes, Runtime.AnimationWarmup.StatAnimations, Runtime.AnimationWarmup.StatWorkerMs,
+                Runtime.AnimationWarmup.StatWorstMs,
+                Runtime.AnimationWarmup.StatWorstShape != null ? " (" + Runtime.AnimationWarmup.StatWorstShape + ")" : "",
+                Runtime.AnimationWarmup.StatSkippedInUse, Runtime.AnimationWarmup.StatWaits, Runtime.AnimationWarmup.StatWaitMs,
+                Patches.EntityLoadPatches.StatWarmupHolds,
+                Runtime.AnimationWarmup.Enabled ? "" : " (OFF)");
         // Server half - in singleplayer the statics are shared with the integrated server, so
         // the counters are live here; on a remote server they stay at zero and say so.
         var posTotal = Patches.EntitySyncPatches.StatPositionsSent + Patches.EntitySyncPatches.StatPositionsSkipped;

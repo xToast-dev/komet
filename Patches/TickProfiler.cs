@@ -48,18 +48,25 @@ public static class TickProfiler
         internal readonly Action<float> Inner;
         private readonly Entry entry;
 
-        public Timed(Action<float> inner, Entry entry)
+        /// <summary>The mod whose code this listener is, resolved once at wrap time - see
+        /// RendererProfiler.Timed.Mod for why it is not a per-call lookup.</summary>
+        internal readonly Measure.ModProfiler.Entry Mod;
+
+        public Timed(Action<float> inner, Entry entry, Measure.ModProfiler.Entry mod)
         {
             Inner = inner;
             this.entry = entry;
+            Mod = mod;
         }
 
         public void Invoke(float dt)
         {
             var t0 = Stopwatch.GetTimestamp();
             Inner(dt);
-            entry.Ticks += Stopwatch.GetTimestamp() - t0;
+            var spent = Stopwatch.GetTimestamp() - t0;
+            entry.Ticks += spent;
             entry.Calls++;
+            Mod.TickTicks += spent;
         }
     }
 
@@ -84,14 +91,24 @@ public static class TickProfiler
         var list = Listeners(manager);
         if (list == null) return;
         int total = 0, wrapped = 0;
+        // recounted from zero every pass, like the renderer side
+        var countMods = Measure.ModProfiler.Enabled;
+        if (countMods) Measure.ModProfiler.BeginListenerCount();
         for (var i = 0; i < list.Count; i++)
         {
             var l = list[i];
             var h = l?.Handler;
             if (h == null) continue;
             total++;
-            if (h.Target is Timed) { wrapped++; continue; }
-            l.Handler = new Timed(h, Bucket(NameOf(h))).Invoke;
+            if (h.Target is Timed already)
+            {
+                if (countMods) already.Mod.Listeners++;
+                wrapped++;
+                continue;
+            }
+            var mod = Measure.ModProfiler.Of(OwnerOf(h));
+            if (countMods) mod.Listeners++;
+            l.Handler = new Timed(h, Bucket(NameOf(h)), mod).Invoke;
             wrapped++;
         }
         StatTotal = total;
@@ -129,6 +146,17 @@ public static class TickProfiler
         return typeName + "." + method;
     }
 
+    /// <summary>The type a listener's code lives in: the closure's or the object's, and for a
+    /// lambda in a nested display class the type that declares it. Same resolution the name
+    /// uses, so the table and the mod attribution can never disagree about who this is.</summary>
+    internal static Type OwnerOf(Action<float> h)
+    {
+        var type = h.Target?.GetType() ?? h.Method.DeclaringType;
+        if (type != null && type.Name.StartsWith("<>", StringComparison.Ordinal) && type.DeclaringType != null)
+            type = type.DeclaringType;
+        return type;
+    }
+
     private static Entry Bucket(string name)
     {
         if (!Entries.TryGetValue(name, out var e)) Entries[name] = e = new Entry();
@@ -145,6 +173,8 @@ public static class TickProfiler
             e.Ms += (e.Ticks * TicksToMs - e.Ms) * Alpha;
             e.Ticks = 0;
         }
+        // every frame, like the buckets above: a listener that did not fire is a real zero
+        Measure.ModProfiler.FoldTick();
     }
 
     /// <summary>The frame's most expensive listener, raw ticks - valid only between the frame
