@@ -6777,12 +6777,24 @@ internal static class Program
                 throw new Exception("a capped volume came out longer than the uncapped one");
         });
 
-        Check("the flat fragment shader keeps every declaration and replaces only main", () =>
+        // Needs the engine's own shader source, which lives in the asset tree - and the CI
+        // runner carries the assemblies, not the content. Skipped with its reason there,
+        // exactly like the animation warm-up check above, rather than failing the build on a
+        // file that was never going to be present.
+        const string flatCheck = "the flat fragment shader keeps every declaration and replaces only main";
+        string shaderPath = System.IO.Path.Combine(
+            Environment.GetEnvironmentVariable("VS_INSTALL") ?? "/opt/vintagestory",
+            "assets", "game", "shaders", "chunkopaque.fsh");
+        if (!System.IO.File.Exists(shaderPath))
+            Skip(flatCheck, "no game assets at " + shaderPath + " - needs an installed game, "
+                          + "the runner has only the engine assemblies");
+        else
+        Check(flatCheck, () =>
         {
             // The engine's typed setters look uniform names up in a table Compile() rebuilds
             // from the source: a uniform that vanished would make the next setter throw. So
             // the swap must keep everything above main, whatever a shader mod put there.
-            var original = System.IO.File.ReadAllText("/opt/vintagestory/assets/game/shaders/chunkopaque.fsh");
+            var original = System.IO.File.ReadAllText(shaderPath);
             var flat = ChunkShaderSwap.FlatSource(original);
             if (flat == null) throw new Exception("no main found in the engine's shader");
 
