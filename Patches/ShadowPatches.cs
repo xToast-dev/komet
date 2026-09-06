@@ -43,6 +43,55 @@ public static class ShadowPatches
     /// <summary>What the config asked for, so a live toggle can return to it.</summary>
     public static double ConfiguredMultiplier = 1.0;
 
+    /// <summary>What komet.json asked for, so safemode has something to come back to.</summary>
+    public static bool ConfiguredTightCull = true;
+
+    // ---- the near cascade's depth ------------------------------------------------------
+
+    /// <summary>
+    /// Cap on the NEAR cascade's <c>ShadowBoxZExtend</c>, in blocks. 0 = vanilla's.
+    ///
+    /// This is the one number that decides how much geometry the near pass draws, and the
+    /// reason took a wrong turn to find. The near pass does not submit a loose band that the
+    /// GPU then clips: the six planes it culls against ARE the shadow projection's clip volume
+    /// (PrepareForShadowRendering feeds CalcFrustumEquations the ortho matrix and a look-at
+    /// along the light), so what it draws is exactly what the volume holds - and the volume's
+    /// depth is <c>maxZ += ShadowBoxZExtend</c>.
+    ///
+    /// Vanilla sets that to <c>50 + 50*|1-sunY| + 100</c> for the near cascade, i.e. 150 to 200
+    /// blocks - MORE than the far cascade's own <c>100 + 60*|1-sunY|</c>, for a cascade covering
+    /// 39 blocks instead of 255. So the near volume is a 60-block-wide column of the world two
+    /// hundred blocks deep, and in a forest that column is foliage from the ground to the top of
+    /// every tree in it. A GPU report has that pass at 20 of 24 ms, and it did not move when the
+    /// map went from 4096 to 2048 px - it is the geometry, not the fill.
+    ///
+    /// What a shorter depth costs is occluders further up-sun than the cap: they stop casting
+    /// into the NEAR map. They still cast in the far map, whose box is six times larger, so the
+    /// result is a shadow at half strength rather than none (fogandlight.fsh adds the two
+    /// cascades' contributions). Flat forest never notices; a mountain up-sun does. That is a
+    /// judgement about a particular world, so the default is vanilla and
+    /// '.komet shadowneardepth &lt;blocks&gt;' prices it live.
+    ///
+    /// It composes with <see cref="ShadowDepthPatches"/>, which is the half of this problem
+    /// that costs nothing: the ortho carries no translation, so vanilla spends the extend half
+    /// up-sun and half DOWN-sun, where no fragment can reach a receiver. The fit removes that
+    /// half outright; this cap trades away up-sun reach on top of it, and only this one is a
+    /// judgement call.
+    /// </summary>
+    public static double NearDepthExtend;
+
+    /// <summary>What komet.json asked for - safemode comes back to it.</summary>
+    public static double ConfiguredNearDepthExtend;
+
+    /// <summary>The extend the near cascade last used, and vanilla's, for the report.</summary>
+    public static double NearExtendUsed { get; private set; }
+    public static double NearExtendVanilla { get; private set; }
+
+    /// <summary>The rule, pure: vanilla's extend and the cap in, the extend to use out. A cap
+    /// of zero or less is "leave it alone", and it never lengthens the box.</summary>
+    internal static double NearExtendFor(double vanilla, double cap)
+        => cap > 0 && cap < vanilla ? cap : vanilla;
+
     // All three patches are applied unconditionally and gated here at runtime. They are the
     // only things in this mod that change how shadows look, and until 1.37.0 they were the
     // only ones that could NOT be switched off in a running session - so every shadow
@@ -163,12 +212,98 @@ public static class ShadowPatches
     public static double NearShadowDistance { get; private set; }
     public static double NearBoxSpan { get; private set; }
 
-    public static void Apply(Harmony harmony, bool fadeFix, double distanceMultiplier, bool symmetricBox)
+    // ---- the cull range, cut down to what the projection actually keeps ------------------
+
+    /// <summary>
+    /// Cull the shadow passes against the volume the shadow projection really covers, instead
+    /// of vanilla's world-axis estimate. Off is exactly vanilla.
+    /// </summary>
+    public static bool TightCullBox = true;
+
+    /// <summary>
+    /// Slack on the tightened range, in blocks.
+    ///
+    /// Two things have to fit in it. The engine's range test compares the part's bounding
+    /// SPHERE CENTRE against the player's block position, so a part whose centre sits just
+    /// outside the box can still reach into it - a chunk-sized part's half-diagonal is
+    /// sqrt(3) * 16 = 27,7 blocks. And the test measures from the player, which in third
+    /// person is a few blocks from the camera.
+    ///
+    /// What is NOT slack, and is added separately (<see cref="LightEyeOffset"/>): the box is
+    /// not centred on the camera. The frustum look-at's eye is <c>CameraPos + SunPosition</c>,
+    /// and SunPosition is the normalised direction times 50 - so the clip volume sits fifty
+    /// blocks up-sun of the camera, and its world-axis footprint is offset from the player by
+    /// 50 * |sun.x| and 50 * |sun.z|. The first version of this range called that "the light
+    /// matrix's own unit eye offset" and folded it into the pad; at a 35-degree sun the offset
+    /// is 41 blocks, the pad minus the part radius is 20, and a band of casters at the up-sun
+    /// edge of the volume was range-culled that the planes would have kept - the long shadows
+    /// of a hill up-sun, missing from the near map. verify now places the eye where the game
+    /// does and fails without the term.
+    ///
+    /// 48 covers the part radius and the third-person offset with room to spare. It is slack on
+    /// a range that is otherwise exact, and the range is only ever narrowed, never widened - so
+    /// over-estimating it costs a little of the saving and can never cost a shadow.
+    /// </summary>
+    internal const double TightCullPad = 48.0;
+
+    /// <summary>|SunPosition|: ClientGameCalendar sets it to the normalised direction times 50,
+    /// and both light look-ats put their eye there.</summary>
+    internal const double LightEyeOffset = 50.0;
+
+    /// <summary>The world-axis distance from the player to the clip volume's centre, per axis:
+    /// the light eye's offset projected onto that axis. Pure; the light view's third row is the
+    /// light direction.</summary>
+    internal static void EyeOffsets(double[] lightView, out double offX, out double offZ)
     {
+        offX = offZ = 0;
+        if (lightView == null || lightView.Length < 16) return;
+        offX = Math.Abs(lightView[2]) * LightEyeOffset;
+        offZ = Math.Abs(lightView[10]) * LightEyeOffset;
+    }
+
+    /// <summary>What the tightened ranges came out as, and vanilla's, for the report.</summary>
+    public static double TightRangeX { get; private set; }
+    public static double TightRangeZ { get; private set; }
+    public static double VanillaRangeX { get; private set; }
+    public static double VanillaRangeZ { get; private set; }
+
+    /// <summary>
+    /// The world-axis half-extents of the box the shadow projection keeps.
+    ///
+    /// loadOrthoModeMatrix writes 2/width, 2/height, -2/length and NO translation, so the clip
+    /// volume is exactly |x| &lt;= width/2, |y| &lt;= height/2, |z| &lt;= length/2 in light space,
+    /// centred on the camera. That is an oriented box in world space, and the smallest
+    /// world-axis box around it has half-extents sum(h_j * |axis_j . world_i|) - the standard
+    /// projection of an OBB onto an axis. The light view matrix is a rotation, so its columns
+    /// are exactly those dot products (column-major: element [i*4 + j] is row j, column i).
+    ///
+    /// Pure, so verify can pin the containment property without an engine: no point that the
+    /// projection keeps can lie outside what this returns.
+    /// </summary>
+    internal static void TightCullExtents(double[] lightView, double width, double height, double length,
+                                          out double halfX, out double halfZ)
+    {
+        halfX = halfZ = 0;
+        if (lightView == null || lightView.Length < 16) return;
+
+        double hx = width / 2.0, hy = height / 2.0, hz = length / 2.0;
+        if (!(hx > 0) || !(hy > 0) || !(hz > 0)) return;
+
+        halfX = Math.Abs(lightView[0]) * hx + Math.Abs(lightView[1]) * hy + Math.Abs(lightView[2]) * hz;
+        halfZ = Math.Abs(lightView[8]) * hx + Math.Abs(lightView[9]) * hy + Math.Abs(lightView[10]) * hz;
+    }
+
+    public static void Apply(Harmony harmony, bool fadeFix, double distanceMultiplier, bool symmetricBox,
+                             bool tightCullBox = true, double nearDepthExtend = 0)
+    {
+        ConfiguredNearDepthExtend = nearDepthExtend;
+        NearDepthExtend = nearDepthExtend;
         ConfiguredMultiplier = distanceMultiplier;
         DistanceMultiplier = distanceMultiplier;
         SymmetricBox = symmetricBox;
         FadeFix = fadeFix;
+        ConfiguredTightCull = tightCullBox;
+        TightCullBox = tightCullBox;
 
         var type = typeof(SystemRenderShadowMap);
 
@@ -221,6 +356,8 @@ public static class ShadowPatches
     {
         SymmetricBox = false;
         FadeFix = false;
+        TightCullBox = false;
+        NearDepthExtend = 0;
         DistanceMultiplier = 1.0;
         // EffectiveFarBoxMargin follows SymmetricBox on its own, so the throttle's movement
         // limit drops back with it - but the map currently retained was drawn for the wide
@@ -233,6 +370,8 @@ public static class ShadowPatches
     {
         SymmetricBox = symmetricBox;
         FadeFix = fadeFix;
+        TightCullBox = ConfiguredTightCull;
+        NearDepthExtend = ConfiguredNearDepthExtend;
         DistanceMultiplier = ConfiguredMultiplier;
         ShadowThrottlePatches.Invalidate();
     }
@@ -344,15 +483,102 @@ public static class ShadowPatches
     /// The engine's own values are the tight ones for a box without margin, so adding the
     /// margin is the same widening on both sides of the same box.
     /// </summary>
-    public static void PadCullRange(ClientMain ___game, EnumFrameBuffer fb)
+    public static void PadCullRange(SystemRenderShadowMap __instance, ClientMain ___game, EnumFrameBuffer fb)
     {
-        if (fb != EnumFrameBuffer.ShadowmapFar) return;
-        var margin = EffectiveFarBoxMargin;
-        if (margin <= 0) return;
         var culler = ___game?.frustumCuller;
         if (culler == null) return;
-        culler.shadowRangeX += margin;
-        culler.shadowRangeZ += margin;
+
+        if (fb == EnumFrameBuffer.ShadowmapFar)
+        {
+            var margin = EffectiveFarBoxMargin;
+            if (margin > 0)
+            {
+                culler.shadowRangeX += margin;
+                culler.shadowRangeZ += margin;
+            }
+        }
+
+        TightenCullRange(__instance, culler, fb);
+    }
+
+    /// <summary>
+    /// Cuts the cull range down to the volume the projection keeps.
+    ///
+    /// What this is and - just as important - what it is NOT.
+    ///
+    /// Vanilla derives the range from the shadow DISTANCE and the depth extend:
+    /// <c>shadowRangeX = distance + ShadowBoxZExtend + extra</c>, <c>shadowRangeZ = distance +
+    /// extra</c>. The depth extend exists so that occluders between the sun and the covered
+    /// volume are drawn - a depth-axis quantity - and it is spent on the world X axis whatever
+    /// the sun is doing. For the NEAR cascade that is a 205 to 255-block band against a 49-block
+    /// box, so it is a loose test by a wide margin.
+    ///
+    /// It is a PRE-FILTER, not the cull. InFrustumShadowPass runs this range test and then six
+    /// plane tests, and during a shadow pass those planes are not the camera's: PrepareForShadow-
+    /// Rendering calls CalcFrustumEquations with the ORTHO projection and a look-at along the
+    /// light, so the six planes already bound the shadow projection's clip volume exactly. The
+    /// range test only decides how many parts reach them.
+    ///
+    /// So tightening it costs the sweep less and draws exactly the same geometry. The first
+    /// version of this comment claimed the pass was submitting a band an order of magnitude
+    /// larger than the map could hold and that the GPU paid for the vertices - it was not, the
+    /// planes had already dropped them, and the field measurement said so: the near cascade did
+    /// not move. What is saved is real but it is CPU: six plane evaluations per part that the
+    /// two range compares now answer on their own.
+    ///
+    /// The projection's own volume is known exactly (see <see cref="TightCullExtents"/>), so the
+    /// range can be the world box around it plus <see cref="TightCullPad"/> of slack. Two rules
+    /// keep this from changing what is drawn:
+    ///
+    ///   * it only ever NARROWS. Where vanilla is already tighter than the projection - which is
+    ///     the normal case for Z, and for both axes with the sun low - vanilla's value stands.
+    ///   * the pad keeps it conservative against the plane test, which is the thing that decides:
+    ///     nothing the planes would have kept is dropped by the range.
+    ///
+    /// It feeds the culler's own fields, so vanilla's cull path and FastCuller both see it and
+    /// cannot disagree - the cull verifier compares them against each other and is untouched.
+    /// </summary>
+    private static void TightenCullRange(SystemRenderShadowMap sys, FrustumCulling culler, EnumFrameBuffer fb)
+    {
+        // Only the near cascade's numbers are kept: it is the one whose band is out of all
+        // proportion to its box, it is the last of the two to run, and a row that mixed the
+        // two would report whichever cascade happened to render last.
+        var near = fb == EnumFrameBuffer.ShadowmapNear;
+        if (near)
+        {
+            VanillaRangeX = culler.shadowRangeX;
+            VanillaRangeZ = culler.shadowRangeZ;
+            TightRangeX = culler.shadowRangeX;
+            TightRangeZ = culler.shadowRangeZ;
+        }
+
+        if (!TightCullBox || sys == null) return;
+
+        try
+        {
+            var box = ShadowBoxRef(sys);
+            var lightView = box?.lightViewMatrix;
+            if (box == null) return;
+
+            TightCullExtents(lightView, box.Width, box.Height, box.Length, out var halfX, out var halfZ);
+            if (!(halfX > 0) || !(halfZ > 0) || double.IsNaN(halfX) || double.IsNaN(halfZ)) return;
+            EyeOffsets(lightView, out var offX, out var offZ);
+
+            var rx = halfX + offX + TightCullPad;
+            var rz = halfZ + offZ + TightCullPad;
+            if (rx < culler.shadowRangeX) culler.shadowRangeX = rx;
+            if (rz < culler.shadowRangeZ) culler.shadowRangeZ = rz;
+
+            if (near)
+            {
+                TightRangeX = culler.shadowRangeX;
+                TightRangeZ = culler.shadowRangeZ;
+            }
+        }
+        catch (Exception)
+        {
+            // a range that cannot be computed is simply vanilla's - never a missing shadow
+        }
     }
 
     /// <summary>Only the far cascade is stretched; the near one is already tight around the player.</summary>
@@ -361,8 +587,19 @@ public static class ShadowPatches
         // update() runs inside the body this prefixes, so the flag is always current when the
         // box postfix reads it
         farCascade = fb == EnumFrameBuffer.ShadowmapFar;
-        if (farCascade && Math.Abs(DistanceMultiplier - 1.0) > double.Epsilon)
-            shadowDistance *= DistanceMultiplier;
+        if (farCascade)
+        {
+            if (Math.Abs(DistanceMultiplier - 1.0) > double.Epsilon)
+                shadowDistance *= DistanceMultiplier;
+            return;
+        }
+
+        // The caller set ShadowBoxZExtend a line before this prefix and shadowBox.update() reads
+        // it a line after, so this is the one place where capping it reaches the near box and
+        // nothing else. See NearDepthExtend.
+        NearExtendVanilla = ShadowBox.ShadowBoxZExtend;
+        NearExtendUsed = NearExtendFor(ShadowBox.ShadowBoxZExtend, NearDepthExtend);
+        ShadowBox.ShadowBoxZExtend = NearExtendUsed;
     }
 
     private static readonly AccessTools.FieldRef<SystemRenderShadowMap, ShadowBox> ShadowBoxRef =

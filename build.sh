@@ -123,6 +123,11 @@ case "${1:-check}" in
     rm -rf "$STAGE"
     mkdir -p "$STAGE"
     cp bin/Release/Komet.dll "$STAGE/"
+    # '.komet alloctrace' attaches the runtime's own EventPipe to the process through the
+    # diagnostics client library; pure managed, loaded from the mod folder like Komet.dll.
+    for dep in Microsoft.Diagnostics.NETCore.Client Microsoft.Extensions.Logging.Abstractions Microsoft.Extensions.DependencyInjection.Abstractions; do
+      cp "bin/Release/$dep.dll" "$STAGE/"
+    done
     cp modicon.png "$STAGE/"
     # assets/komet/lang/{en,de}.json - the HUD and the .komet replies in the player's
     # language. Logs stay English whatever is in here (see Measure/Loc.cs).
@@ -145,7 +150,9 @@ EOF
     # zip stores a modification time per entry, so the staged copies would carry the moment
     # they were copied. Pinned to the commit's timestamp, in UTC, and the entries are listed
     # in a fixed order - that is what makes two runs produce the same archive.
-    pack_zip "$STAGE" "dist/$ZIP" "$SOURCE_DATE_EPOCH" modinfo.json modicon.png Komet.dll assets
+    pack_zip "$STAGE" "dist/$ZIP" "$SOURCE_DATE_EPOCH" modinfo.json modicon.png Komet.dll \
+      Microsoft.Diagnostics.NETCore.Client.dll Microsoft.Extensions.Logging.Abstractions.dll \
+      Microsoft.Extensions.DependencyInjection.Abstractions.dll assets
     rm -rf "$STAGE"
 
     # The baseline ships as its own zip: it must be a SEPARATE mod entry so the mod

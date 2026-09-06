@@ -38,17 +38,13 @@ public static class TesselationPatches
     /// <summary>Chunks the prefetcher found packed and unpacked ahead of the tesselator.</summary>
     public static long StatPrefetchedUnpacks;
 
-    private static readonly AccessTools.FieldRef<ClientWorldMap, Dictionary<long, ClientChunk>> ChunksRef =
-        AccessTools.FieldRefAccess<ClientWorldMap, Dictionary<long, ClientChunk>>("chunks");
-    private static readonly AccessTools.FieldRef<ClientWorldMap, object> ChunksLockRef =
-        AccessTools.FieldRefAccess<ClientWorldMap, object>("chunksLock");
-
     private const long ExtraDimensionsStart = 4503599627370496L;
 
     public static void EnsureReady()
     {
         if (ClientQueues.GameOf == null || ClientQueues.Dirty == null || ClientQueues.DirtyPrio == null
-            || ClientQueues.DirtyLock == null || ChunksRef == null || ChunksLockRef == null)
+            || ClientQueues.DirtyLock == null || ClientQueues.MapChunks == null
+            || ClientQueues.MapChunksLock == null)
             throw new InvalidOperationException("ClientMain/ClientWorldMap internals not found");
     }
 
@@ -95,12 +91,6 @@ public static class TesselationPatches
     }
 
     /// <summary>
-    /// ClientThread.Process sleeps 5 ms after a tick unless some system returned a negative
-    /// interval. Vanilla's 0 means "run every tick, but nap in between" - fine when nothing
-    /// is queued, a brake when 1500 chunks are. Negative only while there is work, so an idle
-    /// thread still naps instead of spinning a core.
-    /// </summary>
-    /// <summary>
     /// Set the moment the world starts leaving, cleared on the next world's Apply. While set,
     /// the tesselation thread gets its vanilla naps back, skips whole ticks, and - the part
     /// that actually closes the hole - skips every remaining chunk of a tick that was already
@@ -129,6 +119,12 @@ public static class TesselationPatches
         return false;
     }
 
+    /// <summary>
+    /// ClientThread.Process sleeps 5 ms after a tick unless some system returned a negative
+    /// interval. Vanilla's 0 means "run every tick, but nap in between" - fine when nothing
+    /// is queued, a brake when 1500 chunks are. Negative only while there is work, so an idle
+    /// thread still naps instead of spinning a core.
+    /// </summary>
     public static void TickIntervalPostfix(ChunkTesselatorManager __instance, ref int __result)
     {
         if (ShuttingDown) return;
@@ -158,7 +154,7 @@ public static class TesselationPatches
             catch { RaiseThreadPriority = false; } // the OS said no; asking again won't help
         }
 
-        if (NeighbourPrefetch) Prefetcher.EnsureRunning(ClientQueues.GameOf(__instance));
+        if (NeighbourPrefetch) Prefetcher.Sweep(ClientQueues.GameOf(__instance));
         return true;
     }
 
@@ -172,76 +168,86 @@ public static class TesselationPatches
     /// queue entries ahead moves the decompression to a spare core and off the critical path.
     /// A chunk the pool repacks in between just gets unpacked again by the tesselator; the
     /// only cost of being wrong is work the tesselator would have done anyway.
+    ///
+    /// This used to be a thread of its own that woke every 2 ms, re-read the front of the
+    /// queue and walked it again. The tesselator consumes well under one chunk in 2 ms, so two
+    /// consecutive passes were all but identical: 32 chunksLock acquisitions and ~860
+    /// dictionary lookups per pass for chunks the previous pass had already unpacked - against
+    /// the lock the tesselation thread takes for every neighbourhood it reads and the network
+    /// thread for every chunk that arrives. Now the sweep runs on the tesselation thread's own
+    /// tick (rate limited), submits one job per queue entry, and the scheduler's dedup key does
+    /// what a hand-written "already seen" set used to: a chunk queued or being unpacked is
+    /// never queued twice. The thread is gone with it.
     /// </summary>
     private static class Prefetcher
     {
         /// <summary>
         /// Queue entries to look ahead. At ~4 ms per tesselation, 32 entries are ~130 ms of
-        /// runway - enough that the worker stays ahead even when a whole neighbourhood turns
-        /// out to be packed, while a full pass is still only ~860 dictionary lookups.
+        /// runway - enough that the pool stays ahead even when a whole neighbourhood turns out
+        /// to be packed.
         /// </summary>
         private const int LookAhead = 32;
 
-        private static Thread worker;
-        private static volatile ClientMain game;
-        private static volatile bool stop;
-        private static readonly long[] ahead = new long[LookAhead];
-        private static readonly ClientChunk[] hood = new ClientChunk[27];
-        private static readonly Vec3i pos = new();
+        /// <summary>Milliseconds between two sweeps. The runway is over a hundred milliseconds
+        /// deep, so a sweep every 20 ms refills it many times over while costing one bounded
+        /// walk of the queue front per sweep instead of one every 2 ms.</summary>
+        private const int SweepIntervalMs = 20;
 
-        public static void EnsureRunning(ClientMain current)
+        /// <summary>
+        /// Entries already handed to the pool. The scheduler dedups what is queued or running;
+        /// this is what stops a completed entry from being re-queued on the next sweep for as
+        /// long as it sits at the front of the tesselation queue. Touched only by the
+        /// tesselation thread (the only sweeper), so it needs no lock; dropped whole when it
+        /// grows past the cap, which costs one repeat prefetch of whatever fell out.
+        /// </summary>
+        private const int SeenCap = 8192;
+        private static readonly HashSet<long> seen = new(SeenCap);
+
+        /// <summary>Written by the tesselation thread's sweep, read by whichever worker runs a
+        /// job. Volatile so a worker cannot pick up the previous world's map.</summary>
+        private static volatile ClientMain game;
+        private static long nextSweepAtMs;
+        private static readonly long[] ahead = new long[LookAhead];
+
+        /// <summary>One job body for every entry, allocated once: the scheduler hands it the
+        /// key, so nothing is captured and a sweep allocates nothing.</summary>
+        private static readonly Action<long> UnpackJob = key => UnpackNeighbourhood(game, key);
+
+        /// <summary>Called from the tesselation thread's tick prefix. Bounded work, on a
+        /// cadence, and every entry it finds new becomes one pool job.</summary>
+        public static void Sweep(ClientMain current)
         {
             if (current == null) return;
-            if (ReferenceEquals(game, current) && worker is { IsAlive: true }) return;
-
-            game = current; // rebind after a world change; the loop re-reads it every pass
-            if (worker is { IsAlive: true }) return;
-
-            stop = false;
-            worker = new Thread(Loop)
+            if (!ReferenceEquals(game, current))
             {
-                Name = "komet-unpack-prefetch",
-                IsBackground = true,
-                Priority = ThreadPriority.BelowNormal // never compete with the tesselator itself
-            };
-            worker.Start();
+                // chunk keys belong to one map; carrying them into the next world would skip
+                // neighbourhoods that were never prefetched there
+                seen.Clear();
+                game = current;
+            }
+
+            var now = Environment.TickCount64;
+            if (now < nextSweepAtMs) return;
+            nextSweepAtMs = now + SweepIntervalMs;
+
+            var copied = Snapshot(current);
+            if (copied == 0) return;
+            if (seen.Count > SeenCap) seen.Clear();
+
+            for (var i = 0; i < copied; i++)
+            {
+                var key = ahead[i] & 0x7FFFFFFFFFFFFFFFL; // the queue uses the sign bit as an edge-only flag
+                if (key >= ExtraDimensionsStart || !seen.Add(key)) continue;
+                JobScheduler.Submit(JobKind.ChunkPrep, key, UnpackJob);
+            }
         }
 
         public static void Stop()
         {
-            stop = true;
+            JobScheduler.CancelKind(JobKind.ChunkPrep);
             game = null;
-        }
-
-        private static void Loop()
-        {
-            while (!stop)
-            {
-                try
-                {
-                    var g = game;
-                    if (g == null || g.disposed) { Thread.Sleep(50); continue; }
-
-                    var copied = Snapshot(g);
-                    if (copied == 0) { Thread.Sleep(25); continue; }
-
-                    // The decompression this thread does off the critical path allocates the
-                    // same arrays the tesselator otherwise would - measured here so the
-                    // alloc-attribution row can name this thread's share instead of leaving
-                    // it in "rest".
-                    var alloc0 = GC.GetAllocatedBytesForCurrentThread();
-                    for (var i = 0; i < copied && !stop; i++) UnpackNeighbourhood(g, ahead[i]);
-                    Komet.Measure.FrameStats.AddPrefetchAllocBytes(
-                        GC.GetAllocatedBytesForCurrentThread() - alloc0);
-                    Thread.Sleep(2);
-                }
-                catch (Exception)
-                {
-                    // A stale ClientMain mid-shutdown can throw almost anywhere. The
-                    // prefetcher is an accelerator, never a dependency - back off and retry.
-                    Thread.Sleep(250);
-                }
-            }
+            seen.Clear();
+            nextSweepAtMs = 0;
         }
 
         /// <summary>Copies the first entries of the dirty-chunk queue under its own lock.</summary>
@@ -264,23 +270,29 @@ public static class TesselationPatches
             return n;
         }
 
+        /// <summary>
+        /// The job body, on a pool worker. Allocation is booked so the attribution row can name
+        /// this work rather than leaving it in "rest" - the decompression allocates the same
+        /// arrays the tesselator otherwise would.
+        /// </summary>
         private static void UnpackNeighbourhood(ClientMain g, long key)
         {
-            key &= 0x7FFFFFFFFFFFFFFFL; // the queue uses the sign bit as an edge-only flag
-            if (key >= ExtraDimensionsStart) return;
-
+            if (g == null || g.disposed || key <= 0) return;
             var map = g.WorldMap;
             if (map == null) return;
-            var chunks = ChunksRef(map);
-            var chunksLock = ChunksLockRef(map);
+            var chunks = ClientQueues.MapChunks(map);
+            var chunksLock = ClientQueues.MapChunksLock(map);
             if (chunks == null || chunksLock == null) return;
 
+            var alloc0 = GC.GetAllocatedBytesForCurrentThread();
             int mulX = map.index3dMulX, mulZ = map.index3dMulZ;
+            var pos = new Vec3i();
             MapUtil.PosInt3d(key, mulX, mulZ, pos);
 
             // One lock acquisition for the whole neighbourhood, exactly like the engine's
-            // GetNeighbouringChunks - 27 separate lock round trips per queue entry were a
-            // measurable contribution to chunksLock contention while chunks stream in.
+            // GetNeighbouringChunks - 27 separate lock round trips per entry were a measurable
+            // contribution to chunksLock contention while chunks stream in.
+            var hood = HoodBuffer ??= new ClientChunk[27];
             var found = 0;
             lock (chunksLock)
             {
@@ -305,7 +317,13 @@ public static class TesselationPatches
                 }
                 hood[i] = null;
             }
+            Komet.Measure.FrameStats.AddPrefetchAllocBytes(
+                GC.GetAllocatedBytesForCurrentThread() - alloc0);
         }
+
+        /// <summary>Per worker, because several may unpack different neighbourhoods at
+        /// once - the one buffer the old single thread could keep static.</summary>
+        [ThreadStatic] private static ClientChunk[] HoodBuffer;
     }
 
     public static void Shutdown()

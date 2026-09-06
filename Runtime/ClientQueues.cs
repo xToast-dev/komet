@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using HarmonyLib;
 using Vintagestory.API.Datastructures;
 using Vintagestory.Client.NoObf;
@@ -39,4 +40,15 @@ internal static class ClientQueues
 
     internal static readonly AccessTools.FieldRef<ClientMain, object> DirtyPrioLock =
         AccessTools.FieldRefAccess<ClientMain, object>("dirtyChunksPriorityLock");
+
+    /// <summary>The loaded chunks, by index3d, and the lock every reader of them takes. The
+    /// engine's own GetClientChunk is internal, so the two systems that look a queue key up -
+    /// the neighbour prefetcher and the window prebuilder's prediction - reach the dictionary
+    /// directly, and do it through one pair of accessors rather than two copies of the same
+    /// two field names.</summary>
+    internal static readonly AccessTools.FieldRef<ClientWorldMap, Dictionary<long, ClientChunk>> MapChunks =
+        AccessTools.FieldRefAccess<ClientWorldMap, Dictionary<long, ClientChunk>>("chunks");
+
+    internal static readonly AccessTools.FieldRef<ClientWorldMap, object> MapChunksLock =
+        AccessTools.FieldRefAccess<ClientWorldMap, object>("chunksLock");
 }

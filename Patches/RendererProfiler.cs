@@ -405,8 +405,14 @@ public static class RendererProfiler
 
         foreach ((var name, var stage, var ms) in top)
         {
-            var label = name.Length > 13 ? name.Substring(0, 13) : name;
-            Measure.DebugHud.Row(sb, label, null, Measure.DebugHud.Ms(ms), stage.ToString().ToLowerInvariant());
+            // The engine's own profiling name already begins with the stage
+            // (ClientEventManager: stage + "-" + name), so printing the stage after it was a
+            // column of the word "before" repeated down the page. It is printed only for a
+            // name that does not carry it - another mod's renderer registered under a name of
+            // its own choosing.
+            var stageName = stage.ToString().ToLowerInvariant();
+            var tail = name.StartsWith(stageName, StringComparison.OrdinalIgnoreCase) ? null : stageName;
+            Measure.DebugHud.Row(sb, Measure.DebugHud.Label(name), null, Measure.DebugHud.Ms(ms), tail);
         }
     }
 

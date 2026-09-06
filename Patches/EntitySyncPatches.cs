@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
-using Vintagestory.API.Util;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.Server;
+using Vintagestory.API.Util;
 using Vintagestory.Common.Network.Packets;
 using Vintagestory.Server;
 using Vintagestory.Server.Systems;
@@ -117,7 +118,7 @@ public static class EntitySyncPatches
         var invalidate = new HarmonyMethod(typeof(EntitySyncPatches), nameof(InvalidateAfterFullPacket));
         harmony.Patch(AccessTools.Method(sp, nameof(ServerPackets.GetEntityPacket), [typeof(FastMemoryStream), typeof(Entity)])
                       ?? throw new InvalidOperationException("ServerPackets.GetEntityPacket(ms, entity) not found"), postfix: invalidate);
-        harmony.Patch(AccessTools.Method(sp, nameof(ServerPackets.GetEntityPacket), [typeof(Entity), typeof(FastMemoryStream), typeof(System.IO.BinaryWriter)])
+        harmony.Patch(AccessTools.Method(sp, nameof(ServerPackets.GetEntityPacket), [typeof(Entity), typeof(FastMemoryStream), typeof(BinaryWriter)])
                       ?? throw new InvalidOperationException("ServerPackets.GetEntityPacket(entity, ms, writer) not found"), postfix: invalidate);
         harmony.Patch(AccessTools.Method(sp, nameof(ServerPackets.GetEntityPacket), [typeof(Entity)])
                       ?? throw new InvalidOperationException("ServerPackets.GetEntityPacket(entity) not found"), postfix: invalidate);

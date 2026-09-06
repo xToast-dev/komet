@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Threading;
 using HarmonyLib;
 using Komet.Measure;
 using Komet.Runtime;
@@ -133,6 +135,279 @@ public static class FastCuller
     public static long StatRangesRaw;
     public static long StatRangesEmitted;
 
+    /// <summary>
+    /// What each cull mode actually emitted, so the report can put the NEAR shadow pass's
+    /// triangles next to its GPU milliseconds. The pool's RenderedTriangles field is
+    /// overwritten by every sweep of the frame, so it only ever holds the last mode's number;
+    /// these are summed per mode as the sweeps go by.
+    /// </summary>
+    public static long StatTrisNear, StatRangesNear, StatTrisFar, StatTrisCamera;
+
+    /// <summary>The render pass whose pool manager is currently sweeping - set by the prefix
+    /// on MeshDataPoolManager.Render (PoolPassPatches), read when a pool enters the cull.</summary>
+    public static int CurrentPass = -1;
+
+    // ---- draw order: nearest first --------------------------------------------------------
+    //
+    // The depth test is order-independent for what it keeps, not for what it costs: a
+    // fragment behind an already written nearer depth is rejected before the fragment shader
+    // runs, one drawn before its occluder is shaded and then overwritten. The camera pass
+    // shades ten fragments per pixel in a forest and keeps one. Drawing near to far turns
+    // most of the other nine into rejections. That needs two orders: the POOLS in the order
+    // of their distance (only meaningful once SpatialPools made a pool a place), and the CELLS
+    // inside a pool nearest first. Gap bridging is off in a sorted sweep - it walks the part
+    // list in index order between two emitted parts, which a sorted emission no longer is.
+
+    /// <summary>Emit the camera pass nearest first: pools by distance, cells inside a pool by
+    /// distance. Off is the index order the merge rule was built for.</summary>
+    public static bool FrontToBack;
+    public static bool ConfiguredFrontToBack;
+
+    public static long StatSortedSweeps;
+    public static long StatPoolSorts;
+
+    [ThreadStatic] private static int[] tlsCellOrder;
+    [ThreadStatic] private static float[] tlsCellKey;
+    private static float[] poolKeys = Array.Empty<float>();
+    private static MeshDataPool[] poolItems = Array.Empty<MeshDataPool>();
+
+    /// <summary>
+    /// Sorts the non-empty cells of a grid by the distance of their centre to the camera,
+    /// nearest first. Pure; returns how many cells were written into <paramref name="order"/>.
+    /// </summary>
+    internal static int SortCells(float[] cellBox, int cellCount, int[] bucketStart,
+                                  double px, double py, double pz, int[] order, float[] keys)
+    {
+        var n = 0;
+        for (var cell = 0; cell < cellCount; cell++)
+        {
+            if (bucketStart[CellBase(cell)] == bucketStart[CellBase(cell) + LodLevels]) continue;
+            var o = cell * 6;
+            var dx = cellBox[o] - px;
+            var dy = cellBox[o + 1] - py;
+            var dz = cellBox[o + 2] - pz;
+            keys[n] = (float)(dx * dx + dy * dy + dz * dz);
+            order[n] = cell;
+            n++;
+        }
+        if (n > 1) Array.Sort(keys, order, 0, n);
+        return n;
+    }
+
+    /// <summary>
+    /// Reorders a manager's pool list nearest first, by each pool's cached box centre. Pools
+    /// without a box (empty, or not swept yet) go last. Main thread, before the manager's
+    /// loop reads the list; the list object stays the same, only its order changes.
+    /// </summary>
+    public static void SortPools(List<MeshDataPool> pools, double px, double py, double pz)
+    {
+        if (pools == null) return;
+        var n = pools.Count;
+        if (n < 2) return;
+        if (poolKeys.Length < n) { poolKeys = new float[n + 64]; poolItems = new MeshDataPool[n + 64]; }
+        for (var i = 0; i < n; i++)
+        {
+            var pool = pools[i];
+            poolItems[i] = pool;
+            var c = pool == null ? null : Lookup(pool);
+            if (c == null || !c.HasBox)
+            {
+                poolKeys[i] = float.MaxValue;
+                continue;
+            }
+            var dx = (c.MinX + c.MaxX) * 0.5 - px;
+            var dy = (c.MinY + c.MaxY) * 0.5 - py;
+            var dz = (c.MinZ + c.MaxZ) * 0.5 - pz;
+            poolKeys[i] = (float)(dx * dx + dy * dy + dz * dz);
+        }
+        Array.Sort(poolKeys, poolItems, 0, n);
+        for (var i = 0; i < n; i++) pools[i] = poolItems[i];
+        StatPoolSorts++;
+    }
+
+    // ---- where the camera pass's triangles come from -----------------------------------
+    //
+    // A report put the camera pass at 17 million triangles in a forest and the near shadow
+    // pass at half a million, with the GPU probe pricing the camera pass at 5,2 ms for six
+    // million. Leaves have no LOD 2 stand-in (only the aquatic blocks do), so they are drawn at
+    // full detail to the view distance. Which pass, which distance band and which LOD level
+    // the triangles belong to is the question the next lever hangs on - so the sweep books
+    // every emitted part's triangles by (pass, band, lod), one add per part, thread-local.
+
+    public const int HistPasses = 10;   // EnumChunkRenderPass has 9 values; the last slot is "unknown"
+    public const int HistBands = 4;     // 0-64, 64-211, 211-640, 640+ blocks
+    public const int HistLods = 8;
+
+    /// <summary>
+    /// How far a cell index shifts to reach its first bucket. Buckets are (cell, level) pairs
+    /// laid out level-minor, so the stride is the level count and indexing is a shift.
+    ///
+    /// The two are derived from one constant on purpose. They used to be written out
+    /// separately - <c>cell &lt;&lt; 3</c> here, <c>cell * 4</c> there - and when the far mesh
+    /// widened the stride from four levels to eight, one site kept the old one: the cell-box
+    /// finaliser then decided most cells were empty, left them holding their sentinel box, and
+    /// whole cells of terrain stopped drawing. Every gating check passed.
+    /// </summary>
+    private const int LodShift = 3;
+
+    /// <summary>
+    /// LOD levels the spatial index keeps apart: the engine's four plus the far LOD's four
+    /// (4 tier 1, 5 the engine's mesh within the distance, 6 tier 2, 7 tier 1 without a tier 2).
+    /// </summary>
+    public const int LodLevels = 1 << LodShift;
+
+    /// <summary>The first bucket of a grid cell - the only place the stride is applied.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CellBase(int cell) => cell << LodShift;
+    public const int HistSize = HistPasses * HistBands * HistLods;
+
+    /// <summary>Set by the sweep between frames; folded into <see cref="HistFrame"/> at the boundary.</summary>
+    private static readonly long[] hist = new long[HistSize];
+
+    /// <summary>Smoothed triangles per frame by (pass, band, lod) - the report's rows.</summary>
+    public static readonly double[] HistFrame = new double[HistSize];
+    public static long HistSamples;
+
+    [ThreadStatic] private static long[] tlsHist;
+
+    /// <summary>The distance band of a part's centre, from its squared distance to the player.</summary>
+    internal static int BandOf(double distSq)
+        => distSq < 64.0 * 64.0 ? 0 : distSq < 211.0 * 211.0 ? 1 : distSq < 640.0 * 640.0 ? 2 : 3;
+
+    internal static int HistIndex(int pass, int band, int lod)
+    {
+        var p = (uint)pass < (uint)HistPasses ? pass : HistPasses - 1;
+        var l = (uint)lod < (uint)HistLods ? lod : HistLods - 1;
+        return (p * HistBands + band) * HistLods + l;
+    }
+
+    private static void Book(int pass, ModelDataPoolLocation loc, int triangles, double px, double pz)
+    {
+        var h = tlsHist ??= new long[HistSize];
+        var sphere = loc.FrustumCullSphere;
+        var dx = sphere.x - px;
+        var dz = sphere.z - pz;
+        h[HistIndex(pass, BandOf(dx * dx + dz * dz), loc.LodLevel)] += triangles;
+    }
+
+    private static void FlushHistogram()
+    {
+        var h = tlsHist;
+        if (h == null) return;
+        for (var i = 0; i < HistSize; i++)
+        {
+            if (h[i] == 0) continue;
+            Interlocked.Add(ref hist[i], h[i]);
+            h[i] = 0;
+        }
+    }
+
+    /// <summary>Folds the frame that just ended. Hangs on MeasurementPatches.FrameBoundary.</summary>
+    public static void HistogramFrame()
+    {
+        const double alpha = 1.0 / 16.0;
+        var any = false;
+        for (var i = 0; i < HistSize; i++)
+        {
+            var v = Interlocked.Exchange(ref hist[i], 0);
+            if (v != 0) any = true;
+            HistFrame[i] += (v - HistFrame[i]) * alpha;
+        }
+        if (any) HistSamples++;
+    }
+
+    /// <summary>Triangles per frame of one pass in one band, all LOD levels.</summary>
+    public static double HistTris(int pass, int band)
+    {
+        double sum = 0;
+        for (var l = 0; l < HistLods; l++) sum += HistFrame[HistIndex(pass, band, l)];
+        return sum;
+    }
+
+    /// <summary>Triangles per frame at one LOD level, all passes and bands.</summary>
+    public static double HistTrisByLod(int lod)
+    {
+        double sum = 0;
+        for (var p = 0; p < HistPasses; p++)
+            for (var b = 0; b < HistBands; b++) sum += HistFrame[HistIndex(p, b, lod)];
+        return sum;
+    }
+
+    // ---- the foliage draw range ---------------------------------------------------------
+
+    /// <summary>
+    /// Squared range, in blocks, beyond which the foliage passes (OpaqueNoCull = leaves and
+    /// plants, BlendNoCull) are not drawn in the CAMERA pass. 0 = vanilla: to the view distance.
+    /// It changes the picture - trees beyond the range are trunks - and is priced live
+    /// ('.komet foliagerange'); the default is vanilla. Applied as a cap on the LOD distance
+    /// table of a foliage pool's sweep, so the cull verifier is told to look away for those.
+    /// </summary>
+    public static double FoliageRangeSq;
+
+    /// <summary>
+    /// How far leaves and plants cast a shadow, squared; 0 is the cascade's own range
+    /// (vanilla). Measured on 06.09.: skipping foliage in the shadow maps outright took the
+    /// frame from 6,27 to 4,40 ms - 315 million fragments in the near cascade and 250 million
+    /// in the far one, against 32 million in the camera pass. The far cascade is where a range
+    /// pays: it is an orthographic map, so a caster costs the same number of shadow texels
+    /// whether it stands at 20 or at 250 blocks, and the fragments therefore scale with the
+    /// AREA the pass covers. Cutting 255 blocks to 100 leaves 15 % of them. Applied as a
+    /// tighter axis-aligned band on the sweep's shadow range - the same test the engine makes,
+    /// narrower - so it removes casters and nothing else.
+    ///
+    /// It IS visible if set too low: a forest that stops shading itself is obvious, and grass
+    /// tufts are in the same render pass as tree leaves, so they cannot be told apart at pool
+    /// granularity. Off by default for that reason.
+    /// </summary>
+    public static double ShadowFoliageRangeSq;
+
+    internal static bool IsFoliagePass(int pass)
+        => pass == (int)EnumChunkRenderPass.OpaqueNoCull || pass == (int)EnumChunkRenderPass.BlendNoCull;
+
+    /// <summary>Whether this sweep is one a foliage range changes - the verifier skips it.</summary>
+    public static bool IsFoliageCapped(MeshDataPool pool, EnumFrustumCullMode mode)
+    {
+        if (mode == EnumFrustumCullMode.CullNormal) return FoliageRangeSq > 0 && IsFoliagePass(Lookup(pool).Pass);
+        if (ShadowFoliageRangeSq <= 0) return false;
+        return (mode == EnumFrustumCullMode.CullInstantShadowPassNear
+                || mode == EnumFrustumCullMode.CullInstantShadowPassFar)
+               && IsFoliagePass(Lookup(pool).Pass);
+    }
+
+    /// <summary>
+    /// The shadow band this sweep uses, in blocks per axis. Narrowed to the foliage shadow
+    /// range for a foliage pass, never widened - a range past the cascade's own reach changes
+    /// nothing. Pure, so the rule is checkable without a sweep.
+    /// </summary>
+    internal static void ShadowBandFor(int pass, double rangeX, double rangeZ, double foliageRangeSq,
+                                       out double outX, out double outZ)
+    {
+        outX = rangeX;
+        outZ = rangeZ;
+        if (foliageRangeSq <= 0 || !IsFoliagePass(pass)) return;
+        var r = Math.Sqrt(foliageRangeSq);
+        if (r < outX) outX = r;
+        if (r < outZ) outZ = r;
+    }
+
+    /// <summary>Caps every LOD level's upper bound: nothing is drawn beyond the range,
+    /// whatever level it is. Never widens - a cap above the view distance changes nothing.</summary>
+    internal static void CapLodBounds(double[] hi, double capSq)
+    {
+        for (var l = 0; l < LodLevels; l++)
+            if (hi[l] > capSq) hi[l] = capSq;
+    }
+
+    [ThreadStatic] private static double[] tlsLoF, tlsHiF;
+    [ThreadStatic] private static FrustumCulling tlsLodCullerF;
+    [ThreadStatic] private static double tlsFoliageCapSq;
+    [ThreadStatic] private static float tlsLod0BiasF;
+    [ThreadStatic] private static double tlsLod2BiasF;
+    [ThreadStatic] private static int tlsLodViewDistSqF;
+    [ThreadStatic] private static bool tlsLodFarOnF;
+    [ThreadStatic] private static double tlsLodFarSqF;
+    [ThreadStatic] private static bool tlsLodTier2F;
+
     /// <summary>Gaps bridged - each one is a draw range that no longer exists.</summary>
     public static long StatRangesBridged;
 
@@ -153,7 +428,6 @@ public static class FastCuller
     private const float BaseCellSize = 96f;
     private const int MaxCells = 4096;
 
-    /// <summary>Parts a grid cell should hold on average - below this the cell test does not pay.</summary>
     /// <summary>
     /// Target parts per grid cell - what the cell edge length is derived from, since a fixed
     /// edge gets one or two parts per cell in a distance-ordered pool.
@@ -205,6 +479,9 @@ public static class FastCuller
         /// <summary>Which batch last culled this pool, so a stage does not cull it twice.</summary>
         public int BatchToken = -1;
         public bool Registered;
+        /// <summary>The chunk render pass the pool's manager draws (EnumChunkRenderPass), -1
+        /// when unknown - a decal pool, or a manager the renderer does not own.</summary>
+        public int Pass = -1;
 
         /// <summary>
         /// Cull geometry in PLANAR order: six blocks of <see cref="GeoStride"/> floats, holding
@@ -221,7 +498,7 @@ public static class FastCuller
 
         /// <summary>Distance between the six blocks of <see cref="Geo"/>, in floats.</summary>
         public int GeoStride;
-        /// <summary>LOD level per part, 0-3.</summary>
+        /// <summary>LOD level per part, 0-7 (0-3 the engine's, 4-7 the far LOD's); 255 = never drawn.</summary>
         public byte[] Lod = Array.Empty<byte>();
         /// <summary>indicesStartByte, indicesLength, triangleCount per part.</summary>
         public int[] Meta = Array.Empty<int>();
@@ -252,6 +529,21 @@ public static class FastCuller
         // the frustum or by the LOD distance band without touching a single part.
         public int[] Orig = Array.Empty<int>();
         public int[] BucketStart = Array.Empty<int>();
+
+        /// <summary>
+        /// One bit per LOD level that has parts in this cell, so the sweep walks the levels a
+        /// cell actually holds instead of all <see cref="LodLevels"/> of them. A cell usually
+        /// holds one or two: terrain is LOD 1, its far picture level 4, and the two never
+        /// share a pool since the pictures got lanes of their own.
+        ///
+        /// Safe in one direction only, and that is the direction it errs in: buckets gain
+        /// members only when the grid is rebuilt (an incremental insert goes to the overflow
+        /// list, which is swept separately), while an incremental removal can empty a bucket
+        /// whose bit stays set. A stale set bit costs one wasted iteration and is caught by
+        /// the emptiness test that was already there; a missing bit would lose geometry, and
+        /// nothing here can clear one.
+        /// </summary>
+        public byte[] CellMask = Array.Empty<byte>();
         public float[] CellBox = Array.Empty<float>();
         public int CellCount;
         public ulong[] VisBits = Array.Empty<ulong>();
@@ -341,15 +633,11 @@ public static class FastCuller
     /// </summary>
     public static bool Parallel = true;
 
-    /// <summary>0 = auto.</summary>
-    public static int MaxThreads;
-
-    /// <summary>
-    /// The threads the batch runs on. Dedicated rather than the shared ThreadPool: see
-    /// <see cref="WorkerSet"/> for why - in short, the game queues chunk tesselation on the
-    /// same pool, and a sweep that has to wait for thread injection is a dropped frame.
-    /// </summary>
-    public static readonly WorkerSet Workers = new("komet-cull");
+    // The batch runs on the shared Komet worker pool (see JobScheduler): dedicated threads
+    // rather than the .NET ThreadPool - the game queues chunk tesselation on that one, and a
+    // sweep that has to wait for thread injection is a dropped frame - and one pool rather than
+    // a set of its own, so a sweep on the frame's deadline outranks the occlusion walk instead
+    // of racing it for cores.
 
     /// <summary>Reused across batches so a sweep allocates nothing at all.</summary>
     private sealed class BatchBody : IWorkBody
@@ -372,7 +660,6 @@ public static class FastCuller
     private static readonly List<WeakReference<MeshDataPool>> KnownPools = new();
     private static MeshDataPool[] batchBuffer = Array.Empty<MeshDataPool>();
     private static PoolCache[] batchCaches = Array.Empty<PoolCache>();
-    private static int batchCount;
 
     /// <summary>
     /// Mesh parts a batch has to have before it is worth spreading over the thread pool.
@@ -436,22 +723,30 @@ public static class FastCuller
     {
         public long Sweeps, Parts, Cells, Buckets, RangesRaw, RangesEmitted, PoolsSkipped, Rebuilds, RebuildTicks;
         public long RangesBridged, PartsBridged, TrisBridged;
+        public long TrisNear, RangesNear, TrisFar, TrisCamera;
+        public long SortedSweeps;
     }
 
     private static void Flush(ref Stats st)
     {
-        System.Threading.Interlocked.Add(ref StatSweeps, st.Sweeps);
-        System.Threading.Interlocked.Add(ref StatPartsTested, st.Parts);
-        System.Threading.Interlocked.Add(ref StatCellsSkipped, st.Cells);
-        System.Threading.Interlocked.Add(ref StatBucketsSkipped, st.Buckets);
-        System.Threading.Interlocked.Add(ref StatRangesRaw, st.RangesRaw);
-        System.Threading.Interlocked.Add(ref StatRangesEmitted, st.RangesEmitted);
-        System.Threading.Interlocked.Add(ref StatRangesBridged, st.RangesBridged);
-        System.Threading.Interlocked.Add(ref StatPartsBridged, st.PartsBridged);
-        System.Threading.Interlocked.Add(ref StatTrisBridged, st.TrisBridged);
-        System.Threading.Interlocked.Add(ref StatPoolsSkipped, st.PoolsSkipped);
-        System.Threading.Interlocked.Add(ref StatRebuilds, st.Rebuilds);
-        System.Threading.Interlocked.Add(ref StatRebuildTicks, st.RebuildTicks);
+        Interlocked.Add(ref StatSweeps, st.Sweeps);
+        Interlocked.Add(ref StatPartsTested, st.Parts);
+        Interlocked.Add(ref StatCellsSkipped, st.Cells);
+        Interlocked.Add(ref StatBucketsSkipped, st.Buckets);
+        Interlocked.Add(ref StatRangesRaw, st.RangesRaw);
+        Interlocked.Add(ref StatRangesEmitted, st.RangesEmitted);
+        Interlocked.Add(ref StatRangesBridged, st.RangesBridged);
+        Interlocked.Add(ref StatPartsBridged, st.PartsBridged);
+        Interlocked.Add(ref StatTrisBridged, st.TrisBridged);
+        Interlocked.Add(ref StatPoolsSkipped, st.PoolsSkipped);
+        Interlocked.Add(ref StatRebuilds, st.Rebuilds);
+        Interlocked.Add(ref StatRebuildTicks, st.RebuildTicks);
+        Interlocked.Add(ref StatTrisNear, st.TrisNear);
+        Interlocked.Add(ref StatRangesNear, st.RangesNear);
+        Interlocked.Add(ref StatTrisFar, st.TrisFar);
+        Interlocked.Add(ref StatTrisCamera, st.TrisCamera);
+        Interlocked.Add(ref StatSortedSweeps, st.SortedSweeps);
+        FlushHistogram();
         st = default;
     }
 
@@ -465,8 +760,8 @@ public static class FastCuller
     /// </summary>
     private static void ReportRebuilds()
     {
-        var ticks = System.Threading.Interlocked.Read(ref StatRebuildTicks);
-        var count = System.Threading.Interlocked.Read(ref StatRebuilds);
+        var ticks = Interlocked.Read(ref StatRebuildTicks);
+        var count = Interlocked.Read(ref StatRebuilds);
         var dTicks = ticks - rebuildTicksReported;
         var dCount = count - rebuildsReported;
         rebuildTicksReported = ticks;
@@ -524,14 +819,13 @@ public static class FastCuller
             Array.Clear(batchCaches, live, batchCaches.Length - live);
         }
 
-        batchCount = live;
         // Already summed for the parallel threshold above, so recording it is free.
         StatPartsHeld = parts;
         StatPoolsLive = live;
         if (live == 0) return;
 
         StatBatches++;
-        var threads = Workers.ThreadCount;
+        var threads = JobScheduler.ActiveWorkers;
 
         // Going wide has to be paid for before the first part is tested: waking the helpers
         // costs tens of microseconds. Below a real workload that is more than the sweep itself,
@@ -553,15 +847,15 @@ public static class FastCuller
         batchBody.Culler = culler;
         batchBody.Mode = mode;
 
-        var waitBefore = Workers.StatWaitTicks;
+        var waitBefore = JobScheduler.StatWaitTicks;
         try
         {
-            Workers.Run(batchBody, live, Math.Max(1, live / (threads * 8)));
+            JobScheduler.RunBatch(batchBody, live, Math.Max(1, live / (threads * 8)), JobKind.Cull);
         }
         finally
         {
             // Only the render thread ever fires a batch, so this reads its own delta.
-            if (MeasureTime) FrameStats.AddCullWaitTicks(Workers.StatWaitTicks - waitBefore);
+            if (MeasureTime) FrameStats.AddCullWaitTicks(JobScheduler.StatWaitTicks - waitBefore);
             batchBody.Pools = null;
             batchBody.Caches = null;
             batchBody.Culler = null;
@@ -569,17 +863,12 @@ public static class FastCuller
     }
 
     /// <summary>
-    /// Forces the reflection field accessors to resolve now, so a renamed engine field fails
-    /// at patch time - where it can be caught and the optimisation skipped - rather than
-    /// inside the render loop as a TypeInitializationException.
+    /// Brings the worker pool up with the default sizing. The game starts it from the mod
+    /// system with the configured ceiling instead; this exists for the benchmark and the verify
+    /// harness, which have no config and still need a pool before the first batch - a lazy
+    /// start would put the thread creations inside whichever batch happened to be first.
     /// </summary>
-    /// <summary>
-    /// Brings the cull threads up. Called once from the mod system; the benchmark calls it too,
-    /// which is the only reason the batch does not start them lazily - a lazy start would put
-    /// six thread creations inside whichever frame happened to be first.
-    /// </summary>
-    public static void StartWorkers()
-        => Workers.Start(MaxThreads > 0 ? MaxThreads : WorkerSet.AutoThreads(1));
+    public static void StartWorkers() => JobScheduler.Start(0, 0);
 
     public static void EnsureReady()
     {
@@ -592,6 +881,9 @@ public static class FastCuller
     {
         if (Caches.TryGetValue(pool, out var c)) c.Dirty = true;
     }
+
+    /// <summary>The culler's player position, for the verifier's restatement of the far-mesh rule.</summary>
+    internal static BlockPos PlayerPosOf(FrustumCulling culler) => PlayerPosRef(culler);
 
     public static void InvalidateAll()
     {
@@ -607,6 +899,12 @@ public static class FastCuller
     /// culling them too. The game never wants this - there a pool going away is exactly what
     /// the weak reference already handles.
     /// </summary>
+    /// <summary>The grid cell count of a pool's cache, or 0 when it has none. Verify's
+    /// multi-cell equivalence check asserts on it, so that a pool which degenerated to a
+    /// single cell cannot pass the check while testing nothing.</summary>
+    internal static int CellCountOf(MeshDataPool pool)
+        => Caches.TryGetValue(pool, out var c) ? c.CellCount : 0;
+
     public static void ForgetAllPools()
     {
         lock (KnownPools) KnownPools.Clear();
@@ -686,23 +984,9 @@ public static class FastCuller
         Array.Copy(c.Meta, p * 3, c.Meta, (p + 1) * 3, (n - p) * 3);
         Array.Copy(c.Locs, p, c.Locs, p + 1, n - p);
 
-        // Only the fields the engine has already filled in by the time TryAdd returns are read
-        // here: the sphere and the index range come out of InsertAt's object initialiser, while
-        // CullVisible and LodLevel are assigned by the caller afterwards - see the note on
-        // PoolCache. Those two are read at sweep time instead, off c.Locs[i].
-        var s2 = loc.FrustumCullSphere;
-        var ex = s2.radius / Sqrt3;
-        var ey = s2.radiusY / Sqrt3;
-        var ez = s2.radiusZ / Sqrt3;
-
-        var len = loc.IndicesEnd - loc.IndicesStart;
-        var m = p * 3;
-        c.Meta[m] = loc.IndicesStart * 4;
-        c.Meta[m + 1] = len;
-        c.Meta[m + 2] = len / 3;
-        c.Locs[p] = loc;
-        c.AllocatedTris += len / 3;
-
+        // The grid and overflow lists index into the part array, so everything at or behind
+        // the new slot moves up by one - before the part is written into it, or the entry
+        // WritePart appends would be shifted along with the old ones.
         var orig = c.Orig;
         for (int k = 0, gridCount = c.GridCount; k < gridCount; k++)
             if (orig[k] >= p) orig[k]++;
@@ -710,26 +994,11 @@ public static class FastCuller
         for (int k = 0, overCount = c.OverCount; k < overCount; k++)
             if (overOrig[k] >= p) overOrig[k]++;
 
-        var g = c.OverCount * 6;
-        c.OverGeo[g] = s2.x;
-        c.OverGeo[g + 1] = s2.y;
-        c.OverGeo[g + 2] = s2.z;
-        c.OverGeo[g + 3] = ex;
-        c.OverGeo[g + 4] = ey;
-        c.OverGeo[g + 5] = ez;
-        c.OverOrig[c.OverCount] = p;
-        c.OverCount++;
-
-        if (s2.x - ex < c.MinX) c.MinX = s2.x - ex;
-        if (s2.y - ey < c.MinY) c.MinY = s2.y - ey;
-        if (s2.z - ez < c.MinZ) c.MinZ = s2.z - ez;
-        if (s2.x + ex > c.MaxX) c.MaxX = s2.x + ex;
-        if (s2.y + ey > c.MaxY) c.MaxY = s2.y + ey;
-        if (s2.z + ez > c.MaxZ) c.MaxZ = s2.z + ez;
+        WritePart(c, loc, p);
 
         c.Count = n + 1;
         c.HasBox = true;
-        System.Threading.Interlocked.Increment(ref StatIncInserts);
+        Interlocked.Increment(ref StatIncInserts);
     }
 
     /// <summary>
@@ -794,7 +1063,7 @@ public static class FastCuller
             // the bucket holding pos is the last one whose start is <= pos; every boundary
             // after it moves down by one, the sentinel at [buckets] included
             var bucketStart = c.BucketStart;
-            var buckets = c.CellCount * 4;
+            var buckets = c.CellCount * LodLevels;
             var b = 0;
             for (var q = 1; q <= buckets; q++)
             {
@@ -848,7 +1117,7 @@ public static class FastCuller
             if (overOrig2[k] > p) overOrig2[k]--;
 
         c.Count = n - 1;
-        System.Threading.Interlocked.Increment(ref StatIncRemovals);
+        Interlocked.Increment(ref StatIncRemovals);
     }
 
     /// <summary>
@@ -868,48 +1137,57 @@ public static class FastCuller
 
         EnsureOverflowCapacity(c, c.OverCount + added);
 
-        for (var i = c.Count; i < n; i++)
-        {
-            var loc = locations[i];
-            var s2 = loc.FrustumCullSphere;
-
-            var ex = s2.radius / Sqrt3;
-            var ey = s2.radiusY / Sqrt3;
-            var ez = s2.radiusZ / Sqrt3;
-
-            var len = loc.IndicesEnd - loc.IndicesStart;
-            var m = i * 3;
-            c.Meta[m] = loc.IndicesStart * 4;
-            c.Meta[m + 1] = len;
-            c.Meta[m + 2] = len / 3;
-
-            c.Locs[i] = loc;
-            c.AllocatedTris += len / 3;
-
-            var g = c.OverCount * 6;
-            c.OverGeo[g] = s2.x;
-            c.OverGeo[g + 1] = s2.y;
-            c.OverGeo[g + 2] = s2.z;
-            c.OverGeo[g + 3] = ex;
-            c.OverGeo[g + 4] = ey;
-            c.OverGeo[g + 5] = ez;
-
-            c.OverOrig[c.OverCount] = i;
-            c.OverCount++;
-
-            // the pool box has to grow with them, or the whole-pool rejection could throw
-            // away parts that are in view
-            if (s2.x - ex < c.MinX) c.MinX = s2.x - ex;
-            if (s2.y - ey < c.MinY) c.MinY = s2.y - ey;
-            if (s2.z - ez < c.MinZ) c.MinZ = s2.z - ez;
-            if (s2.x + ex > c.MaxX) c.MaxX = s2.x + ex;
-            if (s2.y + ey > c.MaxY) c.MaxY = s2.y + ey;
-            if (s2.z + ez > c.MaxZ) c.MaxZ = s2.z + ez;
-        }
+        for (var i = c.Count; i < n; i++) WritePart(c, locations[i], i);
 
         c.Count = n;
         c.HasBox = n > 0;
         c.Appended = false;
+    }
+
+    /// <summary>
+    /// One part into slot <paramref name="index"/>, its geometry appended to the overflow list
+    /// and the pool box grown to hold it. The shared tail of both incremental paths - a
+    /// squeeze-insert and a batch of appends differ only in how they make room for the slot.
+    ///
+    /// Only the fields the engine has already filled in by the time TryAdd returns are read:
+    /// the sphere and the index range come out of InsertAt's object initialiser, while
+    /// CullVisible and LodLevel are assigned by the caller afterwards - see the note on
+    /// PoolCache. Those two are read at sweep time instead, off c.Locs[i].
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WritePart(PoolCache c, ModelDataPoolLocation loc, int index)
+    {
+        var s2 = loc.FrustumCullSphere;
+        var ex = s2.radius / Sqrt3;
+        var ey = s2.radiusY / Sqrt3;
+        var ez = s2.radiusZ / Sqrt3;
+
+        var len = loc.IndicesEnd - loc.IndicesStart;
+        var m = index * 3;
+        c.Meta[m] = loc.IndicesStart * 4;
+        c.Meta[m + 1] = len;
+        c.Meta[m + 2] = len / 3;
+        c.Locs[index] = loc;
+        c.AllocatedTris += len / 3;
+
+        var g = c.OverCount * 6;
+        c.OverGeo[g] = s2.x;
+        c.OverGeo[g + 1] = s2.y;
+        c.OverGeo[g + 2] = s2.z;
+        c.OverGeo[g + 3] = ex;
+        c.OverGeo[g + 4] = ey;
+        c.OverGeo[g + 5] = ez;
+        c.OverOrig[c.OverCount] = index;
+        c.OverCount++;
+
+        // the pool box has to grow with it, or the whole-pool rejection could throw away
+        // parts that are in view
+        if (s2.x - ex < c.MinX) c.MinX = s2.x - ex;
+        if (s2.y - ey < c.MinY) c.MinY = s2.y - ey;
+        if (s2.z - ez < c.MinZ) c.MinZ = s2.z - ez;
+        if (s2.x + ex > c.MaxX) c.MaxX = s2.x + ex;
+        if (s2.y + ey > c.MaxY) c.MaxY = s2.y + ey;
+        if (s2.z + ez > c.MaxZ) c.MaxZ = s2.z + ez;
     }
 
     /// <summary>
@@ -960,7 +1238,7 @@ public static class FastCuller
 
     private static void Rebuild(PoolCache c, List<ModelDataPoolLocation> locations, ref Stats st)
     {
-        var rebuildStart = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var rebuildStart = MeasureTime ? Stopwatch.GetTimestamp() : 0;
         st.Rebuilds++;
         var n = locations.Count;
 
@@ -1005,7 +1283,7 @@ public static class FastCuller
             scratch[g0 + 5] = ez;
             // LOD is packed alongside so pass 2 needs nothing but the scratch arrays
             var lodLevel = loc.LodLevel;
-            c.ScratchBucket[i] = (uint)lodLevel < 4u ? lodLevel : 3;
+            c.ScratchBucket[i] = (uint)lodLevel < (uint)LodLevels ? lodLevel : LodLevels - 1;
 
             if (s2.x - ex < minX) minX = s2.x - ex;
             if (s2.y - ey < minY) minY = s2.y - ey;
@@ -1028,7 +1306,7 @@ public static class FastCuller
         if (n == 0)
         {
             c.CellCount = 0;
-            if (MeasureTime) st.RebuildTicks += System.Diagnostics.Stopwatch.GetTimestamp() - rebuildStart;
+            if (MeasureTime) st.RebuildTicks += Stopwatch.GetTimestamp() - rebuildStart;
             return;
         }
 
@@ -1052,7 +1330,7 @@ public static class FastCuller
         var cellCount = gx * gz;
         c.CellCount = cellCount;
 
-        var buckets = cellCount * 4;
+        var buckets = cellCount * LodLevels;
         if (c.BucketStart.Length < buckets + 1) c.BucketStart = new int[buckets + 1];
         if (c.CellBox.Length < cellCount * 6) c.CellBox = new float[cellCount * 6];
         if (cursor == null || cursor.Length < buckets) cursor = new int[buckets];
@@ -1072,6 +1350,18 @@ public static class FastCuller
             bucketStart[b + 1]++;
         }
         for (var b = 1; b <= buckets; b++) bucketStart[b] += bucketStart[b - 1];
+
+        // which levels each cell holds - once here, instead of eight probes per cell per sweep
+        if (c.CellMask.Length < cellCount) c.CellMask = new byte[cellCount];
+        var cellMaskBuild = c.CellMask;
+        for (var cell = 0; cell < cellCount; cell++)
+        {
+            var b0 = CellBase(cell);
+            var m = 0;
+            for (var l = 0; l < LodLevels; l++)
+                if (bucketStart[b0 + l] != bucketStart[b0 + l + 1]) m |= 1 << l;
+            cellMaskBuild[cell] = (byte)m;
+        }
 
         // pass 3: scatter into cell order and accumulate each cell's box
         for (var cell = 0; cell < cellCount; cell++)
@@ -1106,10 +1396,10 @@ public static class FastCuller
             // The out-of-range LOD levels vanilla treats as permanently invisible share
             // bucket 3, so the real level still has to come from the location itself.
             var l = locs[i].LodLevel;
-            lod[pos] = (byte)((uint)l < 4u ? l : 255);
+            lod[pos] = (byte)((uint)l < (uint)LodLevels ? l : 255);
             orig[pos] = i;
 
-            var o = (b >> 2) * 6;
+            var o = (b >> LodShift) * 6;
             if (sx - ex < cellBox[o]) cellBox[o] = sx - ex;
             if (sy - ey < cellBox[o + 1]) cellBox[o + 1] = sy - ey;
             if (sz - ez < cellBox[o + 2]) cellBox[o + 2] = sz - ez;
@@ -1121,7 +1411,9 @@ public static class FastCuller
         // store the cell boxes the way the plane test wants them: centre plus half extent
         for (var cell = 0; cell < cellCount; cell++)
         {
-            if (bucketStart[cell * 4] == bucketStart[cell * 4 + 4]) continue;
+            // empty cells keep their sentinel box; the stride is LodLevels, not the four
+            // levels the engine has - the far mesh's own levels share these buckets
+            if (bucketStart[CellBase(cell)] == bucketStart[CellBase(cell) + LodLevels]) continue;
             var o = cell * 6;
             float x0 = cellBox[o], y0 = cellBox[o + 1], z0 = cellBox[o + 2];
             float x1 = cellBox[o + 3], y1 = cellBox[o + 4], z1 = cellBox[o + 5];
@@ -1133,10 +1425,10 @@ public static class FastCuller
             cellBox[o + 5] = (z1 - z0) * 0.5f;
         }
 
-        if (MeasureTime) st.RebuildTicks += System.Diagnostics.Stopwatch.GetTimestamp() - rebuildStart;
+        if (MeasureTime) st.RebuildTicks += Stopwatch.GetTimestamp() - rebuildStart;
     }
 
-    /// <summary>Grid cell times four, plus the LOD level - out of range LODs share bucket 3.</summary>
+    /// <summary>Grid cell times eight, plus the LOD level - out of range LODs share the last bucket.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int BucketOf(float x, float z, int lodLevel, float minX, float minZ, float cellSize, int gx, int gz)
     {
@@ -1144,8 +1436,8 @@ public static class FastCuller
         var cz = (int)((z - minZ) / cellSize);
         if ((uint)cx >= (uint)gx) cx = cx < 0 ? 0 : gx - 1;
         if ((uint)cz >= (uint)gz) cz = cz < 0 ? 0 : gz - 1;
-        var l = (uint)lodLevel < 4u ? lodLevel : 3;
-        return ((cz * gx + cx) << 2) + l;
+        var l = (uint)lodLevel < (uint)LodLevels ? lodLevel : LodLevels - 1;
+        return CellBase(cz * gx + cx) + l;
     }
 
     // ---- the plane test ------------------------------------------------------------
@@ -1198,6 +1490,9 @@ public static class FastCuller
     [ThreadStatic] private static float tlsLod0Bias;
     [ThreadStatic] private static double tlsLod2Bias;
     [ThreadStatic] private static int tlsLodViewDistSq;
+    [ThreadStatic] private static bool tlsLodFarOn;
+    [ThreadStatic] private static double tlsLodFarSq;
+    [ThreadStatic] private static bool tlsLodTier2;
 
     /// <summary>
     /// Turns FrustumCulling.InFrustumAndRange's per-LOD switch into "distSq &gt; lo &amp;&amp; distSq &lt; hi".
@@ -1222,15 +1517,41 @@ public static class FastCuller
         // lodLevel 3: distSq > lod2BiasSq && distSq < ViewDistanceSq
         lo[3] = lod2BiasSq;
         hi[3] = viewDistSq;
-        // Entries 4..255 encode "vanilla's default case returns false" and never change, so
+        // Levels 4 to 7 are ours (the far LOD): 5 is the engine's own mesh of a part that
+        // has a far picture, drawn within the far distance; 4 its tier 1 picture from there
+        // to twice the distance; 6 its tier 2 picture beyond that; 7 a tier 1 picture without
+        // a tier 2 sibling, from the distance to the view distance. With the pictures not
+        // drawn, level 5 is an ordinary LOD 1 part and the pictures are never drawn - the
+        // engine's own frame.
+        var farSq = FarMesh.EffectiveDistanceSq(culler);
+        var far2Sq = FarMesh.Tier2 ? FarMesh.EffectiveDistance2Sq(culler) : viewDistSq;
+        if (FarMesh.Active)
+        {
+            lo[FarMesh.LodFar] = farSq;
+            hi[FarMesh.LodFar] = FarMesh.Tier2 ? Math.BitIncrement(far2Sq) : viewDistSq;
+            lo[FarMesh.LodNear] = double.NegativeInfinity;
+            hi[FarMesh.LodNear] = Math.BitIncrement(farSq);
+            lo[FarMesh.LodFar2] = FarMesh.Tier2 ? far2Sq : double.NegativeInfinity;
+            hi[FarMesh.LodFar2] = FarMesh.Tier2 ? viewDistSq : double.NegativeInfinity;
+            lo[FarMesh.LodFarSolo] = farSq;
+            hi[FarMesh.LodFarSolo] = viewDistSq;
+        }
+        else
+        {
+            lo[FarMesh.LodFar] = lo[FarMesh.LodFar2] = lo[FarMesh.LodFarSolo] = double.NegativeInfinity;
+            hi[FarMesh.LodFar] = hi[FarMesh.LodFar2] = hi[FarMesh.LodFarSolo] = double.NegativeInfinity;
+            lo[FarMesh.LodNear] = double.NegativeInfinity;
+            hi[FarMesh.LodNear] = viewDistSq;
+        }
+        // Entries 8..255 encode "vanilla's default case returns false" and never change, so
         // they are written once when the table is allocated - filling them on every sweep cost
-        // 504 stores per pool per pass, which at ~8000 sweeps a frame was pure overhead.
+        // hundreds of stores per pool per pass, which at ~8000 sweeps a frame was pure overhead.
     }
 
     private static double[] NewLodTable(double fill)
     {
         var table = new double[256];
-        for (var i = 4; i < 256; i++) table[i] = fill;
+        for (var i = LodLevels; i < 256; i++) table[i] = fill;
         return table;
     }
 
@@ -1318,22 +1639,10 @@ public static class FastCuller
     }
 
     /// <summary>
-    /// Identical to Plane.AABBisOutside. Vanilla computes sign*radius/sqrt(3) as float, which
-    /// is exactly +/- (radius/sqrt(3)), so hoisting the division out of the plane loop and
-    /// folding the sign into a multiplier reproduces the same rounding, term for term.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool Outside(ref FastPlane p, float x, float y, float z, float ex, float ey, float ez)
-    {
-        return ((double)x + ex * p.Sx) * p.Nx
-             + ((double)y + ey * p.Sy) * p.Ny
-             + ((double)z + ez * p.Sz) * p.Nz
-             + p.D < 0.0;
-    }
-
-    /// <summary>
     /// Signed distance of the AABB's near corner to the plane; &lt; 0 means fully outside.
-    /// Same expression, same order, same rounding as Plane.AABBisOutside.
+    /// Vanilla computes sign*radius/sqrt(3) as float, which is exactly +/- (radius/sqrt(3)),
+    /// so hoisting the division out of the plane loop and folding the sign into a multiplier
+    /// reproduces Plane.AABBisOutside's rounding, term for term.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double Dist(ref FastPlane p, float x, float y, float z, float ex, float ey, float ez)
@@ -1387,9 +1696,9 @@ public static class FastCuller
     /// True when the box is *entirely* on the inside of every plane, so no part inside it can
     /// possibly fail the frustum test.
     ///
-    /// Outside() checks the corner furthest along the normal - if even that is behind the
-    /// plane, nothing is in front of it. Flipping the sign of the extents checks the opposite
-    /// corner instead: if the *nearest* corner is still in front of every plane, the whole box
+    /// The frustum test checks the corner furthest along the normal - if even that is behind
+    /// the plane, nothing is in front of it. Flipping the sign of the extents checks the
+    /// opposite corner: if the *nearest* corner is still in front of every plane, the whole box
     /// is, and so is everything it contains. That turns the per-part frustum test into dead
     /// work for every pool and cell sitting well inside the view - which, close to the camera
     /// and in the ortho shadow projections, is most of them.
@@ -1496,15 +1805,19 @@ public static class FastCuller
 
     public static void Cull(MeshDataPool pool, FrustumCulling culler, EnumFrustumCullMode mode)
     {
+        // The pass is known only on the main thread, inside the manager's Render - and a
+        // pool never changes manager, so once seen it is remembered.
+        if (CurrentPass >= 0) Lookup(pool).Pass = CurrentPass;
+
         if (!Parallel)
         {
-            var ts = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var ts = MeasureTime ? Stopwatch.GetTimestamp() : 0;
             Stats seq = default;
             CullCore(pool, Lookup(pool), culler, mode, ref seq);
             Flush(ref seq);
             if (MeasureTime)
             {
-                FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - ts);
+                FrameStats.AddCullTicks(Stopwatch.GetTimestamp() - ts);
                 ReportRebuilds();
             }
             CullVerifier.Maybe(pool, culler, mode);
@@ -1556,7 +1869,7 @@ public static class FastCuller
         // ninety pools in ninety-one unverified.
         if (!fireBatch && !stale) { CullVerifier.Maybe(pool, culler, mode); return; }
 
-        var t0 = MeasureTime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var t0 = MeasureTime ? Stopwatch.GetTimestamp() : 0;
 
         if (fireBatch)
         {
@@ -1575,7 +1888,7 @@ public static class FastCuller
 
         if (MeasureTime)
         {
-            FrameStats.AddCullTicks(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+            FrameStats.AddCullTicks(Stopwatch.GetTimestamp() - t0);
             ReportRebuilds();
         }
 
@@ -1688,6 +2001,7 @@ public static class FastCuller
         var orig = c.Orig;
         var bucketStart = c.BucketStart;
         var cellBox = c.CellBox;
+        var cellMask = c.CellMask;
         var locs = c.Locs;
         var bits = c.VisBits;
         var merge = MergeDrawRanges;
@@ -1716,17 +2030,55 @@ public static class FastCuller
         double px = ppos.X, pz = ppos.Z;
         var loBound = tlsLo ??= NewLodTable(0.0);
         var hiBound = tlsHi ??= NewLodTable(double.NegativeInfinity);
+        var farOn = FarMesh.Active;
+        var farSqKey = FarMesh.EffectiveDistanceSq(culler);
+        var tier2 = FarMesh.Tier2;
         if (normalMode && !(ReferenceEquals(tlsLodCuller, culler)
                             && tlsLod0Bias.Equals(culler.lod0BiasSq)
                             && tlsLod2Bias.Equals(culler.lod2BiasSq)
-                            && tlsLodViewDistSq == culler.ViewDistanceSq))
+                            && tlsLodViewDistSq == culler.ViewDistanceSq
+                            && tlsLodFarOn == farOn && tlsLodFarSq.Equals(farSqKey) && tlsLodTier2 == tier2))
         {
             BuildLodBounds(culler, loBound, hiBound);
             tlsLodCuller = culler;
             tlsLod0Bias = culler.lod0BiasSq;
             tlsLod2Bias = culler.lod2BiasSq;
             tlsLodViewDistSq = culler.ViewDistanceSq;
+            tlsLodFarOn = farOn;
+            tlsLodFarSq = farSqKey;
+            tlsLodTier2 = tier2;
         }
+
+        // The foliage range: a foliage pool in the camera pass sweeps against a LOD table
+        // whose upper bounds are capped at the range. The table is built once per thread and
+        // reused while nothing that feeds it has changed, like the ordinary one above.
+        if (normalMode && FoliageRangeSq > 0 && IsFoliagePass(c.Pass))
+        {
+            var loF = tlsLoF ??= NewLodTable(0.0);
+            var hiF = tlsHiF ??= NewLodTable(double.NegativeInfinity);
+            if (!(ReferenceEquals(tlsLodCullerF, culler)
+                  && tlsFoliageCapSq.Equals(FoliageRangeSq)
+                  && tlsLod0BiasF.Equals(culler.lod0BiasSq)
+                  && tlsLod2BiasF.Equals(culler.lod2BiasSq)
+                  && tlsLodViewDistSqF == culler.ViewDistanceSq
+                  && tlsLodFarOnF == farOn && tlsLodFarSqF.Equals(farSqKey) && tlsLodTier2F == tier2))
+            {
+                BuildLodBounds(culler, loF, hiF);
+                CapLodBounds(hiF, FoliageRangeSq);
+                tlsLodCullerF = culler;
+                tlsFoliageCapSq = FoliageRangeSq;
+                tlsLod0BiasF = culler.lod0BiasSq;
+                tlsLod2BiasF = culler.lod2BiasSq;
+                tlsLodViewDistSqF = culler.ViewDistanceSq;
+                tlsLodFarOnF = farOn;
+                tlsLodFarSqF = farSqKey;
+                tlsLodTier2F = tier2;
+            }
+            loBound = loF;
+            hiBound = hiF;
+        }
+        var histogram = normalMode;
+        var histPass = c.Pass;
 
         var farPass = mode == EnumFrustumCullMode.CullInstantShadowPassFar;
         var shadowMode = farPass || mode == EnumFrustumCullMode.CullInstantShadowPassNear;
@@ -1746,8 +2098,11 @@ public static class FastCuller
             skipLod3Pool = fx * fx + fz * fz <= culler.lod2BiasSq;
         }
         float ppx = ppos.X, ppz = ppos.Z;
-        var rangeX = culler.shadowRangeX;
-        var rangeZ = culler.shadowRangeZ;
+        // Leaves and plants may be given a shorter reach than the cascade's own: the band is
+        // the engine's test, narrowed. Everything downstream - the per-cell rejection, the
+        // vector kernel's broadcast copies, the scalar path - reads these two locals.
+        ShadowBandFor(c.Pass, culler.shadowRangeX, culler.shadowRangeZ, ShadowFoliageRangeSq,
+                      out var rangeX, out var rangeZ);
 
         // ---- vector setup, also hoisted out of the cell loop ----
         // LoadPlanes filled the broadcast copies alongside the scalar ones under the same
@@ -1776,8 +2131,8 @@ public static class FastCuller
         // parts with it. This is what stops the sweep from touching every mesh part in memory.
         for (int cell = 0, cellCount = c.CellCount; cell < cellCount; cell++)
         {
-            var cellFrom = bucketStart[cell << 2];
-            var cellTo = bucketStart[(cell << 2) + 4];
+            var cellFrom = bucketStart[CellBase(cell)];
+            var cellTo = bucketStart[CellBase(cell) + LodLevels];
             if (cellFrom == cellTo) continue;
 
             var cb = cell * 6;
@@ -1833,15 +2188,21 @@ public static class FastCuller
                 cellMaxSq = fdx * fdx + fdz * fdz;
             }
 
-            for (var l = 0; l < 4; l++)
+            for (var mask = (uint)cellMask[cell]; mask != 0; mask &= mask - 1)
             {
-                var bs = bucketStart[(cell << 2) + l];
-                var be = bucketStart[(cell << 2) + l + 1];
-                if (bs == be) continue;
+                var l = System.Numerics.BitOperations.TrailingZeroCount(mask);
+                var bs = bucketStart[CellBase(cell) + l];
+                var be = bucketStart[CellBase(cell) + l + 1];
+                if (bs == be) continue;   // a bucket an incremental removal emptied
 
                 // vanilla checks LodLevel >= 1 last in the far shadow pass; a pure AND, so
                 // rejecting the whole bucket up front is free
                 if (farPass && l < 1) continue;
+                // The far pictures are camera-pass geometry: up to a unit fatter than the
+                // world, which a shadow at the player's feet would show. The shadow passes
+                // take the engine's own meshes (level 5 casts like level 1) and skip the
+                // pictures. Not drawn, the pictures are hidden and the engine's answer stands.
+                if (shadowMode && farOn && FarMesh.IsPicture(l)) { bucketsSkipped++; continue; }
                 if (skipLod3 && l == 3) { bucketsSkipped++; continue; }
 
                 if (normalMode)
@@ -2007,7 +2368,8 @@ public static class FastCuller
             var i = c.OverOrig[k];
             var loc = locs[i];
             var lodLevel = loc.LodLevel;
-            var lv = (byte)((uint)lodLevel < 4u ? lodLevel : 255);
+            var lv = (byte)((uint)lodLevel < (uint)LodLevels ? lodLevel : 255);
+            if (shadowMode && farOn && FarMesh.IsPicture(lodLevel)) continue;
             bool visible;
 
             if (normalMode)
@@ -2062,8 +2424,45 @@ public static class FastCuller
         //
         // A pool fully inside the frustum cannot contain a frustum-rejected part, so there is
         // nothing a bridge could legally cross - the flag saves the walk, not correctness.
-        var bridging = merge && GapMergeDrawRanges && !poolFullyInside;
+        var sorted = normalMode && FrontToBack && c.CellCount > 0;
+        var bridging = merge && GapMergeDrawRanges && !poolFullyInside && !sorted;
         var prevI = -1;
+        if (sorted)
+        {
+            // Cells nearest first, each cell's parts in bucket order (ascending index inside
+            // a bucket, so back-to-back merges inside a cell survive), then the parts appended
+            // since the last rebuild, which have no cell yet.
+            var cellCount = c.CellCount;
+            var order = tlsCellOrder;
+            var keys = tlsCellKey;
+            if (order == null || order.Length < cellCount) { tlsCellOrder = order = new int[cellCount + 16]; tlsCellKey = keys = new float[cellCount + 16]; }
+            var origIdx = c.Orig;
+            var sortedCells = SortCells(cellBox, cellCount, bucketStart, px, ppos.Y, pz, order, keys);
+            for (var sIdx = 0; sIdx < sortedCells; sIdx++)
+            {
+                var cell = order[sIdx];
+                var from = bucketStart[CellBase(cell)];
+                var to = bucketStart[CellBase(cell) + LodLevels];
+                for (var k = from; k < to; k++)
+                {
+                    var i = origIdx[k];
+                    if ((bits[i >> 6] & (1UL << (i & 63))) == 0) continue;
+                    rawRanges++;
+                    Emit(starts, sizes, meta, i, ref group, ref rendered, ref prevEndByte, merge);
+                    if (histogram) Book(histPass, locs[i], meta[i * 3 + 2], px, pz);
+                }
+            }
+            for (var k = 0; k < c.OverCount; k++)
+            {
+                var i = c.OverOrig[k];
+                if ((bits[i >> 6] & (1UL << (i & 63))) == 0) continue;
+                rawRanges++;
+                Emit(starts, sizes, meta, i, ref group, ref rendered, ref prevEndByte, merge);
+                if (histogram) Book(histPass, locs[i], meta[i * 3 + 2], px, pz);
+            }
+            st.SortedSweeps++;
+        }
+        else
         for (var w = 0; w < words; w++)
         {
             var v = bits[w];
@@ -2075,15 +2474,28 @@ public static class FastCuller
                 if (bridging && group > 0)
                     TryBridge(meta, locs, planes, normalMode, prevI, i, ref prevEndByte, sizes, group, ref st);
                 Emit(starts, sizes, meta, i, ref group, ref rendered, ref prevEndByte, merge);
+                if (histogram) Book(histPass, locs[i], meta[i * 3 + 2], px, pz);
                 prevI = i;
             }
         }
 
         st.RangesRaw += rawRanges;
         st.RangesEmitted += group;
+        BookByMode(ref st, mode, rendered, group);
 
         pool.indicesGroupsCount = group;
         pool.RenderedTriangles = rendered;
         pool.AllocatedTris = c.AllocatedTris;
+    }
+
+    /// <summary>One add per pool per sweep, in the thread-local block - no atomics.</summary>
+    private static void BookByMode(ref Stats st, EnumFrustumCullMode mode, int triangles, int ranges)
+    {
+        switch (mode)
+        {
+            case EnumFrustumCullMode.CullInstantShadowPassNear: st.TrisNear += triangles; st.RangesNear += ranges; break;
+            case EnumFrustumCullMode.CullInstantShadowPassFar: st.TrisFar += triangles; break;
+            case EnumFrustumCullMode.CullNormal: st.TrisCamera += triangles; break;
+        }
     }
 }

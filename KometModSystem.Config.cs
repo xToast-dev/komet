@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Text;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 
@@ -25,7 +27,7 @@ public partial class KometModSystem
     internal static string BackupTag(string stored)
     {
         if (string.IsNullOrEmpty(stored)) return "alt";
-        var sb = new System.Text.StringBuilder(16);
+        var sb = new StringBuilder(16);
         foreach (var c in stored)
         {
             if (sb.Length == 16) break;
@@ -79,9 +81,9 @@ public partial class KometModSystem
     {
         try
         {
-            var path = System.IO.Path.Combine(GamePaths.ModConfig, ConfigFile);
-            if (System.IO.File.Exists(path))
-                System.IO.File.Copy(path, path + "." + tag + ".bak", overwrite: true);
+            var path = Path.Combine(GamePaths.ModConfig, ConfigFile);
+            if (File.Exists(path))
+                File.Copy(path, path + "." + tag + ".bak", overwrite: true);
         }
         catch (Exception e)
         {

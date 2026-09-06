@@ -71,7 +71,16 @@ public static class TightClonePatches
     public static bool PoolExtras = true;
 
     /// <summary>Upper bound on bytes held across all element types; beyond it returns are dropped.</summary>
-    public static int ExtrasPoolBudgetMb = 64;
+    public static int ExtrasPoolBudgetMb
+    {
+        get => budgetMb;
+        set
+        {
+            budgetMb = value;
+            Bytes.BudgetMb = Shorts.BudgetMb = Ints.BudgetMb = Floats.BudgetMb = value;
+        }
+    }
+    private static int budgetMb = 64;
 
     public static long StatClones;
     public static long StatBytesSaved;

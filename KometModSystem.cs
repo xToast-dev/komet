@@ -1,9 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime;
+using System.Text;
 using HarmonyLib;
 using Komet.Culling;
 using Komet.Guard;
 using Komet.Measure;
+using Komet.Patches;
 using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -33,8 +36,11 @@ public partial class KometModSystem : ModSystem
     private bool gcLatencyChanged;
     private DebugHud hud;
     private ModHud modHud;
+    /// <summary>The '.komet' window, created the first time somebody asks for it.</summary>
+    private Gui.KometDialog window;
     private long modScanListenerId = -1;
     private SmoothedCounter partsPerFrame, rawRangesPerFrame, rangesPerFrame, bridgedPerFrame, sweepsPerFrame, batchesPerFrame, rebuildsPerFrame, cellsSkippedPerFrame, rebuildTicksPerFrame;
+    private SmoothedCounter nearTrisPerFrame, nearRangesPerFrame, cameraTrisPerFrame, farTrisPerFrame;
     private PoolReclaimer.Renderer reclaimer;
     private GpuFrameTimer.BeginRenderer gpuBegin;
     private GpuFrameTimer.EndRenderer gpuEnd;
@@ -48,15 +54,22 @@ public partial class KometModSystem : ModSystem
     private Action foreignFinalize;
     private long foreignCallbackId = -1;
     private ForeignClientDialog foreignDialog;
-    private Action cameraSampler;
-    private Action firepitBoundary;
-    private bool uploadBudgetHooked;
-    private bool entityTessHooked;
-    private bool rendererProfilerHooked;
-    private bool entityLoadHooked;
-    private bool mainTaskHooked;
-    private bool entityAnimHooked;
-    private bool tickProfilerHooked;
+    /// <summary>
+    /// Everything this session subscribed to the frame boundary, so leaving the world can take
+    /// exactly those handlers off again.
+    ///
+    /// A handler left on stacks a second copy on the next join, and the doubling is silent:
+    /// RendererProfiler.EndFrame folds every entry twice per frame (halving every average), the
+    /// stress test sees half-length frames, the upload budget squares its own correction. This
+    /// used to be nine 'bool xHooked' fields, nine subscribe sites and nine matching if-blocks
+    /// in Dispose, where the two halves could name different handlers and nothing would say so.
+    /// Now the subscribe records the delegate it actually added.
+    /// </summary>
+    private readonly List<Action> frameBoundaryHooks = new();
+
+    /// <summary>The per-frame counters this session registered - same bookkeeping, same
+    /// reason: <see cref="FrameStats"/>'s list is static and survives the world.</summary>
+    private readonly List<SmoothedCounter> trackedCounters = new();
     private string fbBlockedBy;
 
     public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Client;
@@ -73,11 +86,9 @@ public partial class KometModSystem : ModSystem
     {
         FastCuller.PoolLevelCulling = config.PoolLevelCulling;
         FastCuller.Parallel = config.ParallelCulling;
-        FastCuller.MaxThreads = config.CullingThreads;
         FastCuller.MergeDrawRanges = config.MergeDrawRanges;
         FastCuller.GapMergeDrawRanges = config.GapMergeDrawRanges;
         FastCuller.ShadowSkipRedundantLod = config.ShadowSkipRedundantLod;
-        FastChunkCuller.MaxThreads = config.OcclusionCullingThreads;
         FastChunkCuller.MinIntervalMs = config.OcclusionMinIntervalMs;
         UploadBudget.TargetMs = config.UploadBudgetTargetMs;
         UploadBudget.Enabled = config.AdaptiveUploadBudget;
@@ -86,14 +97,20 @@ public partial class KometModSystem : ModSystem
         FastCuller.VectorCulling = config.VectorCulling && FastCuller.VectorAvailable;
         FastCuller.Log = msg => Mod.Logger.Notification(msg);
 
-        // Both sweeps get their own threads rather than the shared ThreadPool, which the game
-        // also queues chunk tesselation on. Started here, before the first frame, so no frame
-        // pays for the thread creation.
+        // One pool for every CPU-heavy job this mod owns - the two sweeps, the window prebuild,
+        // the neighbour unpack, the animation prewarm and the HUD raster - rather than a thread
+        // set per workload. Four sets used to size themselves against the core count in
+        // ignorance of each other and put eleven threads on six physical cores; a worker here
+        // takes whichever queued job is worth most, so the sweep on the frame's deadline is
+        // never behind an occlusion walk that happens to hold every thread. Started before the
+        // first frame, so no frame pays for the thread creation.
         FastCuller.PartsPerCellTarget = config.PartsPerCellTarget;
         FastChunkCuller.Niceness = config.OcclusionThreadNiceness;
-        if (config.ParallelCulling) FastCuller.StartWorkers();
-        FastChunkCuller.StartWorkers();
-        Patches.RetessSourcePatches.SampleSources = config.SampleRetessSources;
+        JobScheduler.Start(config.WorkerThreads, config.OcclusionThreadNiceness);
+        // The overlay's cairo raster is background work like any other; the baseline keeps its
+        // own synchronous path, which is why this is injected rather than referenced.
+        DebugHud.RasterDispatch = job => JobScheduler.Submit(JobKind.Hud, long.MinValue, job);
+        RetessSourcePatches.SampleSources = config.SampleRetessSources;
         CullVerifier.SampleEvery = config.VerifyCullSweepEvery;
         // Warning, not Notification: a disagreement here means the screen is wrong, and it has
         // to stand out in a log that scrolls past at a hundred lines a second.
@@ -102,7 +119,7 @@ public partial class KometModSystem : ModSystem
         ApplyGcLatencyMode();
 
         harmony = new Harmony(Mod.Info.ModID);
-        ApplyPatches(api);
+        ApplyPatches();
     }
 
     /// <summary>
@@ -136,20 +153,20 @@ public partial class KometModSystem : ModSystem
 
         // The depth-only shadow program needs the client (shadow MVP matrix, atlas padding)
         // and has to follow every shader reload; both belong to this world.
-        Patches.ShadowCullPatches.Game = api.World as Vintagestory.Client.NoObf.ClientMain;
+        ShadowCullPatches.Game = api.World as Vintagestory.Client.NoObf.ClientMain;
         api.Event.ReloadShader += OnShadersReloaded;
 
         // reading and flipping allowPStorage needs the platform, which only exists client side
-        Patch(() => Patches.PersistentMappingPatch.Probe(Mod.Logger), "persistent mapping probe");
+        Patch(() => PersistentMappingPatch.Probe(Mod.Logger), "persistent mapping probe");
         if (config.ExperimentalPersistentMapping)
-            Patch(() => Patches.PersistentMappingPatch.Enable(Mod.Logger), "experimental persistent mapping");
+            Patch(() => PersistentMappingPatch.Enable(Mod.Logger), "experimental persistent mapping");
 
         if (config.MeasureGpuTime)
             Patch(() =>
             {
                 GpuFrameTimer.Enabled = true;
                 // the far cascade's per-drawn-frame cost needs to know which frames drew it
-                GpuFrameTimer.FarCascadeDrawn = () => Patches.ShadowThrottlePatches.FarDrawnThisFrame;
+                GpuFrameTimer.FarCascadeDrawn = () => ShadowThrottlePatches.FarDrawnThisFrame;
                 gpuBegin = new GpuFrameTimer.BeginRenderer();
                 gpuEnd = new GpuFrameTimer.EndRenderer();
                 api.Event.RegisterRenderer(gpuBegin, EnumRenderStage.Before, "kometgpu0");
@@ -177,7 +194,7 @@ public partial class KometModSystem : ModSystem
                 InflowBrake.Capture(Vintagestory.Server.MagicNum.ChunksColumnsToRequestPerTick,
                                     Vintagestory.Server.MagicNum.ChunkRequestTickTime);
                 InflowBrake.Enabled = true;
-                inflowListenerId = api.Event.RegisterGameTickListener(_ => InflowBrake.Update(0.5), 500);
+                inflowListenerId = api.Event.RegisterGameTickListener(InflowBrakeTick, 500);
             }, $"adaptive chunk inflow (full rate below {config.InflowLowWaterChunks} queued, minimum at {config.InflowHighWaterChunks})");
 
         // Always wired, gated at runtime: nothing is wrapped while the profiler is off, and
@@ -189,34 +206,32 @@ public partial class KometModSystem : ModSystem
             // Wrapping substitutes the objects in the dispatch list, so the engine's
             // by-reference UnregisterRenderer must learn to find them - without this,
             // every block entity that unloads leaves a ghost renderer behind.
-            Patches.RendererProfiler.ApplyUnregisterFix(harmony);
+            RendererProfiler.ApplyUnregisterFix(harmony);
 
             // Wrapping needs the event manager, which only exists once the client is up.
             // Renderers register throughout a session, so this is repeated periodically -
             // a renderer registered in the gap simply goes unmeasured until the next pass.
-            MeasurementPatches.FrameBoundary += Patches.RendererProfiler.EndFrame;
-            rendererProfilerHooked = true;
-            rewrapListenerId = api.Event.RegisterGameTickListener(_ => WrapRenderers(), 250);
+            HookFrameBoundary(RendererProfiler.EndFrame);
+            rewrapListenerId = api.Event.RegisterGameTickListener(RewrapRenderersTick, 250);
 
             // The hitch log asks for this at detection time - inside the frame boundary,
             // before EndFrame folds and clears the per-frame ticks - so a hitch frame can
             // name its most expensive renderer, not just its stage.
-            HitchLog.TopRendererProvider = Patches.RendererProfiler.TopOfCurrentFrame;
+            HitchLog.TopRendererProvider = RendererProfiler.TopOfCurrentFrame;
 
-            Patches.RendererProfiler.Enabled = config.ProfileRenderers;
+            RendererProfiler.Enabled = config.ProfileRenderers;
             // The Before stage (a handful of system renderers: entities, chunk uploads,
             // liquid depth, camera ...) stays attributed even with the profiler off - it is
             // where the unnamed world-join bursts live, and naming a hitch must not depend
             // on having armed the profiler before it happened.
-            Patches.RendererProfiler.AttributeBeforeStage = config.AttributeBeforeStage;
+            RendererProfiler.AttributeBeforeStage = config.AttributeBeforeStage;
 
             // The game tick's listeners get the same treatment as the Before stage: always
             // wrapped (a few dozen delegates, two Stopwatch reads each), so a "tick 12,7"
             // hitch names its listener instead of a bucket with a hundred owners.
-            Patches.TickProfiler.Enabled = config.ProfileTickListeners;
-            HitchLog.TopTickListenerProvider = Patches.TickProfiler.TopOfCurrentFrame;
-            MeasurementPatches.FrameBoundary += Patches.TickProfiler.EndFrame;
-            tickProfilerHooked = true;
+            TickProfiler.Enabled = config.ProfileTickListeners;
+            HitchLog.TopTickListenerProvider = TickProfiler.TopOfCurrentFrame;
+            HookFrameBoundary(TickProfiler.EndFrame);
             WrapRenderers();
         }, config.ProfileRenderers
             ? "per renderer profiling"
@@ -231,8 +246,7 @@ public partial class KometModSystem : ModSystem
         HitchLog.Factor = config.HitchFrameFactor;
         HitchLog.Log = msg => Mod.Logger.Notification(msg);
         HitchLog.CommandHint = "'.komet hitch'";
-        cameraSampler = SampleCameraForHitchLog;
-        MeasurementPatches.FrameBoundary += cameraSampler;
+        HookFrameBoundary(SampleCameraForHitchLog);
         // the tesselation rates fold with the GC rates at the frame boundary - not in the
         // HUD, whose visibility must not decide whether a report has numbers in it
         FrameStats.PeriodicSample += TesselationStats.Sample;
@@ -246,15 +260,19 @@ public partial class KometModSystem : ModSystem
             Environment.GetEnvironmentVariable("DOTNET_gcServer") ?? "nichts gesetzt",
             System.Runtime.GCSettings.LatencyMode);
 
-        partsPerFrame = FrameStats.TrackCounter(() => FastCuller.StatPartsTested);
-        cellsSkippedPerFrame = FrameStats.TrackCounter(() => FastCuller.StatCellsSkipped);
-        rebuildTicksPerFrame = FrameStats.TrackCounter(() => FastCuller.StatRebuildTicks);
-        rebuildsPerFrame = FrameStats.TrackCounter(() => FastCuller.StatRebuilds);
-        rawRangesPerFrame = FrameStats.TrackCounter(() => FastCuller.StatRangesRaw);
-        rangesPerFrame = FrameStats.TrackCounter(() => FastCuller.StatRangesEmitted);
-        bridgedPerFrame = FrameStats.TrackCounter(() => FastCuller.StatRangesBridged);
-        sweepsPerFrame = FrameStats.TrackCounter(() => FastCuller.StatSweeps);
-        batchesPerFrame = FrameStats.TrackCounter(() => FastCuller.StatBatches);
+        partsPerFrame = Track(() => FastCuller.StatPartsTested);
+        cellsSkippedPerFrame = Track(() => FastCuller.StatCellsSkipped);
+        rebuildTicksPerFrame = Track(() => FastCuller.StatRebuildTicks);
+        rebuildsPerFrame = Track(() => FastCuller.StatRebuilds);
+        rawRangesPerFrame = Track(() => FastCuller.StatRangesRaw);
+        rangesPerFrame = Track(() => FastCuller.StatRangesEmitted);
+        bridgedPerFrame = Track(() => FastCuller.StatRangesBridged);
+        sweepsPerFrame = Track(() => FastCuller.StatSweeps);
+        batchesPerFrame = Track(() => FastCuller.StatBatches);
+        nearTrisPerFrame = Track(() => FastCuller.StatTrisNear);
+        nearRangesPerFrame = Track(() => FastCuller.StatRangesNear);
+        cameraTrisPerFrame = Track(() => FastCuller.StatTrisCamera);
+        farTrisPerFrame = Track(() => FastCuller.StatTrisFar);
 
         DebugHud.BackgroundRaster = config.HudBackgroundRaster;
         hud = new DebugHud(api, "komet " + KometVersion.Display(Mod.Info.Version))
@@ -281,7 +299,7 @@ public partial class KometModSystem : ModSystem
             Visible = config.ModHudVisible,
             Compact = true,
             // What this HUD can see depends on it, and the reader must not have to remember
-            AllRenderersWrapped = () => Patches.RendererProfiler.Enabled
+            AllRenderersWrapped = () => RendererProfiler.Enabled
         };
         api.Event.RegisterRenderer(modHud, EnumRenderStage.Ortho, "kometmodhud");
         // Shift+F7, not a key of its own: this mod already owns F7, and the free-looking keys
@@ -296,7 +314,22 @@ public partial class KometModSystem : ModSystem
         // Patches and registered classes, rescanned on the patch guard's cadence and for the
         // same reason: mods patch lazily, and an inventory nobody refreshes is a stale one.
         if (config.ProfileMods)
-            modScanListenerId = api.Event.RegisterGameTickListener(_ => ScanMods(), 10000);
+            modScanListenerId = api.Event.RegisterGameTickListener(ScanModsTick, 10000);
+
+        // Ctrl+F7 opens the window, alongside F7 (overlay) and Shift+F7 (mod overlay). A third
+        // variant of a key this mod already owns rather than a fourth key: the engine matches
+        // modifiers exactly and runs that pass before the modifier-ignoring fallback, so the
+        // three cannot trigger each other - and the keys that LOOK free are not (F6 was tried
+        // and is a minimap macro). The dialog itself is created on first use; a player who
+        // never opens it never pays for a cairo surface and a GL texture.
+        api.Input.RegisterHotKey(Gui.KometDialog.HotkeyCode, "komet: Performance-Fenster", GlKeys.F7,
+            HotkeyType.HelpAndOverlays, altPressed: false, ctrlPressed: true, shiftPressed: false);
+        api.Input.SetHotKeyHandler(Gui.KometDialog.HotkeyCode, _ =>
+        {
+            if (window is { } open && open.IsOpened()) open.TryClose();
+            else OpenWindow(Gui.KometView.Overview);
+            return true;
+        });
 
         api.Input.RegisterHotKey("komethud", "komet: Performance-HUD", GlKeys.F7, HotkeyType.HelpAndOverlays);
         api.Input.SetHotKeyHandler("komethud", _ =>
@@ -329,11 +362,11 @@ public partial class KometModSystem : ModSystem
             // queued (LevelFinalize itself included) has to run in its own frame, or a
             // renderer that is already registered draws against state its LevelFinalize
             // has not built yet (see MainThreadTaskPatches.WorldReady).
-            Patches.MainThreadTaskPatches.WorldReady = true;
+            MainThreadTaskPatches.WorldReady = true;
             RunPatchGuard(engineCheck: true);
         };
         api.Event.LevelFinalize += guardFinalize;
-        guardListenerId = api.Event.RegisterGameTickListener(_ => RunPatchGuard(engineCheck: false), 10000);
+        guardListenerId = api.Event.RegisterGameTickListener(PatchGuardTick, 10000);
 
         // Optimum (a forked client) and OptiTime (a mod) replace the same engine code komet
         // does, each unaware of the other. The player hears it at every world join: the log
@@ -372,20 +405,26 @@ public partial class KometModSystem : ModSystem
         // 50 ms cadence: together with the per-tick cap this sets the drain capacity
         // (~5000/s baseline, more in catch-up mode) - it must exceed any realistic inflow.
         // Registered even when the feature is off, so the live toggle has a flusher.
-        edgeFlushListenerId = api.Event.RegisterGameTickListener(_ => Patches.EdgeCoalescePatches.Flush(), 50);
+        edgeFlushListenerId = api.Event.RegisterGameTickListener(EdgeFlushTick, 50);
 
         RegisterCommands(api);
-        MeasurementPatches.FrameBoundary += StressTest.OnFrameBoundary;
+        HookFrameBoundary(StressTest.OnFrameBoundary);
+
+        // The pool's own frame tick: fold its rates, move the active worker count against what
+        // the last frame and the loading front looked like, and run whatever a worker handed
+        // back to the main thread - under a budget, so a burst of handoffs is spread over
+        // frames instead of lengthening one.
+        HookFrameBoundary(WorkerPoolFrame);
+        FrameStats.FrameSummary += WorkerPoolSummary;
 
         if (config.StatsLogIntervalSeconds > 0)
         {
             statsListenerId = api.Event.RegisterGameTickListener(
-                _ => Mod.Logger.Notification(BuildStats().Replace("\n", " | ")),
-                config.StatsLogIntervalSeconds * 1000);
+                StatsLogTick, config.StatsLogIntervalSeconds * 1000);
         }
     }
 
-    private void ApplyPatches(ICoreAPI api)
+    private void ApplyPatches()
     {
         // First of everything, and that is the point: this times the ModSystem phases of every
         // mod, and only the ones that run AFTER this line can be measured. Komet loads at
@@ -393,8 +432,8 @@ public partial class KometModSystem : ModSystem
         if (config.ProfileMods)
             Patch(() =>
             {
-                Patches.ModPhasePatches.Apply(harmony);
-                Patches.ModPhasePatches.Enabled = true;
+                ModPhasePatches.Apply(harmony);
+                ModPhasePatches.Enabled = true;
             }, "mod load time attribution (per mod, per phase)");
 
         // Measurement only: who on the client's worker threads and the thread pool allocates
@@ -402,9 +441,9 @@ public partial class KometModSystem : ModSystem
         // a GC pause). Applied always, gated at runtime, sampled with the other rates.
         Patch(() =>
         {
-            Patches.ClientAllocPatches.Apply(harmony);
-            Patches.ClientAllocPatches.Enabled = config.ClientAllocAttribution;
-            FrameStats.PeriodicSample += Patches.ClientAllocPatches.Sample;
+            ClientAllocPatches.Apply(harmony);
+            ClientAllocPatches.Enabled = config.ClientAllocAttribution;
+            FrameStats.PeriodicSample += ClientAllocPatches.Sample;
         }, "client thread allocation attribution " + (config.ClientAllocAttribution ? "on" : "off")
            + "; '.komet toggle clientalloc' flips it");
 
@@ -424,23 +463,23 @@ public partial class KometModSystem : ModSystem
             Patch(() =>
             {
                 FastCuller.EnsureReady();
-                harmony.CreateClassProcessor(typeof(Patches.MeshDataPoolPatches)).Patch();
+                harmony.CreateClassProcessor(typeof(MeshDataPoolPatches)).Patch();
             }, "fast frustum culling");
 
         if (config.FastOcclusionCulling)
             Patch(() =>
             {
                 FastChunkCuller.EnsureReady();
-                harmony.CreateClassProcessor(typeof(Patches.ChunkCullerPatches)).Patch();
+                harmony.CreateClassProcessor(typeof(ChunkCullerPatches)).Patch();
             }, "parallel occlusion culling");
 
         if (config.BulkMeshUpload || config.ExperimentalPersistentMapping)
-            Patch(() => Patches.MeshUploadPatches.Apply(harmony), "bulk chunk mesh upload");
+            Patch(() => MeshUploadPatches.Apply(harmony), "bulk chunk mesh upload");
 
         // Must run before the framebuffers are built, i.e. before the first frame. Always
         // applied: the near-map size is gated at run time so '.komet shadownear' works in a
         // session that started at 0; the extra step's transpiler goes on only when asked.
-        Patch(() => Patches.ShadowResPatches.Apply(harmony, config.ShadowMapExtraQuality, config.ShadowNearMapSize),
+        Patch(() => ShadowResPatches.Apply(harmony, config.ShadowMapExtraQuality, config.ShadowNearMapSize),
               (config.ShadowMapExtraQuality > 0
                   ? $"shadow map +{config.ShadowMapExtraQuality} quality step(s)"
                   : "shadow map at the engine's size")
@@ -448,7 +487,7 @@ public partial class KometModSystem : ModSystem
 
         // Always applied, gated at runtime ('.komet toggle shadowcull'): culling on the solid
         // passes of the shadow map draws the same depth map with half the solid faces.
-        Patch(() => Patches.ShadowCullPatches.Apply(harmony, config.ShadowCullBackfaces, config.ShadowDepthOnlySolidPasses),
+        Patch(() => ShadowCullPatches.Apply(harmony, config.ShadowCullBackfaces, config.ShadowDepthOnlySolidPasses),
               "shadow pass solid passes: back-face culling " + (config.ShadowCullBackfaces ? "on" : "off")
               + ", depth-only shader " + (config.ShadowDepthOnlySolidPasses ? "on" : "off"));
 
@@ -456,11 +495,11 @@ public partial class KometModSystem : ModSystem
         // on screen ('.komet toggle shadowbox|shadowfade|shadowdist', and safemode).
         Patch(() =>
               {
-                  Patches.ShadowPatches.Apply(harmony, config.FixShadowFadeCutoff, config.ShadowDistanceMultiplier, config.SymmetricShadowBox);
+                  ShadowPatches.Apply(harmony, config.FixShadowFadeCutoff, config.ShadowDistanceMultiplier, config.SymmetricShadowBox, config.ShadowTightCullBox, config.ShadowNearDepthExtend);
                   // The coverage margin and the throttle's movement limit are one decision in
                   // two places: the box is drawn wider exactly so the camera may move that far
                   // before the retained map has to be redrawn.
-                  Patches.ShadowPatches.FarBoxMargin = Math.Max(0.0, config.ShadowFarBoxMargin);
+                  ShadowPatches.FarBoxMargin = Math.Max(0.0, config.ShadowFarBoxMargin);
               },
               $"shadow patches (fade fix {(config.FixShadowFadeCutoff ? "on" : "off")}, "
               + $"distance x{config.ShadowDistanceMultiplier:0.##}, symmetric box {(config.SymmetricShadowBox ? "on" : "off")}"
@@ -475,15 +514,83 @@ public partial class KometModSystem : ModSystem
         Patch(() => MeasurementPatches.Apply(harmony), "frame + render stage measurement");
 
         if (config.SunOcclusionQueryInterval > 1)
-            Patch(() => Patches.SunQueryPatches.Apply(harmony, config.SunOcclusionQueryInterval),
+            Patch(() => SunQueryPatches.Apply(harmony, config.SunOcclusionQueryInterval),
                   $"sun occlusion query every {config.SunOcclusionQueryInterval} frames");
 
         if (config.StabiliseShadowTexels)
-            Patch(() => Patches.ShadowStabilityPatches.Apply(harmony), "shadow texel snapping");
+            Patch(() => ShadowStabilityPatches.Apply(harmony), "shadow texel snapping");
+
+        // Always applied, gated at runtime, because it changes what the near cascade DRAWS and
+        // that is the one thing a user can see going wrong. Same window as the snapping above:
+        // both are postfixes on loadOrthoModeMatrix, one writing x/y, this one z.
+        Patch(() => ShadowDepthPatches.Apply(harmony, config.ShadowNearDepthFit),
+              config.ShadowNearDepthFit
+                  ? "near shadow depth fitted to what can cast (the untranslated ortho spends half the extend down-sun)"
+                  : "near shadow depth as the engine projects it; '.komet toggle shadownearfit' enables the fit live");
+
+        // Always applied, gated at runtime and by the near throttle: the planes are the
+        // engine's own, moved in to what the camera can see.
+        Patch(() => ShadowFootprintPatches.Apply(harmony, config.ShadowNearFootprintCull),
+              config.ShadowNearFootprintCull
+                  ? "near shadow pass culled to casters that can reach a visible receiver"
+                  : "near shadow pass drawn for every direction (vanilla); '.komet toggle shadowfootprint' enables the cull live");
+
+        // The passes measured where the timestamps could not: elapsed-time brackets around
+        // the chunk passes on every third frame. The shadow halves hang on the transpiled
+        // boundary ShadowCullPatches owns; this adds the camera pass.
+        Patch(() =>
+              {
+                  ChunkPassProbePatches.Apply(harmony);
+                  GpuPassProbe.Enabled = config.GpuPassProbe;
+              },
+              config.GpuPassProbe
+                  ? "gpu pass probe (elapsed time + fragments per chunk pass, every 3rd frame)"
+                  : "gpu pass probe off; '.komet toggle passprobe' enables it live");
+
+        // Which pass a pool belongs to, for the sweep's triangle histogram and the foliage
+        // range. Measurement first; the range is off unless komet.json says otherwise.
+        Patch(() =>
+              {
+                  PoolPassPatches.Apply(harmony);
+                  FastCuller.FoliageRangeSq = config.FoliageRange > 0 ? config.FoliageRange * config.FoliageRange : 0;
+                  FastCuller.ShadowFoliageRangeSq = config.ShadowFoliageRange > 0 ? config.ShadowFoliageRange * config.ShadowFoliageRange : 0;
+                  ParticlePatches.ConfiguredOrphan = config.ParticleBufferOrphaning;
+                  ParticlePatches.Orphan = config.ParticleBufferOrphaning;
+                  HookFrameBoundary(FastCuller.HistogramFrame);
+              },
+              config.FoliageRange > 0
+                  ? $"camera pass triangles by pass and distance; foliage passes drawn to {config.FoliageRange:0} blocks"
+                  : "camera pass triangles by pass and distance; foliage passes to the view distance (vanilla)");
+
+        // The far LOD: beyond the far distance a chunk part is drawn as cells of two blocks,
+        // beyond twice that as cells of four. Always patched (the pictures built at
+        // tesselation time need the pool hook whatever the switch says), gated live; off
+        // draws the engine's picture with nothing re-tesselated.
+        Patch(() => FarMeshPatches.Apply(harmony, config.FarMesh, config.FarMeshDistance, config.FarMeshTier2, Mod.Logger),
+              config.FarMesh
+                  ? (config.FarMeshDistance > 0
+                      ? $"far lod beyond {config.FarMeshDistance:0} blocks{(config.FarMeshTier2 ? ", cells of four beyond twice that" : "")}"
+                      : $"far lod beyond max(400, 0.35 x view distance){(config.FarMeshTier2 ? ", cells of four beyond twice that" : "")}")
+                  : "far lod off; '.komet toggle farmesh' enables it live");
+
+        // Pools as places, and the camera pass nearest first. The routing is always patched
+        // and gated live; the order is a flag on the sweep and the manager prefix.
+        Patch(() =>
+              {
+                  SpatialPools.Apply(harmony, config.SpatialPools, config.SpatialPoolRegion);
+                  FastCuller.ConfiguredFrontToBack = config.FrontToBack;
+                  FastCuller.FrontToBack = config.FrontToBack;
+              },
+              (config.SpatialPools
+                  ? $"mesh pools routed by {SpatialPools.ClampRegion(config.SpatialPoolRegion)}-block region"
+                  : "mesh pools first-fit (vanilla); '.komet toggle spatialpools' routes them live")
+              + (config.FrontToBack
+                  ? ", camera pass drawn nearest first"
+                  : ", camera pass in index order (vanilla); '.komet toggle fronttoback' sorts it live"));
 
         // Always applied, gated at runtime by the interval values (1/1 = exactly vanilla), so
         // '.komet toggle shadowthrottle' can bisect a shadow artefact live.
-        Patch(() => Patches.ShadowThrottlePatches.Apply(harmony,
+        Patch(() => ShadowThrottlePatches.Apply(harmony,
                         config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval,
                         config.ShadowFarMaxSkip, config.ShadowFarMoveThreshold),
               config.ShadowFarUpdateInterval > 1 || config.ShadowFarMaxSkip > 1 || config.ShadowNearUpdateInterval > 1
@@ -494,20 +601,19 @@ public partial class KometModSystem : ModSystem
         if (config.AdaptiveUploadBudget)
             Patch(() =>
             {
-                Patches.UploadBudgetPatches.Apply(harmony);
+                UploadBudgetPatches.Apply(harmony);
                 // the frame-pressure input: the finished frame's totals reach the
                 // controller each boundary, so it can see the deferred driver cost the
                 // upload clock is blind to under mesa_glthread
                 FrameStats.FrameSummary += UploadBudget.NotePressure;
-                uploadBudgetHooked = true;
             }, "adaptive chunk upload budget");
 
         // Always applied, gated at runtime: whether a relight storm's uploads may be spread
         // over frames is exactly the kind of question '.komet toggle prioupload' answers live.
         Patch(() =>
         {
-            Patches.PrioUploadPatches.Apply(harmony);
-            Patches.PrioUploadPatches.Enabled = config.BudgetPriorityUploads;
+            PrioUploadPatches.Apply(harmony);
+            PrioUploadPatches.Enabled = config.BudgetPriorityUploads;
         }, config.BudgetPriorityUploads
             ? "priority chunk upload budget (storms spread over frames, player edits unaffected)"
             : "priority chunk uploads unbudgeted (vanilla); '.komet toggle prioupload' enables the budget live");
@@ -519,7 +625,7 @@ public partial class KometModSystem : ModSystem
             // for), and a lower nice value needs privileges the game does not have. Saying
             // "thread priority: True" in a Linux log claimed a lever that does not exist.
             var priority = config.TesselationThreadPriority && !OperatingSystem.IsLinux();
-            Patch(() => Patches.TesselationPatches.Apply(harmony,
+            Patch(() => TesselationPatches.Apply(harmony,
                             config.TesselationNoIdleSleep, priority,
                             config.TesselationNeighbourPrefetch),
                   "faster chunk loading (no idle sleep: " + config.TesselationNoIdleSleep
@@ -531,32 +637,31 @@ public partial class KometModSystem : ModSystem
         if (config.FirepitContentsMaxDistance > 0 || config.FirepitLightCacheMs > 0)
             Patch(() =>
             {
-                Patches.FirepitPatches.Log = msg => Mod.Logger.Warning(msg);
-                Patches.FirepitPatches.Apply(harmony, config.FirepitContentsMaxDistance, config.FirepitLightCacheMs);
+                FirepitPatches.Log = msg => Mod.Logger.Warning(msg);
+                FirepitPatches.Apply(harmony, config.FirepitContentsMaxDistance, config.FirepitLightCacheMs);
                 // held in a field so Dispose can take exactly this handler off the static
                 // event again - an anonymous lambda would be unremovable, and the stale
                 // closure would keep publishing the previous session's camera and API
-                firepitBoundary = () =>
+                HookFrameBoundary(() =>
                 {
-                    Patches.FirepitPatches.CameraPos = capi?.World?.Player?.Entity?.CameraPos;
-                    Patches.FirepitPatches.Api ??= capi;
-                };
-                MeasurementPatches.FrameBoundary += firepitBoundary;
+                    FirepitPatches.CameraPos = capi?.World?.Player?.Entity?.CameraPos;
+                    FirepitPatches.Api ??= capi;
+                });
             }, $"firepit contents gate (beyond {config.FirepitContentsMaxDistance} blocks, "
              + $"light cache {config.FirepitLightCacheMs} ms)");
 
         if (config.MeasureRetessSources)
-            Patch(() => Patches.RetessSourcePatches.Apply(harmony), "dirty-mark source sampling");
+            Patch(() => RetessSourcePatches.Apply(harmony), "dirty-mark source sampling");
 
         // Always applied but runtime-gated: default off since 1.36.0 (stress test measured
         // a small cost, and it was twice prime suspect for border holes on fresh terrain);
         // '.komet toggle edgecoal' switches the held-back marking on live for experiments.
         Patch(() =>
         {
-            Patches.EdgeCoalescePatches.Log = msg => Mod.Logger.Warning(msg);
-            Patches.EdgeCoalescePatches.Apply(harmony,
+            EdgeCoalescePatches.Log = msg => Mod.Logger.Warning(msg);
+            EdgeCoalescePatches.Apply(harmony,
                 config.EdgeRetessCoalesceMs > 0 ? config.EdgeRetessCoalesceMs : 400);
-            Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0;
+            EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0;
         }, config.EdgeRetessCoalesceMs > 0
             ? $"edge retess coalescing ({config.EdgeRetessCoalesceMs:0} ms window)"
             : "edge retess coalescing off (vanilla marking); '.komet toggle edgecoal' enables it live");
@@ -565,9 +670,9 @@ public partial class KometModSystem : ModSystem
         // eye at the load front, so '.komet toggle edgeprio' must be able to A/B it live.
         Patch(() =>
         {
-            Patches.EdgeRetessPriorityPatches.Log = msg => Mod.Logger.Warning(msg);
-            Patches.EdgeRetessPriorityPatches.Apply(harmony);
-            Patches.EdgeRetessPriorityPatches.Enabled = config.EdgeRetessPriority;
+            EdgeRetessPriorityPatches.Log = msg => Mod.Logger.Warning(msg);
+            EdgeRetessPriorityPatches.Apply(harmony);
+            EdgeRetessPriorityPatches.Enabled = config.EdgeRetessPriority;
         }, config.EdgeRetessPriority
             ? "edge retess priority (visible border repairs jump the tesselation queue)"
             : "edge retess priority off (vanilla order); '.komet toggle edgeprio' enables it live");
@@ -578,9 +683,9 @@ public partial class KometModSystem : ModSystem
         // tesselation thread, the only place that may touch them), disabling frees ours.
         Patch(() =>
         {
-            Patches.MeshRecyclerPatches.BudgetMb = config.MeshRecyclerBudgetMb;
-            Patches.MeshRecyclerPatches.Apply(harmony);
-            Patches.MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler);
+            MeshRecyclerPatches.BudgetMb = config.MeshRecyclerBudgetMb;
+            MeshRecyclerPatches.Apply(harmony);
+            MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler);
         }, config.FastMeshRecycler
             ? $"mesh recycler size-class pool ({config.MeshRecyclerBudgetMb} MB budget)"
             : "mesh recycler pool off (vanilla storage); '.komet toggle recycler' enables it live");
@@ -589,9 +694,10 @@ public partial class KometModSystem : ModSystem
         // the GC counters must work live.
         Patch(() =>
         {
-            Patches.TightClonePatches.Apply(harmony);
-            Patches.TightClonePatches.Enabled = config.TightCustomClones;
-            Patches.TightClonePatches.PoolExtras = config.PoolMeshExtras;
+            TightClonePatches.Apply(harmony);
+            TightClonePatches.Enabled = config.TightCustomClones;
+            TightClonePatches.PoolExtras = config.PoolMeshExtras;
+            FarLod.PoolArrays = config.PoolMeshExtras;
         }, config.TightCustomClones
             ? "compact custom-part clones (content-sized, not capacity-sized)"
             : "capacity-sized clones (vanilla); '.komet toggle tightclone' enables the compact ones live");
@@ -600,8 +706,8 @@ public partial class KometModSystem : ModSystem
         // with '.komet toggle animcull' while it is on screen, and safemode switches it off.
         Patch(() =>
         {
-            Patches.AnimatableCullPatches.Apply(harmony);
-            Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
+            AnimatableCullPatches.Apply(harmony);
+            AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
         }, config.CullAnimatableRenderers
             ? "animatable renderer frustum gate (animated block entities outside the stage's frustum are skipped)"
             : "animatable renderer frustum gate off (vanilla); '.komet toggle animcull' enables it live");
@@ -615,9 +721,8 @@ public partial class KometModSystem : ModSystem
         if (config.EntityTesselationBudgetMs > 0 && RequireFrameBoundary("entity tesselation budget"))
             Patch(() =>
             {
-                Patches.EntityTessPatches.Apply(harmony, config.EntityTesselationBudgetMs);
-                MeasurementPatches.FrameBoundary += Patches.EntityTessPatches.OnFrameBoundary;
-                entityTessHooked = true;
+                EntityTessPatches.Apply(harmony, config.EntityTesselationBudgetMs);
+                HookFrameBoundary(EntityTessPatches.OnFrameBoundary);
             }, $"entity tesselation budget ({config.EntityTesselationBudgetMs:0.#} ms/frame)");
 
         // Always applied, gated at runtime: '.komet toggle entload' must be able to A/B the
@@ -625,15 +730,14 @@ public partial class KometModSystem : ModSystem
         // held and hand every packet straight back to vanilla.
         Patch(() =>
         {
-            Patches.EntityLoadPatches.Log = msg => Mod.Logger.Warning(msg);
-            Patches.EntityLoadPatches.Apply(harmony);
-            Patches.EntityLoadPatches.BudgetMs = config.EntityLoadBudgetMs > 0 ? config.EntityLoadBudgetMs : 1.5;
-            Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 && MeasurementPatches.FrameBoundaryLive;
-            MeasurementPatches.FrameBoundary += Patches.EntityLoadPatches.OnFrameBoundary;
-            entityLoadHooked = true;
+            EntityLoadPatches.Log = msg => Mod.Logger.Warning(msg);
+            EntityLoadPatches.Apply(harmony);
+            EntityLoadPatches.BudgetMs = config.EntityLoadBudgetMs > 0 ? config.EntityLoadBudgetMs : 1.5;
+            EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 && MeasurementPatches.FrameBoundaryLive;
+            HookFrameBoundary(EntityLoadPatches.OnFrameBoundary);
             // the warm-up only has a window while entities are held
-            Runtime.AnimationWarmup.Log = msg => Mod.Logger.Warning(msg);
-            Runtime.AnimationWarmup.Enabled = config.EntityAnimationPrewarm && Patches.EntityLoadPatches.Enabled;
+            AnimationWarmup.Log = msg => Mod.Logger.Warning(msg);
+            AnimationWarmup.Enabled = config.EntityAnimationPrewarm && EntityLoadPatches.Enabled;
         }, config.EntityLoadBudgetMs <= 0
             ? "entity load budget off (vanilla: each entity finishes in its packet's task); '.komet toggle entload' enables it live"
             : MeasurementPatches.FrameBoundaryLive
@@ -644,10 +748,10 @@ public partial class KometModSystem : ModSystem
         // returns vanilla's 200 while disabled, so off is exactly vanilla.
         Patch(() =>
         {
-            Patches.MinimapPatches.Apply(harmony);
-            Patches.MinimapPatches.TargetMs = config.MinimapPieceBudgetMs > 0 ? config.MinimapPieceBudgetMs : 1.0;
-            Patches.MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0;
-            Patches.MinimapPatches.DirectUpload = config.MinimapDirectUpload;
+            MinimapPatches.Apply(harmony);
+            MinimapPatches.TargetMs = config.MinimapPieceBudgetMs > 0 ? config.MinimapPieceBudgetMs : 1.0;
+            MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0;
+            MinimapPatches.DirectUpload = config.MinimapDirectUpload;
         }, (config.MinimapPieceBudgetMs > 0
             ? $"minimap piece upload budget ({config.MinimapPieceBudgetMs:0.#} ms/tick, adaptive cap)"
             : "minimap piece upload unbudgeted (vanilla 200/tick); '.komet toggle minimap' enables the budget live")
@@ -657,11 +761,10 @@ public partial class KometModSystem : ModSystem
         // around each task, and '.komet toggle mtt' hands it back to vanilla.
         Patch(() =>
         {
-            Patches.MainThreadTaskPatches.Apply(harmony);
-            Patches.MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks;
-            Patches.MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs);
-            MeasurementPatches.FrameBoundary += Patches.MainThreadTaskPatches.EndFrame;
-            mainTaskHooked = true;
+            MainThreadTaskPatches.Apply(harmony);
+            MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks;
+            MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs);
+            HookFrameBoundary(MainThreadTaskPatches.EndFrame);
         }, (config.AttributeMainThreadTasks
             ? "main-thread task attribution (a 'draussen' hitch names its packet type)"
             : "main-thread task attribution off (vanilla drain); '.komet toggle mtt' enables it live")
@@ -669,18 +772,28 @@ public partial class KometModSystem : ModSystem
                ? $", drain budget {config.MainThreadTaskBudgetMs:0.#} ms/frame (remainder requeued in order)"
                : ", no drain budget (vanilla: everything queued runs in the frame)"));
 
+        // Measurement only, and cheap: two timestamps per particle pool per frame, i.e. eight.
+        // Particles were the last part of the frame this mod could not name a number for.
+        Patch(() =>
+        {
+            ParticlePatches.Apply(harmony);
+            ParticlePatches.Enabled = config.MeasureParticles;
+            HookFrameBoundary(ParticlePatches.EndFrame);
+        }, config.MeasureParticles
+            ? "particle pools measured (physics and upload on the render thread, apart from the off-thread pickup)"
+            : "particle pools unmeasured ('.komet toggle particles')");
+
         // Always applied, gated at runtime: the Before-stage loop is a 1:1 transcription with
         // clocks around its two halves; '.komet toggle entbefore' hands it back to vanilla,
         // '.komet toggle animlod' flips the reduced animation rate for far / shadow-only entities.
         Patch(() =>
         {
-            Patches.EntityAnimPatches.Apply(harmony);
-            Patches.EntityAnimPatches.Enabled = config.AttributeEntityBeforeStage;
-            Patches.EntityAnimPatches.LodEnabled = config.EntityAnimationLod;
-            Patches.EntityAnimPatches.FarBlocks = Math.Max(8, config.EntityAnimationFarBlocks);
-            HitchLog.EntityFrameProvider = Patches.EntityAnimPatches.TopOfCurrentFrame;
-            MeasurementPatches.FrameBoundary += Patches.EntityAnimPatches.EndFrame;
-            entityAnimHooked = true;
+            EntityAnimPatches.Apply(harmony);
+            EntityAnimPatches.Enabled = config.AttributeEntityBeforeStage;
+            EntityAnimPatches.LodEnabled = config.EntityAnimationLod;
+            EntityAnimPatches.FarBlocks = Math.Max(8, config.EntityAnimationFarBlocks);
+            HitchLog.EntityFrameProvider = EntityAnimPatches.TopOfCurrentFrame;
+            HookFrameBoundary(EntityAnimPatches.EndFrame);
         }, config.AttributeEntityBeforeStage
             ? (config.EntityAnimationLod
                 ? $"entity before-stage attribution + animation LOD (shadow-only entities every 3rd frame, rendered beyond {config.EntityAnimationFarBlocks:0} blocks every 2nd)"
@@ -693,7 +806,7 @@ public partial class KometModSystem : ModSystem
         Patch(() =>
         {
             WindowPrebuilder.Log = msg => Mod.Logger.Notification(msg);
-            Patches.WindowPipelinePatches.Apply(harmony, config.TesselationPipelineValidateFirstN);
+            WindowPipelinePatches.Apply(harmony, config.TesselationPipelineValidateFirstN);
             WindowPrebuilder.Enabled = config.TesselationWindowPipelining;
         }, config.TesselationWindowPipelining
             ? $"tesselation window pipelining (validate first {config.TesselationPipelineValidateFirstN})"
@@ -703,10 +816,10 @@ public partial class KometModSystem : ModSystem
         {
             Patch(() =>
             {
-                harmony.CreateClassProcessor(typeof(Patches.AnimatorBaseCtorPatch)).Patch();
+                harmony.CreateClassProcessor(typeof(AnimatorBaseCtorPatch)).Patch();
 
                 var dropLower = new HarmonyMethod(AccessTools.Method(
-                    typeof(Patches.AnimationPatches), nameof(Patches.AnimationPatches.DropToLowerInvariant)));
+                    typeof(AnimationPatches), nameof(AnimationPatches.DropToLowerInvariant)));
 
                 harmony.Patch(AccessTools.Method(typeof(AnimatorBase), nameof(AnimatorBase.OnFrame)),
                     transpiler: dropLower);
@@ -720,7 +833,7 @@ public partial class KometModSystem : ModSystem
             Patch(() =>
             {
                 var replaceAny = new HarmonyMethod(AccessTools.Method(
-                    typeof(Patches.AnimationPatches), nameof(Patches.AnimationPatches.ReplaceAnyWithLoop)));
+                    typeof(AnimationPatches), nameof(AnimationPatches.ReplaceAnyWithLoop)));
 
                 harmony.Patch(AccessTools.Method(typeof(AnimationManager), nameof(AnimationManager.OnClientFrame)),
                     transpiler: replaceAny);
@@ -731,17 +844,43 @@ public partial class KometModSystem : ModSystem
         // unchanged, and '.komet toggle glerror' can A/B the two per-frame driver syncs live.
         Patch(() =>
         {
-            Patches.GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck;
-            Patches.GlErrorPatches.Apply(harmony);
+            GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck;
+            GlErrorPatches.Apply(harmony);
         }, config.SkipPerFrameGlErrorCheck
             ? "skip per frame glGetError"
             : "per frame glGetError kept (vanilla); '.komet toggle glerror' skips it live");
     }
 
-    /// <summary>
-    /// A failed patch must never take the game down with it - the engine's internals can shift
-    /// between point releases. Log it, skip that one optimisation, carry on.
-    /// </summary>
+    /// <summary>Register a per-frame counter and remember it, so <see cref="UntrackCounters"/>
+    /// takes it out again - the counter list is static and outlives the world, so one left
+    /// behind keeps advancing for the rest of the process and every rejoin adds another.</summary>
+    private SmoothedCounter Track(Func<long> read)
+    {
+        var counter = FrameStats.TrackCounter(read);
+        trackedCounters.Add(counter);
+        return counter;
+    }
+
+    private void UntrackCounters()
+    {
+        foreach (var counter in trackedCounters) FrameStats.Untrack(counter);
+        trackedCounters.Clear();
+    }
+
+    /// <summary>Subscribe to the frame boundary and remember the delegate, so
+    /// <see cref="UnhookFrameBoundaries"/> can take that exact handler off at world leave.</summary>
+    private void HookFrameBoundary(Action handler)
+    {
+        MeasurementPatches.FrameBoundary += handler;
+        frameBoundaryHooks.Add(handler);
+    }
+
+    private void UnhookFrameBoundaries()
+    {
+        foreach (var handler in frameBoundaryHooks) MeasurementPatches.FrameBoundary -= handler;
+        frameBoundaryHooks.Clear();
+    }
+
     /// <summary>
     /// Guards a feature that can only be correct while the frame boundary fires. Says so once,
     /// in the same voice as <see cref="Patch"/>, and answers false so the caller stays on
@@ -756,6 +895,10 @@ public partial class KometModSystem : ModSystem
         return false;
     }
 
+    /// <summary>
+    /// A failed patch must never take the game down with it - the engine's internals can shift
+    /// between point releases. Log it, skip that one optimisation, carry on.
+    /// </summary>
     private void Patch(Action apply, string what)
     {
         try
@@ -816,13 +959,13 @@ public partial class KometModSystem : ModSystem
     {
         var open = api?.Gui?.OpenedGuis;
         if (open == null) return null;
-        System.Text.StringBuilder sb = null;
+        StringBuilder sb = null;
         foreach (var g in open)
         {
             var name = g?.GetType().Name;
             // the HUD elements are always "open"; the question is which real dialog was
             if (name == null || name.StartsWith("Hud", StringComparison.Ordinal)) continue;
-            sb ??= new System.Text.StringBuilder();
+            sb ??= new StringBuilder();
             if (sb.Length > 0) sb.Append(',');
             sb.Append(name);
         }
@@ -848,7 +991,7 @@ public partial class KometModSystem : ModSystem
         {
             if (capi?.World is Vintagestory.Client.NoObf.ClientMain game
                 && game.Platform is Vintagestory.Client.NoObf.ClientPlatformWindows platform)
-                done = Patches.ShadowResPatches.TryForceRebuild(platform, msg => Mod.Logger.Notification(msg), out fbBlockedBy);
+                done = ShadowResPatches.TryForceRebuild(platform, msg => Mod.Logger.Notification(msg), out fbBlockedBy);
         }
         catch (Exception e)
         {
@@ -882,14 +1025,14 @@ public partial class KometModSystem : ModSystem
         {
             if (capi?.World is not Vintagestory.Client.NoObf.ClientMain game) return;
             var manager = EventManagerRef(game);
-            if (Patches.TickProfiler.Enabled && !Vintagestory.Client.ScreenManager.FrameProfiler.Enabled)
-                Patches.TickProfiler.Wrap(manager);
+            if (TickProfiler.Enabled && !Vintagestory.Client.ScreenManager.FrameProfiler.Enabled)
+                TickProfiler.Wrap(manager);
             else
-                Patches.TickProfiler.Unwrap(manager);
+                TickProfiler.Unwrap(manager);
         }
         catch (Exception e)
         {
-            Patches.TickProfiler.Enabled = false;
+            TickProfiler.Enabled = false;
             Mod.Logger.Error("tick listener profiling failed, switching it off:\n{0}", e);
         }
     }
@@ -899,6 +1042,96 @@ public partial class KometModSystem : ModSystem
     /// the class registry, so it runs on a slow tick and switches itself off rather than
     /// repeating a failure every ten seconds.
     /// </summary>
+    // ---- the periodic listeners ------------------------------------------------------
+    //
+    // Named methods, not lambdas, and that is not a style choice. The tick profiler and the
+    // hitch log name a listener after the method its delegate belongs to, and a lambda written
+    // inside StartClientSide belongs to StartClientSide - so all six of these landed in ONE
+    // bucket called "KometModSystem.StartClientSide()". A field log then shows that bucket at
+    // 10-16 ms every ten seconds with no way to tell which of the six it was, which is the one
+    // thing this mod's own instrument must not do to itself.
+
+    private void InflowBrakeTick(float dt) => InflowBrake.Update(0.5);
+
+    private void RewrapRenderersTick(float dt) => WrapRenderers();
+
+    /// <summary>
+    /// Budget for continuations a worker handed back to the main thread. Small on purpose:
+    /// nothing in this mod posts heavy work here - a handoff is a texture upload or a state
+    /// flip that needs the GL context or a non-thread-safe engine API - and a queue that grows
+    /// is a queue that gets drained over the next few frames rather than in this one.
+    /// </summary>
+    private const double HandoffBudgetMs = 1.0;
+
+    private void WorkerPoolFrame()
+    {
+        // The monitor turns a job's dedup key back into chunk coordinates, and the multipliers
+        // only exist once a world does.
+        if (JobScheduler.KeyMulX == 0)
+        {
+            var map = capi?.World?.BlockAccessor == null ? null : (capi.World as Vintagestory.Client.NoObf.ClientMain)?.WorldMap;
+            if (map != null) { JobScheduler.KeyMulX = map.index3dMulX; JobScheduler.KeyMulZ = map.index3dMulZ; }
+        }
+
+        JobScheduler.DrainMain(HandoffBudgetMs);
+    }
+
+    /// <summary>
+    /// The finished frame's bill, from the same summary the upload throttle reads. The GC pause
+    /// is subtracted first for the same reason it is there: a pause freezes every thread at
+    /// once, so it is not evidence that the pool is competing with the render thread, and
+    /// shrinking the pool cannot shorten one.
+    /// </summary>
+    private static void WorkerPoolSummary(double frameMs, double avgFrameMs, double gcPauseMs, double uploadMs)
+        => JobScheduler.Sample(Math.Max(0, frameMs - Math.Max(0, gcPauseMs)), avgFrameMs,
+                               Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation);
+
+    private void EdgeFlushTick(float dt) => EdgeCoalescePatches.Flush();
+
+    private void StatsLogTick(float dt)
+        => Mod.Logger.Notification(BuildStats().Replace("\n", " | "));
+
+    /// <summary>Ticks of the mod inventory scan so far - see <see cref="ScanModsTick"/>.</summary>
+    private int modScanTicks;
+
+    /// <summary>
+    /// The mod inventory scan, on a cadence that follows what it is looking for. It walks the
+    /// same Harmony registry the patch guard does, at the same price per method, and what it
+    /// finds only changes when a mod patches or registers something new - which happens at load
+    /// and on first use. Ten seconds for the first three minutes, once a minute after that.
+    /// </summary>
+    private void ScanModsTick(float dt)
+    {
+        modScanTicks++;
+        if (modScanTicks > 18 && modScanTicks % 6 != 0) return;
+        ScanMods();
+    }
+
+    /// <summary>
+    /// The guard's periodic scan, in slices.
+    ///
+    /// The full scan measured 12,6 ms on the render thread - the hitch log named it as soon as
+    /// this listener had a name of its own - and every millisecond of that is Harmony rebuilding
+    /// a patched method's serialised info, once per method. None of it has to happen in one
+    /// frame: the guard exists to notice a lazily applied patch eventually, not within a frame.
+    /// So each tick walks two milliseconds' worth and publishes when it reaches the end, which
+    /// at ~150 patched methods is a completed scan every minute or so.
+    ///
+    /// The world-join scan stays whole (see guardFinalize): there the answer is wanted at once.
+    /// </summary>
+    private void PatchGuardTick(float dt)
+    {
+        try
+        {
+            PatchGuard.ScanSlice(budgetMs: 2.0);
+        }
+        catch (Exception e)
+        {
+            // a guard that reports problems must never become one
+            Mod.Logger.Notification("patch guard could not check ({0}), continuing without it", e.GetType().Name);
+        }
+    }
+
     private void ScanMods()
     {
         if (!ModProfiler.Enabled) return;
@@ -924,11 +1157,11 @@ public partial class KometModSystem : ModSystem
         try
         {
             if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
-                Patches.RendererProfiler.Wrap(EventManagerRef(game));
+                RendererProfiler.Wrap(EventManagerRef(game));
         }
         catch (Exception e)
         {
-            Patches.RendererProfiler.Enabled = false;
+            RendererProfiler.Enabled = false;
             if (rewrapListenerId >= 0)
             {
                 capi?.Event.UnregisterGameTickListener(rewrapListenerId);
@@ -947,8 +1180,8 @@ public partial class KometModSystem : ModSystem
         try
         {
             if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
-                Patches.RendererProfiler.Unwrap(EventManagerRef(game),
-                    keepBeforeAttribution: Patches.RendererProfiler.AttributeBeforeStage);
+                RendererProfiler.Unwrap(EventManagerRef(game),
+                    keepBeforeAttribution: RendererProfiler.AttributeBeforeStage);
         }
         catch (Exception e)
         {
@@ -969,98 +1202,55 @@ public partial class KometModSystem : ModSystem
             capi?.Event.UnregisterGameTickListener(edgeFlushListenerId);
             edgeFlushListenerId = -1;
         }
-        Patches.EdgeCoalescePatches.Reset(); // the world map is going away; pending marks with it
-        Patches.EdgeRetessPriorityPatches.Reset(); // stats and sweep clock; queues die with the world
-        Patches.MeshRecyclerPatches.Clear(); // held buffers must not outlive the world
-        Patches.TightClonePatches.ClearPools(); // same for the pooled extras arrays
-        if (cameraSampler != null)
-        {
-            MeasurementPatches.FrameBoundary -= cameraSampler;
-            cameraSampler = null;
-        }
-
-        // FrameBoundary and the counter list are static and survive the world: everything
-        // this session subscribed has to come off again, or every rejoin stacks another set
-        // of handlers - a doubled RendererProfiler.EndFrame folds each entry twice per frame
-        // (halving every average), a doubled StressTest tick sees half-length frames, and a
-        // doubled upload FrameEnd squares the budget controller's correction.
-        MeasurementPatches.FrameBoundary -= StressTest.OnFrameBoundary;
-        if (rendererProfilerHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.RendererProfiler.EndFrame;
-            rendererProfilerHooked = false;
-        }
-        if (entityTessHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.EntityTessPatches.OnFrameBoundary;
-            entityTessHooked = false;
-        }
-        if (entityLoadHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.EntityLoadPatches.OnFrameBoundary;
-            entityLoadHooked = false;
-        }
-        if (mainTaskHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.MainThreadTaskPatches.EndFrame;
-            mainTaskHooked = false;
-        }
-        if (entityAnimHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.EntityAnimPatches.EndFrame;
-            HitchLog.EntityFrameProvider = null;
-            entityAnimHooked = false;
-        }
-        if (tickProfilerHooked)
-        {
-            MeasurementPatches.FrameBoundary -= Patches.TickProfiler.EndFrame;
-            HitchLog.TopTickListenerProvider = null;
-            tickProfilerHooked = false;
-        }
+        EdgeCoalescePatches.Reset(); // the world map is going away; pending marks with it
+        EdgeRetessPriorityPatches.Reset(); // stats and sweep clock; queues die with the world
+        MeshRecyclerPatches.Clear(); // held buffers must not outlive the world
+        TightClonePatches.ClearPools(); // same for the pooled extras arrays
+        FarLod.ClearPools();            // and the far LOD's output arrays
+        // FrameBoundary and the counter list are static and survive the world, so everything
+        // this session subscribed comes off again here.
+        UnhookFrameBoundaries();
+        ParticlePatches.Reset();
+        HitchLog.EntityFrameProvider = null;
+        HitchLog.TopTickListenerProvider = null;
         // held entities belong to the world that is going away; the cached game instance too
-        Patches.EntityLoadPatches.Reset();
-        Patches.EntityAnimPatches.Reset();
-        Patches.MainThreadTaskPatches.Detach();
-        if (firepitBoundary != null)
-        {
-            MeasurementPatches.FrameBoundary -= firepitBoundary;
-            firepitBoundary = null;
-        }
-        if (uploadBudgetHooked)
-        {
-            Patches.UploadBudgetPatches.Unhook();
-            FrameStats.FrameSummary -= UploadBudget.NotePressure;
-            uploadBudgetHooked = false;
-        }
+        EntityLoadPatches.Reset();
+        EntityAnimPatches.Reset();
+        MainThreadTaskPatches.Detach();
+        UploadBudgetPatches.Unhook();
+        FrameStats.FrameSummary -= UploadBudget.NotePressure;
 
         // published through statics the boundary handler above kept fresh; the next session
         // must not start on a disposed API or a dead world's camera
-        Patches.FirepitPatches.Api = null;
-        Patches.FirepitPatches.CameraPos = null;
+        FirepitPatches.Api = null;
+        FirepitPatches.CameraPos = null;
 
-        FrameStats.Untrack(partsPerFrame);
-        FrameStats.Untrack(cellsSkippedPerFrame);
-        FrameStats.Untrack(rebuildTicksPerFrame);
-        FrameStats.Untrack(rebuildsPerFrame);
-        FrameStats.Untrack(rawRangesPerFrame);
-        FrameStats.Untrack(rangesPerFrame);
-        FrameStats.Untrack(bridgedPerFrame);
-        FrameStats.Untrack(sweepsPerFrame);
-        FrameStats.Untrack(batchesPerFrame);
+        UntrackCounters();
+        ShadowFootprintPatches.Reset();
+        GpuPassProbe.Reset();
+        PoolPassPatches.Reset();
+        FarMeshPatches.Reset();  // nothing tracked, mode unknown
+        SpatialPools.Reset();
+        ChunkShaderSwap.Restore();     // a diagnostic never outlives the world; the context still exists here
+        ShadowCullPatches.SkipFoliage = false; // a diagnostic never survives the world
 
         HitchLog.TopRendererProvider = null;
         HitchLog.Log = null;
         FrameStats.PeriodicSample -= TesselationStats.Sample;
-        FrameStats.PeriodicSample -= Patches.ClientAllocPatches.Sample;
-        Patches.ClientAllocPatches.Clear();
+        FrameStats.PeriodicSample -= ClientAllocPatches.Sample;
+        ClientAllocPatches.Clear();
         FrameStats.PeriodicSample -= AllocSampler.Sample;
         AllocSampler.Stop();
         AllocSampler.Clear();
         if (capi != null) capi.Event.LeaveWorld -= OnLeaveWorldEarly;
         // belt and braces: normally already done by OnLeaveWorldEarly, but Dispose can also
         // come without a DestroyGameSession (mod reload), and both are idempotent
-        Patches.TesselationPatches.Shutdown();
+        TesselationPatches.Shutdown();
         WindowPrebuilder.Shutdown();
+        // FrameSummary is static and survives the world: a rejoin that stacked a second
+        // handler would move the pool's worker count twice per frame. Same rule, same reason
+        // as every other consumer of it.
+        FrameStats.FrameSummary -= WorkerPoolSummary;
         if (gcLatencyChanged)
         {
             try { GCSettings.LatencyMode = previousLatencyMode; } catch { /* nothing to salvage */ }
@@ -1074,8 +1264,8 @@ public partial class KometModSystem : ModSystem
             {
                 if (capi?.World is Vintagestory.Client.NoObf.ClientMain game)
                 {
-                    Patches.RendererProfiler.Unwrap(EventManagerRef(game));
-                    Patches.TickProfiler.Unwrap(EventManagerRef(game));
+                    RendererProfiler.Unwrap(EventManagerRef(game));
+                    TickProfiler.Unwrap(EventManagerRef(game));
                 }
             }
             catch { /* the world is going away anyway */ }
@@ -1147,11 +1337,29 @@ public partial class KometModSystem : ModSystem
             modHud.Dispose();
             modHud = null;
         }
+        // The window owns a cairo surface and a GL texture per panel; closing it first makes
+        // sure they go through the dialog's own teardown rather than being dropped on the
+        // finaliser after the GL context is gone.
+        if (window != null)
+        {
+            window.TryClose();
+            window.Dispose();
+            window = null;
+        }
+        // The toggle table closes over config and over this instance; a rejoin builds a new one.
+        toggles = null;
         // The index holds an entry per mod and a cache of every type ever resolved - none of
         // it survives the session it was built for.
         ModProfiler.Clear();
         harmony?.UnpatchAll(harmony.Id);
         base.Dispose();
+    }
+
+    /// <summary>The engine rebuilt its programs: ours is rebuilt from the new one on the next shadow pass.</summary>
+    private bool OnShadersReloaded()
+    {
+        ShadowCullPatches.OnShadersReloaded();
+        return true;
     }
 
     /// <summary>
@@ -1161,25 +1369,27 @@ public partial class KometModSystem : ModSystem
     /// no-ops within the engine's 200 ms window), the prefetcher and the window prebuilder
     /// stop. From Dispose this was provably too late - the teardown NRE recurred there.
     /// </summary>
-    /// <summary>The engine rebuilt its programs: ours is rebuilt from the new one on the next shadow pass.</summary>
-    private bool OnShadersReloaded()
-    {
-        Patches.ShadowCullPatches.OnShadersReloaded();
-        return true;
-    }
-
     private void OnLeaveWorldEarly()
     {
-        Patches.TesselationPatches.Shutdown();
+        TesselationPatches.Shutdown();
         WindowPrebuilder.Shutdown();
+        // Every queued job that names a chunk belongs to the world being torn down: running it
+        // against the next one would read chunk data that has already been freed, which is the
+        // exact shape of the teardown NRE the per-chunk tesselation guard exists for. The pool
+        // keeps its threads - only the work is dropped - and the key multipliers go with the
+        // map they decode.
+        JobScheduler.CancelKind(JobKind.MeshPrep);
+        JobScheduler.CancelKind(JobKind.ChunkPrep);
+        JobScheduler.KeyMulX = 0;
+        JobScheduler.KeyMulZ = 0;
         // the depth-only shadow program was compiled for this world's context
         try { capi?.Event.ReloadShader -= OnShadersReloaded; } catch (Exception) { /* event api gone */ }
-        Patches.ShadowCullPatches.Game = null;
-        Patches.ShadowCullPatches.OnShadersReloaded();
+        ShadowCullPatches.Game = null;
+        ShadowCullPatches.OnShadersReloaded();
         // entities still held for the load budget were meant for this world; finishing them
         // into a disposing session would register renderers on a dying event manager
-        Patches.EntityLoadPatches.Reset();
-        Patches.EntityAnimPatches.Reset();
+        EntityLoadPatches.Reset();
+        EntityAnimPatches.Reset();
         // the join warning belongs to the world that is ending: a callback still pending
         // must not fire into the teardown, and the dialog was that session's
         if (foreignCallbackId >= 0)

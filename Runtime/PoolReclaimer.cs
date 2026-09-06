@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using HarmonyLib;
 using Komet.Culling;
 using Vintagestory.API.Client;
@@ -60,7 +61,7 @@ public static class PoolReclaimer
         AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.ClientMain, Vintagestory.Client.NoObf.ChunkRenderer>("chunkRenderer");
 
     /// <summary>How long each pool has been empty, keyed weakly so a pool can still be collected.</summary>
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<MeshDataPool, EmptySince> Seen = new();
+    private static readonly ConditionalWeakTable<MeshDataPool, EmptySince> Seen = new();
 
     private sealed class EmptySince { public double At = -1; }
 

@@ -6,6 +6,7 @@ using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
 using Vintagestory.API.Common;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
@@ -53,6 +54,12 @@ public static class WindowPrebuilder
     public static long StatStale;
     /// <summary>Validated hits: window compared element-wise against a vanilla build.</summary>
     public static long StatValidated;
+
+    /// <summary>Queue entries the prediction stepped over because the tesselator will drop
+    /// them without building a window (missing, all air, not yet loaded). Every one of these
+    /// used to be a wasted overlap, so this is the number that says whether the look-ahead is
+    /// earning anything on this machine.</summary>
+    public static long StatPredictSkips;
 
     /// <summary>
     /// While positive, a would-be hit instead lets vanilla build and compares the two windows
@@ -294,16 +301,20 @@ public static class WindowPrebuilder
 
     // ---- worker state --------------------------------------------------------------
 
-    private static Thread worker;
-    private static readonly AutoResetEvent wake = new(false);
-    private static volatile bool stop;
-
     private static ChunkTesselator tess;
     private static ClientMain game;
 
-    private static readonly object reqLock = new();
-    private static long reqKey = long.MinValue;
-    private static int reqGen, doneGen;
+    /// <summary>
+    /// The chunk the tesselation thread expects to mesh next, claimed by whichever pool worker
+    /// picks the job up. Exchange rather than read: two requests in quick succession queue two
+    /// jobs, and the second must find the target already taken instead of rebuilding it.
+    /// </summary>
+    private static long wantedKey = long.MinValue;
+
+    /// <summary>Single-flight gate. The buffers below are one set, so exactly one build may be
+    /// in flight; a job that finds one running returns and lets the next chunk's request
+    /// re-trigger it, which costs a miss rather than a corrupted window.</summary>
+    private static int buildRunning;
 
     // buffers + the snapshot describing what they contain
     private static Block[] blocksExt, fluidsExt;
@@ -354,16 +365,6 @@ public static class WindowPrebuilder
         fluidsExt ??= new Block[WindowCells];
         rgbsExt ??= new int[WindowCells];
 
-        if (worker is not { IsAlive: true })
-        {
-            stop = false;
-            worker = new Thread(WorkerLoop)
-            {
-                Name = "komet-window-prebuild",
-                IsBackground = true
-            };
-            worker.Start();
-        }
         return true;
     }
 
@@ -475,77 +476,132 @@ public static class WindowPrebuilder
         return true;
     }
 
-    /// <summary>Peeks the front of the tesselation queue - the chunk the thread pops next.</summary>
+    /// <summary>
+    /// How far into a queue the prediction looks for a chunk the tesselator will really mesh.
+    ///
+    /// Not just the front entry, because the front entry is regularly one the consumer drops
+    /// without ever building a window: TesselateChunk returns before BuildExtendedChunkData
+    /// for a chunk that is missing, empty (all air - and at a tall view distance most of a
+    /// column above the surface is) or not yet loaded from the server. Predicting one of those
+    /// wastes the whole overlap: the worker builds nothing (BuildWindow bails on an empty
+    /// centre) and the chunk the tesselator does reach pays the full window build. Eight
+    /// entries are enough to step over a run of sky chunks and still cost one dictionary
+    /// lookup each, on the tesselation thread, once per meshed chunk.
+    /// </summary>
+    private const int PredictScan = 8;
+
+    private static readonly long[] scan = new long[PredictScan];
+
+    /// <summary>Peeks the front of the tesselation queues - the chunk the thread meshes next.
+    /// Priority first, exactly as the consumer drains them.</summary>
     private static void RequestNext()
     {
         var g = game;
-        if (g == null) return;
+        var map = g?.WorldMap;
+        if (map == null) return;
 
-        var key = long.MinValue;
-        var prio = ClientQueues.DirtyPrio(g);
-        var prioLock = ClientQueues.DirtyPrioLock(g);
-        if (prio != null && prioLock != null && prio.Count > 0)
-        {
-            lock (prioLock) { foreach (var k in prio) { key = k; break; } }
-        }
+        var key = Predict(map, ClientQueues.DirtyPrio(g), ClientQueues.DirtyPrioLock(g));
         if (key == long.MinValue)
-        {
-            var dirty = ClientQueues.Dirty(g);
-            var dirtyLock = ClientQueues.DirtyLock(g);
-            if (dirty == null || dirtyLock == null || dirty.Count == 0) return;
-            lock (dirtyLock) { foreach (var k in dirty) { key = k; break; } }
-        }
-        if (key == long.MinValue || (key & 0x7FFFFFFFFFFFFFFFL) >= ExtraDimensionsStart) return;
+            key = Predict(map, ClientQueues.Dirty(g), ClientQueues.DirtyLock(g));
+        if (key == long.MinValue) return;
 
-        lock (reqLock)
-        {
-            reqKey = key;
-            reqGen++;
-        }
-        wake.Set();
+        // The key doubles as the scheduler's dedup key, so a chunk already queued for a window
+        // is not queued again; the target is refreshed either way, because the prediction may
+        // have moved on while the old job waited.
+        Volatile.Write(ref wantedKey, key);
+        JobScheduler.Submit(JobKind.MeshPrep, key, BuildJob);
     }
 
-    private static void WorkerLoop()
+    /// <summary>
+    /// The first entry of one queue whose chunk the tesselator will actually build a window
+    /// for, or long.MinValue when there is none within <see cref="PredictScan"/>.
+    ///
+    /// Being wrong is free in both directions: a chunk that stops being empty between here and
+    /// the pop just makes the tesselator build its own window, exactly as it did before there
+    /// was a prediction at all.
+    /// </summary>
+    private static long Predict(ClientWorldMap map, UniqueQueue<long> q, object qLock)
     {
-        var pos = new Vec3i();
-        while (!stop)
+        if (q == null || qLock == null || q.Count == 0) return long.MinValue;
+
+        var n = 0;
+        lock (qLock)
         {
-            try
+            foreach (var k in q)
             {
-                wake.WaitOne(500);
-                if (stop) return;
-
-                long key;
-                int gen;
-                lock (reqLock)
-                {
-                    if (reqGen == doneGen || reqKey == long.MinValue) continue;
-                    key = reqKey;
-                    gen = reqGen;
-                }
-
-                var g = game;
-                var map = g?.WorldMap;
-                if (g == null || g.disposed || map == null) continue;
-
-                var skip = key < 0;
-                MapUtil.PosInt3d(key & 0x7FFFFFFFFFFFFFFFL, map.index3dMulX, map.index3dMulZ, pos);
-
-                lock (BuildLock)
-                {
-                    BuildWindow(map, pos.X, pos.Y, pos.Z, skip);
-                }
-
-                lock (reqLock) { doneGen = gen; }
+                scan[n++] = k;
+                if (n >= PredictScan) break;
             }
-            catch (Exception)
+        }
+
+        var chunks = ClientQueues.MapChunks(map);
+        var chunksLock = ClientQueues.MapChunksLock(map);
+        if (chunks == null || chunksLock == null) return n > 0 ? Buildable(scan[0]) : long.MinValue;
+
+        // One acquisition for the whole scan, like the engine's own GetNeighbouringChunks -
+        // this runs on the tesselation thread, and chunksLock is the lock the network thread
+        // inserts arriving chunks under. The queue key IS the chunk key (SetChunkDirty looks
+        // the chunk up with it before enqueueing it), less the edge-only sign bit.
+        lock (chunksLock)
+        {
+            for (var i = 0; i < n; i++)
             {
-                // a chunk vanished mid-build, the world is shutting down, or similar - the
-                // prebuilder is an accelerator, never a dependency
-                ready = false;
-                if (++failures > 50) { Enabled = false; HardDisabled = true; return; }
-                Thread.Sleep(100);
+                var key = Buildable(scan[i]);
+                if (key == long.MinValue) continue;
+                if (chunks.TryGetValue(key & 0x7FFFFFFFFFFFFFFFL, out var c)
+                    && c is { Empty: false, LoadedFromServer: true })
+                    return key;
+                StatPredictSkips++;
             }
+        }
+        return long.MinValue;
+    }
+
+    /// <summary>Keys the prebuilder has no plans for: the extra dimensions, whose windows the
+    /// plans were never built against.</summary>
+    private static long Buildable(long key)
+        => (key & 0x7FFFFFFFFFFFFFFFL) >= ExtraDimensionsStart ? long.MinValue : key;
+
+    /// <summary>Allocated once: a job body that captures nothing, so a request costs a queue
+    /// node and no closure.</summary>
+    private static readonly Action BuildJob = RunBuild;
+
+    private static readonly Vec3i jobPos = new();
+
+    /// <summary>
+    /// One window build, on a pool worker. Reached only through the single-flight gate, so
+    /// <see cref="jobPos"/> and the window buffers have exactly one writer at a time.
+    /// </summary>
+    private static void RunBuild()
+    {
+        if (Interlocked.CompareExchange(ref buildRunning, 1, 0) != 0) return;
+        try
+        {
+            var key = Interlocked.Exchange(ref wantedKey, long.MinValue);
+            if (key == long.MinValue) return;
+
+            var g = game;
+            var map = g?.WorldMap;
+            if (g == null || g.disposed || map == null) return;
+
+            var skip = key < 0;
+            MapUtil.PosInt3d(key & 0x7FFFFFFFFFFFFFFFL, map.index3dMulX, map.index3dMulZ, jobPos);
+
+            lock (BuildLock)
+            {
+                BuildWindow(map, jobPos.X, jobPos.Y, jobPos.Z, skip);
+            }
+        }
+        catch (Exception)
+        {
+            // a chunk vanished mid-build, the world is shutting down, or similar - the
+            // prebuilder is an accelerator, never a dependency
+            ready = false;
+            if (++failures > 50) { Enabled = false; HardDisabled = true; }
+        }
+        finally
+        {
+            Volatile.Write(ref buildRunning, 0);
         }
     }
 
@@ -626,8 +682,10 @@ public static class WindowPrebuilder
 
     public static void Shutdown()
     {
-        stop = true;
-        wake.Set();
+        // Queued builds hold chunk references from the world being torn down; they must not run
+        // against the next one.
+        JobScheduler.CancelKind(JobKind.MeshPrep);
+        Volatile.Write(ref wantedKey, long.MinValue);
         ready = false;
         game = null;
         tess = null;

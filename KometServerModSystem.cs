@@ -1,5 +1,6 @@
 using System;
 using HarmonyLib;
+using Komet.Patches;
 using Komet.Runtime;
 using Vintagestory.API.Common;
 using Vintagestory.Server;
@@ -64,10 +65,10 @@ public class KometServerModSystem : ModSystem
         try
         {
             harmony ??= new Harmony(Mod.Info.ModID + ".server");
-            Patches.EntitySyncPatches.Apply(harmony, api.World as Vintagestory.API.Server.IServerWorldAccessor);
-            Patches.EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
-            Patches.EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning;
-            Patches.EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip;
+            EntitySyncPatches.Apply(harmony, api.World as Vintagestory.API.Server.IServerWorldAccessor);
+            EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
+            EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning;
+            EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip;
             Mod.Logger.Notification("enabled: entity sync tuning {0} (distance send rate, tracking hysteresis, nearest-first cap), attribute no-op skip {1}",
                 config.ServerEntitySyncTuning ? "on" : "off (vanilla)", config.ServerAttributeNoOpSkip ? "on" : "off (vanilla)");
         }
@@ -82,8 +83,8 @@ public class KometServerModSystem : ModSystem
         try
         {
             harmony ??= new Harmony(Mod.Info.ModID + ".server");
-            Patches.ServerAllocPatches.Apply(harmony);
-            Patches.ServerAllocPatches.Enabled = config.ServerAllocAttribution;
+            ServerAllocPatches.Apply(harmony);
+            ServerAllocPatches.Enabled = config.ServerAllocAttribution;
             Mod.Logger.Notification("server allocation attribution {0}", config.ServerAllocAttribution ? "on" : "off");
         }
         catch (Exception e)
@@ -97,8 +98,8 @@ public class KometServerModSystem : ModSystem
         try
         {
             harmony ??= new Harmony(Mod.Info.ModID + ".server");
-            Patches.PacketSourcePatches.Apply(harmony);
-            Patches.PacketSourcePatches.Enabled = config.ServerAllocAttribution;
+            PacketSourcePatches.Apply(harmony);
+            PacketSourcePatches.Enabled = config.ServerAllocAttribution;
         }
         catch (Exception e)
         {
@@ -109,9 +110,9 @@ public class KometServerModSystem : ModSystem
 
     public override void Dispose()
     {
-        Patches.EntitySyncPatches.Clear();
-        Patches.ServerAllocPatches.Clear();
-        Patches.PacketSourcePatches.Clear();
+        EntitySyncPatches.Clear();
+        ServerAllocPatches.Clear();
+        PacketSourcePatches.Clear();
         harmony?.UnpatchAll(harmony.Id);
         harmony = null;
         base.Dispose();

@@ -163,13 +163,15 @@ public sealed class ModHud : DebugHud
             Bar(e.Ms, frameMs).PadRight(11) + source);
     }
 
-    /// <summary>The mod id, cut to the label column. Game content is marked: it is on the list
-    /// because it costs something, not because a player could remove it.</summary>
+    /// <summary>The mod id, cut to the label column - which is the overlay's thirteen cells
+    /// here and the window's wider one there, so the same table does not lose mod ids in a
+    /// panel that had room for them. Game content is marked: it is on the list because it costs
+    /// something, not because a player could remove it.</summary>
     private static string Label(ModProfiler.Entry e)
     {
         var id = e.ModId ?? "?";
-        if (e.GameContent && id.Length <= 11) id = "*" + id;
-        return id.Length > 13 ? id.Substring(0, 13) : id;
+        if (e.GameContent && id.Length < DebugHud.LabelWidth - 1) id = "*" + id;
+        return DebugHud.Label(id);
     }
 
     /// <summary>Wrapped instances, in the value column: "8/2" is eight renderers and two tick

@@ -327,8 +327,6 @@ public static class MeshRecyclerPatches
         return found;
     }
 
-    internal static int ClassSizeOf(int index) => classSizes[index];
-
     private static void EnsureClasses()
     {
         if (classes != null) return;

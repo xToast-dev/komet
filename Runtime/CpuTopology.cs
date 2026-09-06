@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 
 namespace Komet.Runtime;
@@ -69,14 +71,14 @@ public static class CpuTopology
     private static int FromSysfs(int logical)
     {
         const string root = "/sys/devices/system/cpu/";
-        if (!System.IO.Directory.Exists(root)) return 0;
+        if (!Directory.Exists(root)) return 0;
         return CountDistinctCores(logical, i =>
         {
             var dir = root + "cpu" + i + "/topology/";
-            var pkg = System.IO.Path.Combine(dir, "physical_package_id");
-            var core = System.IO.Path.Combine(dir, "core_id");
-            if (!System.IO.File.Exists(pkg) || !System.IO.File.Exists(core)) return null;
-            return (System.IO.File.ReadAllText(pkg), System.IO.File.ReadAllText(core));
+            var pkg = Path.Combine(dir, "physical_package_id");
+            var core = Path.Combine(dir, "core_id");
+            if (!File.Exists(pkg) || !File.Exists(core)) return null;
+            return (File.ReadAllText(pkg), File.ReadAllText(core));
         });
     }
 
@@ -88,7 +90,7 @@ public static class CpuTopology
     /// </summary>
     internal static int CountDistinctCores(int logical, Func<int, (string package, string core)?> read)
     {
-        var seen = new System.Collections.Generic.HashSet<string>();
+        var seen = new HashSet<string>();
         for (var i = 0; i < logical; i++)
         {
             var t = read(i);

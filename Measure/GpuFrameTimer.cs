@@ -352,6 +352,11 @@ public static class GpuFrameTimer
 
             try
             {
+                // The pass probe takes every Nth frame for its own elapsed-time brackets; only
+                // one such query may be active, so the frame's is not issued on those frames.
+                GpuPassProbe.FrameBegin();
+                if (GpuPassProbe.ProbeFrame) return;
+
                 if (queries[0] == 0) GL.GenQueries(QueryRing.Depth, queries);
 
                 var slot = ring.Begin();

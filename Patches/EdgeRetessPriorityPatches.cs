@@ -141,6 +141,43 @@ public static class EdgeRetessPriorityPatches
     private static readonly List<long> taken = new(MaxPromotedPerSweep);
 
     /// <summary>
+    /// UniqueQueue's own two halves. Rotating through its public API costs four hash
+    /// operations per key - Dequeue removes from the set, Enqueue puts it straight back -
+    /// for keys that never leave the queue at all, and the queue this sweep walks holds
+    /// tens of thousands of them during a chunk flood. Rotating the inner Queue instead
+    /// leaves the set alone except for the handful of keys that really do leave.
+    ///
+    /// Measured (./build.sh bench, "edge sweep rotation", four runs): 4,6-5,1x at a short
+    /// queue and 5,8-6,8x at the 45.000 the inflow brake was built for - about 1,1 ms per
+    /// sweep down to 0,18 ms, which is 16-21 ms a second of tesselation-thread time and the
+    /// same reduction in how long dirtyChunksLock is held against the network thread
+    /// inserting arrivals.
+    ///
+    /// Null when the fields are not where they were (a game update): the sweep then takes
+    /// the API path, which is what it always did. <see cref="RotateInner"/> lets verify
+    /// drive both paths through the same assertions.
+    /// </summary>
+    private static readonly AccessTools.FieldRef<UniqueQueue<long>, Queue<long>> InnerQueue =
+        InnerField<Queue<long>>("queue");
+    private static readonly AccessTools.FieldRef<UniqueQueue<long>, HashSet<long>> InnerSet =
+        InnerField<HashSet<long>>("hashSet");
+
+    private static AccessTools.FieldRef<UniqueQueue<long>, TField> InnerField<TField>(string name)
+    {
+        var f = AccessTools.Field(typeof(UniqueQueue<long>), name);
+        return f != null && f.FieldType == typeof(TField)
+            ? AccessTools.FieldRefAccess<UniqueQueue<long>, TField>(f)
+            : null;
+    }
+
+    /// <summary>Take the cheap rotation when it is available. Verify clears it to prove the
+    /// fallback produces the same queues; nothing in the game changes it.</summary>
+    internal static bool RotateInner = true;
+
+    /// <summary>Whether the cheap rotation is available at all on this build of the engine.</summary>
+    internal static bool InnerRotationBound => InnerQueue != null && InnerSet != null;
+
+    /// <summary>
     /// The pure center: moves up to <paramref name="cap"/> edge-only (negative) keys from
     /// <paramref name="dirty"/> into <paramref name="prio"/>, preserving the relative order
     /// of everything - the keepers in dirty and the promoted keys among themselves. One
@@ -154,19 +191,16 @@ public static class EdgeRetessPriorityPatches
         taken.Clear();
         lock (dirtyLock)
         {
-            var n = dirty.Count;
-            if (n == 0) return 0;
+            if (dirty.Count == 0) return 0;
             var any = false;
             foreach (var k in dirty)
                 if (k < 0) { any = true; break; }
             if (!any) return 0;
 
-            for (var i = 0; i < n; i++)
-            {
-                var k = dirty.Dequeue();
-                if (k < 0 && taken.Count < cap) taken.Add(k);
-                else dirty.Enqueue(k);
-            }
+            var inner = RotateInner && InnerRotationBound ? InnerQueue(dirty) : null;
+            var set = inner != null ? InnerSet(dirty) : null;
+            if (set != null) RotateOnInner(inner, set, cap);
+            else RotateOnQueue(dirty, cap);
         }
         if (taken.Count == 0) return 0;
 
@@ -179,6 +213,34 @@ public static class EdgeRetessPriorityPatches
         }
         StatPromoted += taken.Count;
         return taken.Count;
+    }
+
+    /// <summary>The rotation as UniqueQueue itself would do it - the fallback, and what the
+    /// fast path is checked against.</summary>
+    private static void RotateOnQueue(UniqueQueue<long> dirty, int cap)
+    {
+        var n = dirty.Count;
+        for (var i = 0; i < n; i++)
+        {
+            var k = dirty.Dequeue();
+            if (k < 0 && taken.Count < cap) taken.Add(k);
+            else dirty.Enqueue(k);
+        }
+    }
+
+    /// <summary>The same rotation on the inner pair: a key that goes round stays in the set,
+    /// so only the promoted ones are removed from it. The queue is left with exactly the
+    /// keepers, in their original order, and the set with exactly those keys - which is the
+    /// invariant UniqueQueue's own methods maintain.</summary>
+    private static void RotateOnInner(Queue<long> queue, HashSet<long> set, int cap)
+    {
+        var n = queue.Count;
+        for (var i = 0; i < n; i++)
+        {
+            var k = queue.Dequeue();
+            if (k < 0 && taken.Count < cap) { taken.Add(k); set.Remove(k); }
+            else queue.Enqueue(k);
+        }
     }
 
     public static void Reset()

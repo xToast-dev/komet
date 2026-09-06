@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -38,7 +40,7 @@ public static class MeasurementPatches
 
     /// <summary>Optional brackets that did not apply in the last <see cref="Apply"/>, by name.
     /// Empty on a stock engine; the report prints it so a field log says what is missing.</summary>
-    public static readonly System.Collections.Generic.List<string> SkippedBrackets = new();
+    public static readonly List<string> SkippedBrackets = new();
 
     /// <summary>
     /// Applies the frame accounting. The four core brackets (render stages, game tick, chunk
@@ -190,12 +192,6 @@ public static class MeasurementPatches
     }
 
     /// <summary>
-    /// Runs one optional bracket. A failure is logged with the bracket's name and recorded in
-    /// <see cref="SkippedBrackets"/>; the remaining brackets still apply. The throw-away
-    /// exception text is kept short on purpose - the mandatory brackets already proved the
-    /// engine is patchable, so what matters here is WHICH detail is missing.
-    /// </summary>
-    /// <summary>
     /// The brackets sit OUTSIDE every other mod's prefix and postfix on the same method:
     /// prefixes at Priority.First run before the rest, postfixes at Priority.Last run after
     /// them (Harmony orders both kinds by descending priority). What another mod adds inside
@@ -213,6 +209,12 @@ public static class MeasurementPatches
     private static HarmonyMethod OuterPostfix(string name)
         => new(AccessTools.Method(typeof(MeasurementPatches), name)) { priority = OuterPostfixPriority };
 
+    /// <summary>
+    /// Runs one optional bracket. A failure is logged with the bracket's name and recorded in
+    /// <see cref="SkippedBrackets"/>; the remaining brackets still apply. The throw-away
+    /// exception text is kept short on purpose - the mandatory brackets already proved the
+    /// engine is patchable, so what matters here is WHICH detail is missing.
+    /// </summary>
     private static void Optional(string name, Action apply)
     {
         try
@@ -241,9 +243,9 @@ public static class MeasurementPatches
     /// with one extra overload is enough. Enumerating never throws, and a caller that wants
     /// all of them just gets all of them.
     /// </summary>
-    internal static System.Collections.Generic.List<MethodInfo> MethodsNamed(Type type, string name)
+    internal static List<MethodInfo> MethodsNamed(Type type, string name)
     {
-        var found = new System.Collections.Generic.List<MethodInfo>();
+        var found = new List<MethodInfo>();
         foreach (var m in AccessTools.GetDeclaredMethods(type))
             if (m.Name == name) found.Add(m);
         return found;
@@ -283,8 +285,8 @@ public static class MeasurementPatches
     /// call site is untouched. Fails loudly when the call is not found - a measurement that
     /// silently measures nothing is worse than none.
     /// </summary>
-    public static System.Collections.Generic.IEnumerable<CodeInstruction> WrapSwapBuffers(
-        System.Collections.Generic.IEnumerable<CodeInstruction> instructions)
+    public static IEnumerable<CodeInstruction> WrapSwapBuffers(
+        IEnumerable<CodeInstruction> instructions)
     {
         var prefix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPrefix));
         var postfix = AccessTools.Method(typeof(MeasurementPatches), nameof(SwapPostfix));
@@ -298,12 +300,12 @@ public static class MeasurementPatches
                 // the receiver is already on the stack; a static void() call leaves it alone.
                 // Any label pointing at the call moves to the inserted prefix, so a jump to
                 // "swap" cannot bypass the start timestamp.
-                var pre = new CodeInstruction(System.Reflection.Emit.OpCodes.Call, prefix);
+                var pre = new CodeInstruction(OpCodes.Call, prefix);
                 pre.MoveLabelsFrom(ins);
                 pre.MoveBlocksFrom(ins);
                 yield return pre;
                 yield return ins;
-                yield return new CodeInstruction(System.Reflection.Emit.OpCodes.Call, postfix);
+                yield return new CodeInstruction(OpCodes.Call, postfix);
                 wrapped++;
             }
             else

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using HarmonyLib;
 using Komet.Culling;
 using Vintagestory.API.Client;
@@ -27,8 +28,8 @@ public static class MeshDataPoolPatches
         return false; // skip the original
     }
 
-    private static readonly HarmonyLib.AccessTools.FieldRef<MeshDataPool, System.Collections.Generic.List<ModelDataPoolLocation>> LocationsRef =
-        HarmonyLib.AccessTools.FieldRefAccess<MeshDataPool, System.Collections.Generic.List<ModelDataPoolLocation>>("poolLocations");
+    private static readonly HarmonyLib.AccessTools.FieldRef<MeshDataPool, List<ModelDataPoolLocation>> LocationsRef =
+        HarmonyLib.AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations");
 
     [HarmonyPostfix]
     [HarmonyPatch(nameof(MeshDataPool.TryAdd))]

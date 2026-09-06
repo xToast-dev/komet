@@ -16,7 +16,10 @@
 
   <ItemGroup>
     <Compile Include="../Culling/FastCuller.cs" />
-    <Compile Include="../Runtime/WorkerSet.cs" />
+    <Compile Include="../Runtime/FarMesh.cs" />
+    <Compile Include="../Runtime/FarLod.cs" />
+    <Compile Include="../Runtime/ArrayPoolByClass.cs" />
+    <Compile Include="../Runtime/JobScheduler.cs" />
     <Compile Include="../Runtime/CpuTopology.cs" />
     <Compile Include="../Culling/CullVerifier.cs" />
     <Compile Include="../Culling/RayTraversal.cs" />

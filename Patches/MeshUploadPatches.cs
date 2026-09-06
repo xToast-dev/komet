@@ -37,8 +37,7 @@ namespace Komet.Patches;
 /// </summary>
 public static class MeshUploadPatches
 {
-    /// <summary>Bytes moved through the bulk path, and calls that fell through to vanilla.</summary>
-    public static long StatBytesCopied;
+    /// <summary>Calls that took the bulk path, and calls that fell through to vanilla.</summary>
     public static long StatBulkCalls;
     public static long StatFallbackCalls;
 
@@ -107,7 +106,6 @@ public static class MeshUploadPatches
         Unsafe.CopyBlockUnaligned(ref dst, ref src, (uint)bytes);
 
         StatBulkCalls++;
-        StatBytesCopied += bytes;
         return false;
     }
 
@@ -150,7 +148,6 @@ public static class MeshUploadPatches
             ref var from = ref Unsafe.As<int, byte>(ref MemoryMarshal.GetArrayDataReference(Indices));
             Unsafe.CopyBlockUnaligned(ref Unsafe.AsRef<byte>(dst), ref from, (uint)bytes);
             StatBulkCalls++;
-            StatBytesCopied += bytes;
         }
 
         GL.BindBuffer((BufferTarget)GlElementArrayBuffer, 0);

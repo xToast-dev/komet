@@ -262,11 +262,13 @@ public sealed class AllocSampler : EventListener
 
     // ---- naming ---------------------------------------------------------------------------
 
-    /// <summary>"System.Int32[]" -> "Int32[]", "System.Collections.Generic.List`1[...]" -> "List`1[...]".</summary>
+    private static readonly char[] GenericOrArray = ['`', '['];
+
+    /// <summary>"System.Int32[]" -> "Int32[]", "List`1[...]" -> "List`1[...]".</summary>
     internal static string ShortType(string typeName)
     {
         if (string.IsNullOrEmpty(typeName)) return "?";
-        var end = typeName.IndexOfAny(new[] { '`', '[' });
+        var end = typeName.IndexOfAny(GenericOrArray);
         var head = end < 0 ? typeName : typeName.Substring(0, end);
         var dot = head.LastIndexOf('.');
         return dot < 0 ? typeName : typeName.Substring(dot + 1);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using Vintagestory.API.Client;
 
 namespace Komet.Measure;
@@ -103,6 +104,118 @@ public static class FrameStats
     /// </summary>
     public static double LastSwapMs { get; private set; }
     public static double LastShadowMs { get; private set; }
+
+    // ---- the frame time distribution ------------------------------------------------
+    // The averages above hide exactly what a player feels. A smoothed 10 ms frame with one
+    // 40 ms frame per second reads the same as a steady 10,6 ms one, and only the second is
+    // smooth. Two figures tell them apart: the worst 1 % of frames and the worst 0,1 %.
+    // Both need the raw distribution, so every finished frame time goes into a ring - one
+    // float store per frame, and nothing reads it until somebody asks.
+    //
+    // 2048 frames is about 20 s at 100 fps: long enough that the 0,1 % figure averages two
+    // frames rather than reporting a single sample, short enough that walking into a new
+    // scene shows up within a breath. float rather than double, because a frame time has a
+    // handful of significant digits and the sort then moves half the bytes.
+
+    /// <summary>Frames the distribution keeps. Also the graph's source data.</summary>
+    public const int HistoryFrames = 2048;
+
+    private static readonly float[] history = new float[HistoryFrames];
+    private static int historyAt;
+    private static int historyCount;
+
+    /// <summary>Scratch for the percentile sort - one buffer for the process, reused. The
+    /// alternative is 8 KB of garbage every time a window refreshes, in a mod whose own
+    /// report counts allocation rates.</summary>
+    private static readonly float[] sortScratch = new float[HistoryFrames];
+    private static long lowsAtFrame = -1;
+
+    /// <summary>How many frames the distribution currently holds.</summary>
+    public static int HistoryCount => historyCount;
+
+    /// <summary>
+    /// The mean of the worst 1 % of frames in the window, in milliseconds - the "1 % low".
+    /// This is the averaging definition (CapFrameX and most reviewers), not the
+    /// 99th-percentile-sample one: an average over the bucket says how bad the bad frames
+    /// are, where a single percentile sample says only where the bucket begins.
+    /// Call <see cref="UpdateLows"/> before reading.
+    /// </summary>
+    public static double Low1PercentMs { get; private set; }
+
+    /// <summary>The same for the worst 0,1 % - the frames a player calls a stutter.</summary>
+    public static double Low01PercentMs { get; private set; }
+
+    /// <summary>The middle of the distribution. Against <see cref="AvgFrameMs"/> it says
+    /// whether the average is being carried by a tail: a median well below the mean means the
+    /// typical frame is faster than the average admits, and the difference is the spikes.</summary>
+    public static double MedianFrameMs { get; private set; }
+
+    /// <summary>The longest frame in the window. Unlike <see cref="MaxFrameMs"/> this one does
+    /// not decay - it leaves when it falls out of the ring, and not before.</summary>
+    public static double WindowWorstMs { get; private set; }
+
+    /// <summary>
+    /// Recomputes the four figures above, at most once per frame however often it is called -
+    /// the overview and the frametime view of one window refresh both want them, and a sort
+    /// per reader would be an instrument with a per-reader price.
+    /// </summary>
+    public static void UpdateLows()
+    {
+        if (lowsAtFrame == TotalFrames) return;
+        lowsAtFrame = TotalFrames;
+
+        var n = historyCount;
+        if (n == 0)
+        {
+            Low1PercentMs = Low01PercentMs = MedianFrameMs = WindowWorstMs = 0;
+            return;
+        }
+
+        Array.Copy(history, sortScratch, n);
+        Array.Sort(sortScratch, 0, n);   // ascending: the worst frames are the last ones
+
+        MedianFrameMs = sortScratch[n / 2];
+        WindowWorstMs = sortScratch[n - 1];
+        Low1PercentMs = TailMean(sortScratch, n, 100);
+        Low01PercentMs = TailMean(sortScratch, n, 1000);
+    }
+
+    /// <summary>The benchmark's way of paying the sort every time rather than once per frame -
+    /// what it is pricing is the sort, not the cache in front of it.</summary>
+    internal static void ForceLowsForBench()
+    {
+        lowsAtFrame = -1;
+        UpdateLows();
+    }
+
+    /// <summary>
+    /// The mean of the worst 1/<paramref name="oneIn"/> of a sorted-ascending window. Always at
+    /// least one sample, so a short window answers with its worst frame instead of nothing - a
+    /// reader two seconds into a world still gets a number, and the sample count printed next
+    /// to it says how much to trust it. Internal so verify can pin the arithmetic against
+    /// hand-computed windows.
+    /// </summary>
+    internal static double TailMean(float[] sortedAscending, int count, int oneIn)
+    {
+        var take = Math.Max(1, count / oneIn);
+        double sum = 0;
+        for (var i = count - take; i < count; i++) sum += sortedAscending[i];
+        return sum / take;
+    }
+
+    /// <summary>
+    /// The most recent <paramref name="want"/> frame times in chronological order, written into
+    /// the caller's buffer; returns how many were written. No allocation and no sort: this is
+    /// what the live graph draws, once per window refresh.
+    /// </summary>
+    public static int CopyHistory(float[] dest, int want)
+    {
+        var n = Math.Min(Math.Min(want, historyCount), dest.Length);
+        // the ring's newest sample sits just before historyAt
+        var start = ((historyAt - n) % HistoryFrames + HistoryFrames) % HistoryFrames;
+        for (var i = 0; i < n; i++) dest[i] = history[(start + i) % HistoryFrames];
+        return n;
+    }
 
     /// <summary>
     /// Raised once per frame boundary, after the warmup gate, with the finished frame's
@@ -211,10 +324,10 @@ public static class FrameStats
     private static long seenMainAllocB, seenNetAllocB, seenPrefetchAllocB;
 
     public static void AddNetAllocBytes(long bytes)
-    { if (bytes > 0) System.Threading.Interlocked.Add(ref netAllocBytes, bytes); }
+    { if (bytes > 0) Interlocked.Add(ref netAllocBytes, bytes); }
 
     public static void AddPrefetchAllocBytes(long bytes)
-    { if (bytes > 0) System.Threading.Interlocked.Add(ref prefetchAllocBytes, bytes); }
+    { if (bytes > 0) Interlocked.Add(ref prefetchAllocBytes, bytes); }
     private static TimeSpan seenCpuTime;
 
     /// <summary>
@@ -247,19 +360,19 @@ public static class FrameStats
     /// every <see cref="SampleIntervalSeconds"/>; a direct call is harmless (0.2 s guard).</summary>
     public static void SampleGc()
     {
-        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var now = Stopwatch.GetTimestamp();
         int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
         var pauseMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         var alloc = GC.GetTotalAllocatedBytes(precise: false);
         var mainAlloc = GC.GetAllocatedBytesForCurrentThread();
-        var netAlloc = System.Threading.Interlocked.Read(ref netAllocBytes);
-        var prefetchAlloc = System.Threading.Interlocked.Read(ref prefetchAllocBytes);
+        var netAlloc = Interlocked.Read(ref netAllocBytes);
+        var prefetchAlloc = Interlocked.Read(ref prefetchAllocBytes);
 
         var cpuTime = Environment.CpuUsage.TotalTime;
 
         if (gcSeenAt != 0)
         {
-            var dt = (now - gcSeenAt) / (double)System.Diagnostics.Stopwatch.Frequency;
+            var dt = (now - gcSeenAt) / (double)Stopwatch.Frequency;
             if (dt > 0.2)
             {
                 var a = 0.4; // fast enough to catch an underwater excursion while it lasts
@@ -530,6 +643,13 @@ public static class FrameStats
             // 1/64 weight, which moves the threshold by well under a percent.
             if (TotalFrames > WarmupFrames)
             {
+                // The distribution, under the same warmup gate and for the same reason: the
+                // first frames after a join are outliers against an average that does not
+                // exist yet, and they would sit in the 0,1 % bucket for the next 2000 frames.
+                history[historyAt] = (float)frameMs;
+                historyAt = (historyAt + 1) % HistoryFrames;
+                if (historyCount < HistoryFrames) historyCount++;
+
                 double stagedMs = 0;
                 for (var i = 0; i < StageCount; i++) stagedMs += stageTicks[i] * TicksToMs;
                 var tickMs = gameTickTicks * TicksToMs;
@@ -673,6 +793,9 @@ public static class FrameStats
         WorstGameTickMs = WorstUploadMs = WorstGcPauseMs = WorstOutsideMs = WorstSwapMs = 0;
         AvgFrameMs = MaxFrameMs = AvgCullMs = MaxCullMs = AvgUploadMs = MaxUploadMs = GameTickMs = AvgSwapMs = 0;
         LastSwapMs = LastShadowMs = 0;
+        historyAt = historyCount = 0;
+        lowsAtFrame = -1;
+        Low1PercentMs = Low01PercentMs = MedianFrameMs = WindowWorstMs = 0;
         for (var i = 0; i < Counters.Count; i++) Counters[i].Rebase();
     }
 }

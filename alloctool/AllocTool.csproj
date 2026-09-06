@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Turns a .nettrace written by '.komet alloctrace' (or dotnet-trace with the GC keyword
+       at verbose level) into allocation sites: bytes by thread, by type, by the innermost
+       method of the mod or the engine on the stack, and the top stacks per type.
+         dotnet run -c Release - -report <file.nettrace> [-top N]
+         dotnet run -c Release - -selftest      (records this process, checks a known site shows up) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>KometAllocTool</AssemblyName>
+    <RootNamespace>Komet.AllocTool</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.6" />
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.731102" />
+  </ItemGroup>
+</Project>

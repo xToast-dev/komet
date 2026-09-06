@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
-using System.Threading;
 using HarmonyLib;
+using Komet.Measure;
 using Vintagestory.Server;
 
 
@@ -43,41 +43,18 @@ public static class ServerAllocPatches
 {
     public static bool Enabled = true;
 
-    public sealed class Entry
-    {
-        public readonly string Name;
-        /// <summary>A whole thread (disjoint from every other thread-level entry) or a
-        /// suspect inside one.</summary>
-        public readonly bool IsThread;
-        internal long bytes, calls, seenBytes;
-        public double MbPerSecond;
-        public long Bytes => Interlocked.Read(ref bytes);
-        public long Calls => Interlocked.Read(ref calls);
-        internal Entry(string name, bool isThread) { Name = name; IsThread = isThread; }
-    }
-
-    private static readonly List<Entry> All = new(24);
-    private static readonly Dictionary<MethodBase, Entry> ByMethod = new();
-    private static readonly ConcurrentDictionary<string, Entry> ByThread = new();
-    private static Entry helperEntry;
-    private static long lastSampleTs;
-    private const double Alpha = 0.4; // like FrameStats.SampleGc: catches a flood while it lasts
+    private static readonly AllocLedger Ledger = new();
+    private static readonly Dictionary<MethodBase, AllocLedger.Entry> ByMethod = new();
+    private static readonly ConcurrentDictionary<string, AllocLedger.Entry> ByThread = new();
+    private static AllocLedger.Entry helperEntry;
 
     private static readonly AccessTools.FieldRef<ServerThread, string> ThreadNameRef =
         AccessTools.FieldRefAccess<ServerThread, string>("threadName");
 
-    public static IReadOnlyList<Entry> Entries => All;
+    public static IReadOnlyList<AllocLedger.Entry> Entries => Ledger.Entries;
 
     /// <summary>Sum of the thread-level rates: what the client's "rest" can subtract.</summary>
-    public static double ThreadMbPerSecond
-    {
-        get
-        {
-            double sum = 0;
-            foreach (var e in All) if (e.IsThread) sum += e.MbPerSecond;
-            return sum;
-        }
-    }
+    public static double ThreadMbPerSecond => Ledger.Sum(true);
 
     public static void Apply(Harmony harmony)
     {
@@ -89,8 +66,7 @@ public static class ServerAllocPatches
         {
             var m = (args == null ? AccessTools.Method(type, method) : AccessTools.Method(type, method, args))
                     ?? throw new InvalidOperationException($"{type.Name}.{method} not found");
-            var entry = Add(name, isThread);
-            ByMethod[m] = entry;
+            ByMethod[m] = Ledger.Add(name, isThread);
             harmony.Patch(m, prefix: prefix, postfix: postfix);
         }
 
@@ -109,7 +85,7 @@ public static class ServerAllocPatches
             postfix: new HarmonyMethod(self, nameof(ThreadPostfix)));
         var helper = AccessTools.Inner(typeof(PhysicsManager), "PhysicsOffthreadTasks")
                      ?? throw new InvalidOperationException("PhysicsManager.PhysicsOffthreadTasks not found");
-        helperEntry = Add("physik-helper", true);
+        helperEntry = Ledger.Add("physik-helper", true);
         harmony.Patch(AccessTools.Method(helper, "QueueAsyncTask")
                       ?? throw new InvalidOperationException("PhysicsOffthreadTasks.QueueAsyncTask not found"),
             prefix: new HarmonyMethod(self, nameof(HelperPrefix)));
@@ -124,34 +100,28 @@ public static class ServerAllocPatches
         Book(supply, "mainThreadLoadChunkColumn", "chunk-einbau", false);
     }
 
-    private static Entry Add(string name, bool isThread)
-    {
-        var e = new Entry(name, isThread);
-        lock (All) All.Add(e);
-        return e;
-    }
-
     public static void AllocPrefix(out long __state) => __state = Enabled ? GC.GetAllocatedBytesForCurrentThread() : -1;
 
     public static void AllocPostfix(long __state, MethodBase __originalMethod)
     {
         if (__state < 0 || !ByMethod.TryGetValue(__originalMethod, out var entry)) return;
-        Book(entry, GC.GetAllocatedBytesForCurrentThread() - __state);
-        if (entry.Name == "tick") MaybeSample();
+        AllocLedger.Book(entry, GC.GetAllocatedBytesForCurrentThread() - __state);
+        // the server tick is the clock: about once a second the counters become rates
+        if (entry.Name == "tick") Ledger.MaybeSample(1.0);
     }
 
-    public static void ThreadPrefix(ServerThread __instance, out (Entry entry, long bytes) __state)
+    public static void ThreadPrefix(ServerThread __instance, out (AllocLedger.Entry entry, long bytes) __state)
     {
         if (!Enabled) { __state = (null, 0); return; }
         var name = ThreadNameRef(__instance) ?? "?";
-        var entry = ByThread.GetOrAdd(name, static n => Add(ThreadLabel(n), true));
+        var entry = ByThread.GetOrAdd(name, static n => Ledger.Add(ThreadLabel(n), true));
         __state = (entry, GC.GetAllocatedBytesForCurrentThread());
     }
 
-    public static void ThreadPostfix((Entry entry, long bytes) __state)
+    public static void ThreadPostfix((AllocLedger.Entry entry, long bytes) __state)
     {
         if (__state.entry == null) return;
-        Book(__state.entry, GC.GetAllocatedBytesForCurrentThread() - __state.bytes);
+        AllocLedger.Book(__state.entry, GC.GetAllocatedBytesForCurrentThread() - __state.bytes);
     }
 
     /// <summary>The helper runs queued actions on its own thread; the action is wrapped
@@ -164,7 +134,7 @@ public static class ServerAllocPatches
         {
             var b0 = GC.GetAllocatedBytesForCurrentThread();
             inner();
-            Book(helperEntry, GC.GetAllocatedBytesForCurrentThread() - b0);
+            AllocLedger.Book(helperEntry, GC.GetAllocatedBytesForCurrentThread() - b0);
         };
     }
 
@@ -177,82 +147,34 @@ public static class ServerAllocPatches
         _ => threadName.ToLowerInvariant(),
     };
 
-    private static void Book(Entry e, long bytes)
-    {
-        if (bytes > 0) Interlocked.Add(ref e.bytes, bytes);
-        Interlocked.Increment(ref e.calls);
-    }
-
-    /// <summary>Folds the counters into MB/s about once a second (from the server tick).</summary>
-    private static void MaybeSample()
-    {
-        var now = Stopwatch.GetTimestamp();
-        if (lastSampleTs == 0) { lastSampleTs = now; return; }
-        var dt = (now - lastSampleTs) / (double)Stopwatch.Frequency;
-        if (dt < 1.0) return;
-        lastSampleTs = now;
-        Sample(dt);
-    }
-
-    internal static void Sample(double dtSeconds)
-    {
-        lock (All)
-        {
-            foreach (var e in All)
-            {
-                var b = Interlocked.Read(ref e.bytes);
-                var rate = (b - e.seenBytes) / dtSeconds / 1048576.0;
-                e.seenBytes = b;
-                e.MbPerSecond += (rate - e.MbPerSecond) * Alpha;
-            }
-        }
-    }
+    internal static void Sample(double dtSeconds) => Ledger.Sample(dtSeconds);
 
     /// <summary>One report line: threads by rate, then the suspects inside them.</summary>
-    public static void Write(StringBuilder sb, System.Globalization.CultureInfo ci)
+    public static void Write(StringBuilder sb, CultureInfo ci)
     {
-        List<Entry> threads = new(), subs = new();
-        lock (All)
-        {
-            foreach (var e in All)
-                if (e.MbPerSecond >= 0.5) (e.IsThread ? threads : subs).Add(e);
-        }
-        threads.Sort((x, y) => y.MbPerSecond.CompareTo(x.MbPerSecond));
-        subs.Sort((x, y) => y.MbPerSecond.CompareTo(x.MbPerSecond));
+        List<AllocLedger.Entry> threads = new(), subs = new();
+        Ledger.Split(threads, subs);
         sb.Append("  alloc server: ");
         if (threads.Count == 0) sb.Append("unter 0,5 MB/s je thread");
-        for (var i = 0; i < threads.Count; i++)
-        {
-            if (i > 0) sb.Append(", ");
-            sb.AppendFormat(ci, "{0} {1:F0}", threads[i].Name, threads[i].MbPerSecond);
-        }
+        AllocLedger.AppendRates(sb, ci, threads);
         if (threads.Count > 0) sb.Append(" MB/s");
         if (subs.Count > 0)
         {
             sb.Append(" | davon ");
-            for (var i = 0; i < subs.Count; i++)
-            {
-                if (i > 0) sb.Append(", ");
-                sb.AppendFormat(ci, "{0} {1:F0}", subs[i].Name, subs[i].MbPerSecond);
-            }
+            AllocLedger.AppendRates(sb, ci, subs);
         }
         if (!Enabled) sb.Append(" (OFF)");
         sb.Append('\n');
     }
 
-    public static void ResetStats()
-    {
-        lock (All)
-            foreach (var e in All) { Interlocked.Exchange(ref e.bytes, 0); Interlocked.Exchange(ref e.calls, 0); e.seenBytes = 0; }
-    }
+    public static void ResetStats() => Ledger.ResetStats();
 
     /// <summary>Server shutdown: rates go stale, thread entries belong to threads that are gone.</summary>
     public static void Clear()
     {
-        lock (All) All.Clear();
+        Ledger.Clear();
         ByMethod.Clear();
         ByThread.Clear();
         helperEntry = null;
-        lastSampleTs = 0;
     }
 }
