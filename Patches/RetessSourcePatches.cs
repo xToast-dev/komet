@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Threading;
 using HarmonyLib;
+using Komet.Measure;
 
 
 // Harmony binds patch parameters BY NAME (__instance, __result, __state, ___field, and the engine's
@@ -60,8 +62,7 @@ public static class RetessSourcePatches
     /// '.komet retess reset' in the scene it is about.
     /// </summary>
     internal const int MaxCapturesPerSecond = 25;
-    private static long bucketStartTicks;
-    private static int bucketTaken;
+    private static readonly CaptureBudget Budget = new(MaxCapturesPerSecond);
 
     public static long StatMarks, StatEdgeOnly, StatPriority;
     private static long sampled;
@@ -94,11 +95,11 @@ public static class RetessSourcePatches
         // the edge coalescer re-issues held marks through the same funnel; counting those
         // would double-book every coalesced mark and make "nur-rand" incomparable
         if (EdgeCoalescePatches.IsFlushing) return;
-        System.Threading.Interlocked.Increment(ref StatMarks);
-        if (edgeOnly) System.Threading.Interlocked.Increment(ref StatEdgeOnly);
-        if (priority) System.Threading.Interlocked.Increment(ref StatPriority);
+        Interlocked.Increment(ref StatMarks);
+        if (edgeOnly) Interlocked.Increment(ref StatEdgeOnly);
+        if (priority) Interlocked.Increment(ref StatPriority);
 
-        if (System.Threading.Interlocked.Increment(ref sampled) % SampleEveryNth != 0) return;
+        if (Interlocked.Increment(ref sampled) % SampleEveryNth != 0) return;
         if (!SampleSources && !BucketAllows(Stopwatch.GetTimestamp())) return;
 
         // Frames are resolved one at a time and the walk stops at the first that answers the
@@ -131,19 +132,8 @@ public static class RetessSourcePatches
         return type + "." + method;
     }
 
-    /// <summary>
-    /// One capture token, at most <see cref="MaxCapturesPerSecond"/> per rolling second.
-    /// Races on the second boundary cost at worst a few extra captures - the cap is a cost
-    /// ceiling, not a contract. Takes the clock as a parameter so the rule is testable.
-    /// </summary>
-    internal static bool BucketAllows(long nowTicks)
-    {
-        var start = System.Threading.Interlocked.Read(ref bucketStartTicks);
-        if (nowTicks - start >= Stopwatch.Frequency
-            && System.Threading.Interlocked.CompareExchange(ref bucketStartTicks, nowTicks, start) == start)
-            System.Threading.Interlocked.Exchange(ref bucketTaken, 0);
-        return System.Threading.Interlocked.Increment(ref bucketTaken) <= MaxCapturesPerSecond;
-    }
+    /// <summary>At most <see cref="MaxCapturesPerSecond"/> captures per rolling second.</summary>
+    internal static bool BucketAllows(long nowTicks) => Budget.Allows(nowTicks);
 
     /// <summary>The first frame <see cref="Accept"/> takes. Kept for the frame-list tests.</summary>
     internal static string PickSource(IReadOnlyList<(string type, string method)> frames)
@@ -224,8 +214,7 @@ public static class RetessSourcePatches
     {
         StatMarks = StatEdgeOnly = StatPriority = 0;
         sampled = 0;
-        bucketStartTicks = 0;
-        bucketTaken = 0;
+        Budget.Reset();
         Sources.Clear();
         countingSince = Stopwatch.GetTimestamp();
         windowStart = 0;

@@ -6,6 +6,9 @@ namespace Komet;
 /// </summary>
 public class KometConfig
 {
+
+    // ---- the file itself ---------------------------------------------------------------------
+
     /// <summary>
     /// The layout version of this file. Bumped by hand, and only when a change actually
     /// concerns the config: a new setting, a removed one, a changed default. It is deliberately
@@ -19,13 +22,15 @@ public class KometConfig
     /// therefore silently missed every existing install - which is exactly how a shadow fix
     /// stayed half-applied.
     /// </summary>
-    public const string Current = "15";
+    public const string Current = "26";
 
     /// <summary>
     /// The <see cref="Current"/> value this file was written by. Does not match the running
     /// mod's? Then the file is backed up and regenerated from the current defaults.
     /// </summary>
     public string ConfigVersion { get; set; }
+
+    // ---- the visibility sweep ----------------------------------------------------------------
 
     /// <summary>
     /// Replace MeshDataPool.FrustumCull with the struct-of-arrays version. This is the patch
@@ -40,24 +45,6 @@ public class KometConfig
     /// distance 1536. Pools only ever touch their own arrays, so they can be done concurrently.
     /// </summary>
     public bool ParallelCulling { get; set; } = true;
-
-    /// <summary>
-    /// Helper threads for the parallel cull, on top of the render thread. 0 = auto: physical
-    /// cores minus one, capped at 8.
-    ///
-    /// These are dedicated threads, not the shared ThreadPool - the game queues chunk
-    /// tesselation on that pool, and a sweep that has to wait for the pool's thread injection
-    /// heuristic (about one thread per 500 ms) stalls the frame. That was measured: sweeps of
-    /// 26, 30 and 46 ms in frames with no GC pause, against an average well under one.
-    ///
-    /// The count is derived from physical cores rather than hardware threads because the sweep
-    /// is a memory-bound linear scan, where an SMT sibling adds queueing and not throughput -
-    /// and because eleven cull threads on a six core part left nothing for the render thread,
-    /// the tesselator, or the collector. Physical cores are read from the OS (sysfs, Win32,
-    /// sysctl - the report's "kerne:" line names the source); the old "above four hardware
-    /// threads assume SMT" guess took a 2c/4t laptop for four cores.
-    /// </summary>
-    public int CullingThreads { get; set; }
 
     /// <summary>
     /// Test four mesh parts per instruction in the visibility sweep, using 256 bit double lanes
@@ -90,17 +77,48 @@ public class KometConfig
     public int PartsPerCellTarget { get; set; } = 32;
 
     /// <summary>
-    /// Unix nice increment for the occlusion walk's threads, 0 = leave them at normal priority.
+    /// Put each chunk's mesh parts into a pool that belongs to the chunk's region, so a pool is
+    /// a place in the world and can be drawn in distance order. Off is the engine's first-fit.
     ///
-    /// Default off. The idea is sound - the walk holds five threads for 11 ms about five times a
-    /// second while the cull batch needs every core for a fraction of a millisecond on the
-    /// frame's deadline - but the one field measurement with it on had the cull batch waiting
-    /// *longer*, not shorter, and I have no mechanism that explains that. The measurement was
-    /// confounded (heavier scene, a diagnostic running), so this ships as an option rather than
-    /// as a default until a clean A/B says which way it goes. Linux only; Thread.Priority is
-    /// accepted and silently ignored there, so this goes through setpriority.
+    /// The engine's AddModel takes the first pool with room, so every pool holds parts from all
+    /// over the loaded world and every pool's draw covers the whole view - which is why the
+    /// camera pass could never be drawn nearest first: a far part of pool 1 comes before a near
+    /// part of pool 2 whatever the parts inside are sorted by. Routed by region (SpatialPoolRegion
+    /// blocks per side, every height), a pool's cached box is small and sorting the pools by
+    /// distance is a real front-to-back order. Same sizing, same registration, same origin rule
+    /// as the engine's; mini-dimension models stay on the engine's path. Price: a region's pools
+    /// fill less evenly, so there are more of them - the report prints how many and how full.
+    /// Takes effect for every model added from then on; '.komet toggle spatialpools' live.
+    ///
+    /// OFF BY DEFAULT, measured: with 128-block regions a session at view distance 1536 made
+    /// 1.917 pools of 56 parts each (first-fit: 513 of 289), every one allocated at the
+    /// engine's full pool size - four times the video memory, allocation stalls of 0,3 to
+    /// 7,9 seconds while the driver paged, 21 fps. And the reason it was built did not
+    /// happen: shaded fragments stayed at 40 million with the pass drawn nearest first, so
+    /// the depth test does not reject early under the chunk shader (a shader that discards
+    /// writes depth late, and the early test has nothing final to reject against). Kept as
+    /// an experiment with a number on it, not as a default.
     /// </summary>
-    public int OcclusionThreadNiceness { get; set; }
+    public bool SpatialPools { get; set; }
+
+    /// <summary>Region edge for SpatialPools, in blocks; a power of two between 32 and 1024.</summary>
+    public int SpatialPoolRegion { get; set; } = 128;
+
+    /// <summary>
+    /// Draw the camera pass nearest first: pools by distance (needs SpatialPools to mean
+    /// anything), cells inside a pool by distance. The depth test is order-independent in what
+    /// it keeps and not in what it costs - a fragment behind an already written nearer depth is
+    /// rejected before it is shaded, one drawn before its occluder is shaded and overwritten. A
+    /// forest scene shades ten fragments per pixel and keeps one. Off is the index order the
+    /// range-merge rule was built for; sorted emission keeps merges inside a cell and gives up
+    /// gap bridging, so the range count rises a little. '.komet toggle fronttoback' live.
+    ///
+    /// OFF BY DEFAULT, measured: 40 million shaded fragments nearest first against 39 million
+    /// in index order - no early rejection under a discarding shader (see SpatialPools). It
+    /// only costs the gap bridging. Kept for the day the pass has a depth pre-pass in front of
+    /// it; without one, order does not reach the fragment shader.
+    /// </summary>
+    public bool FrontToBack { get; set; }
 
     /// <summary>
     /// Coalesce mesh parts that sit back to back in the index buffer into one draw range, so
@@ -117,19 +135,13 @@ public class KometConfig
     /// </summary>
     public bool GapMergeDrawRanges { get; set; } = true;
 
+    // ---- occlusion culling -------------------------------------------------------------------
+
     /// <summary>
     /// Replace the occlusion culling ray walk with the hoisted, snapshot-based, multi-threaded
     /// one. Same visibility result; it just stops pinning a core at high view distances.
     /// </summary>
     public bool FastOcclusionCulling { get; set; } = true;
-
-    /// <summary>
-    /// Helper threads for the occlusion walk. 0 = auto: physical cores minus two, capped at 8 -
-    /// which is zero helpers on a dual core, where the walk then runs inline on its own thread
-    /// instead of adding a third busy thread to two cores. Its own dedicated set, separate from
-    /// the cull threads, so a walk in flight can never hold up a render stage queued behind it.
-    /// </summary>
-    public int OcclusionCullingThreads { get; set; }
 
     /// <summary>
     /// Minimum milliseconds between two occlusion passes triggered by chunks streaming in.
@@ -141,70 +153,131 @@ public class KometConfig
     public int OcclusionMinIntervalMs { get; set; } = 200;
 
     /// <summary>
-    /// Copy chunk mesh data into persistently mapped GPU buffers in bulk instead of one
-    /// element at a time.
+    /// Threads in Komet's worker pool, 0 = derive from the machine.
     ///
-    /// Off by default: in 1.22.7 ClientPlatformWindows.allowPStorage is never assigned, so
-    /// persistent mapping is dead code and every upload already goes through glBufferSubData.
-    /// Measured on this install: 0 bulk copies against 342 605 fall-throughs. Kept in case a
-    /// later version or another mod turns persistent storage on.
-    /// </summary>
-    public bool BulkMeshUpload { get; set; }
-
-    /// <summary>
-    /// EXPERIMENTAL. Turn on the engine's own persistent-mapping path for chunk VBOs
-    /// (ClientPlatformWindows.allowPStorage, which vanilla never sets). Uploads then write
-    /// straight into mapped GPU memory instead of glBufferSubData into a buffer the GPU may
-    /// still be reading - which is where the upload spikes come from. Implies BulkMeshUpload.
+    /// One pool serves every CPU-heavy job this mod owns: the visibility sweep, the occlusion
+    /// walk, the tesselator's prebuilt window, the neighbour unpack, the animation prewarm and
+    /// the HUD raster. It used to be four independent sets that each sized themselves against
+    /// the core count without knowing about the others - five cull helpers, four occlusion
+    /// helpers and two dedicated threads, eleven in total on a six-core machine, next to the
+    /// render thread, the tesselator and the integrated server's worldgen threads.
     ///
-    /// A path the developers never enable is a path they never tested: if terrain renders
-    /// wrong or the game crashes on world join, set this back to false.
+    /// The default is physical cores minus two: one for the render thread and one for the
+    /// engine's tesselation thread, the two this pool must never take a core from. Hardware
+    /// threads are deliberately not counted - both batch workloads are memory-bound linear
+    /// scans, so a second worker on the same core's SMT sibling adds queueing, not throughput.
+    /// The pool then adapts DOWNWARD from this on its own when the frame is suffering, and
+    /// back up when there is a queue deep enough to justify it; this value is the ceiling.
     /// </summary>
-    public bool ExperimentalPersistentMapping { get; set; }
+    public int WorkerThreads { get; set; }
 
     /// <summary>
-    /// Cap how long the main thread spends uploading chunk meshes per frame. Vanilla's budget
-    /// grows with the square of the view distance and again with the tesselation backlog,
-    /// which is what makes frame times collapse while moving at high view distance.
+    /// Unix nice increment for the occlusion walk's threads, 0 = leave them at normal priority.
+    ///
+    /// Default off. The idea is sound - the walk holds five threads for 11 ms about five times a
+    /// second while the cull batch needs every core for a fraction of a millisecond on the
+    /// frame's deadline - but the one field measurement with it on had the cull batch waiting
+    /// *longer*, not shorter, and I have no mechanism that explains that. The measurement was
+    /// confounded (heavier scene, a diagnostic running), so this ships as an option rather than
+    /// as a default until a clean A/B says which way it goes. Linux only; Thread.Priority is
+    /// accepted and silently ignored there, so this goes through setpriority.
     /// </summary>
-    public bool AdaptiveUploadBudget { get; set; } = true;
+    public int OcclusionThreadNiceness { get; set; }
 
-    /// <summary>Milliseconds per frame the upload throttle aims for.</summary>
-    public double UploadBudgetTargetMs { get; set; } = 6.0;
-
-    /// <summary>
-    /// Let the upload throttle also react to the whole frame running hot (minus its GC
-    /// pause) while uploads are in flight. Under mesa_glthread the upload clock only sees
-    /// command recording - the driver pays the real copy later in opaque/swap, which is
-    /// where a field log's eight-hitch streaming burst lived while the throttle read 100 %.
-    /// '.komet toggle uploaddruck' flips it live.
-    /// </summary>
-    public bool UploadFramePressure { get; set; } = true;
+    // ---- what else is drawn ------------------------------------------------------------------
 
     /// <summary>
-    /// Also budget the PRIORITY chunk upload queue, which vanilla drains completely in a
-    /// single frame with no limit of any kind. Its designed load is a player block edit -
-    /// one or two chunks - but relight storms (time or season changes, light-baking mods)
-    /// and priority re-tesselations all route through the same queue, and the hitch log
-    /// measured 10-27 ms of upload in single frames while one was running. The budget
-    /// uploads at least one chunk per frame and at least a full chunk mesh's worth of
-    /// vertices (so an edit still appears in the frame it was meshed in) and carries the
-    /// rest into the following frames - deferred, never lost. '.komet toggle prioupload'
-    /// flips it live.
+    /// Range in blocks beyond which the foliage passes - OpaqueNoCull (leaves, plants) and
+    /// BlendNoCull - are not drawn in the camera pass. 0 = vanilla: to the view distance.
+    ///
+    /// Leaves have no LOD 2 stand-in (only the aquatic blocks carry doNotRenderAtLod2), so a
+    /// forest is drawn leaf by leaf out to the view distance, and the GPU probe priced the
+    /// camera pass at 5,2 ms for six million triangles - 17 million in a forest report. This
+    /// changes the picture: a tree beyond the range is a trunk. It is a coarse lever, priced
+    /// live by '.komet foliagerange' with the report's triangles-by-pass-and-distance rows
+    /// next to it; the default is vanilla because that is a judgement about a particular world
+    /// and view distance.
     /// </summary>
-    public bool BudgetPriorityUploads { get; set; } = true;
+    public double FoliageRange { get; set; }
 
     /// <summary>
-    /// Look animation codes up case-insensitively instead of allocating a lowercase copy of
-    /// the key on every animated entity, every frame.
+    /// The far LOD: beyond FarMeshDistance a chunk part is drawn as a picture of cells two
+    /// blocks on a side, beyond twice that (FarMeshTier2) as cells of four. At view distance
+    /// 1536 the camera pass drew 16 million triangles, 12,7 million of them beyond 640 blocks
+    /// where a block covers one to three pixels; the chunk vertex shader exports thirteen
+    /// vec4 per vertex and evaluates 3D noise several times, so the GPU front end paid for
+    /// every one of those sub-pixel faces (11,7 ms opaque at 15 million fragments) and the
+    /// frame fell from 189 to 53 fps looking from the ground to the horizon.
+    ///
+    /// The picture is built from what the engine tesselated, on the tesselation thread, with
+    /// no shader change: unit faces mark their block solid and the block in front air, air
+    /// floods through the unknown, a cell is solid if any of its blocks is, and a solid cell
+    /// emits one face per air neighbour that copies a source face's tile, light, flags and
+    /// colour map. Plants, leaves (rotated cubes), stairs and fences keep one representative
+    /// per cell, scaled to fill it. So a tree stays a tree and a house a house, up to a unit
+    /// fatter, never thinner: no gaps between chunks at different tiers. The engine's own
+    /// mesh stops at the distance and stands within it exactly as before; the shadow passes
+    /// keep using the engine's meshes, never the pictures.
+    ///
+    /// Costs: the build on the tesselation thread (the report prices it per chunk) and the
+    /// pictures' vertices in the pools next to the engine's (a quarter to a third). What it
+    /// changes in the frame is only beyond the distance, where a block is a few pixels:
+    /// the step where the picture takes over is up to one block. '.komet farmesh <blocks>'
+    /// moves the distance live, '.komet toggle farmesh' switches the whole thing; off, the
+    /// engine's meshes are drawn at every distance again with nothing re-tesselated.
     /// </summary>
-    public bool AnimationLookupWithoutAlloc { get; set; } = true;
+    public bool FarMesh { get; set; } = true;
 
     /// <summary>
-    /// Replace the LINQ .Any() over the active animation dictionary with a plain loop; the
-    /// LINQ version boxes the dictionary enumerator once per animated entity per frame.
+    /// Distance in blocks beyond which the picture replaces the engine's mesh. 0 = the
+    /// default rule: 0,35 of the view distance, at least 400 blocks (538 at view distance
+    /// 1536, which puts 88 % of the visible area beyond it). A distance at or beyond the
+    /// view distance leaves no band and nothing is built.
     /// </summary>
-    public bool AnimationCollisionBoxWithoutAlloc { get; set; } = true;
+    public double FarMeshDistance { get; set; }
+
+    /// <summary>
+    /// Tier 2: beyond twice FarMeshDistance the picture is cells of four blocks, built from
+    /// tier 1's picture the same way. At view distance 1536 that is everything beyond 1075
+    /// blocks - half the visible area, where a block is a pixel or less. Off, tier 1 carries
+    /// on to the view distance. '.komet toggle farlod2' flips it live.
+    /// </summary>
+    public bool FarMeshTier2 { get; set; } = true;
+
+    /// <summary>
+    /// Skip AnimatableRenderer.OnRenderFrame (animated block entities: windmills, pulverizers,
+    /// bellows, swinging doors, modded machines) when the mesh's bounding sphere lies entirely
+    /// outside the frustum of the stage being rendered - the camera frustum in Opaque/OIT, the
+    /// light box in the two shadow stages. Vanilla runs every active instance in four stages
+    /// with a shader switch, a chunk light lookup, ~15 uniforms, a UBO update and a draw, with
+    /// no distance or visibility test at all (its RenderRange is never read by the engine).
+    /// Exact by construction: only geometry that could not produce a fragment is skipped, and
+    /// an idle instance already returns before its first GL call, so no successor renderer
+    /// can depend on this one's GL state. HUD/report row "animatable-gate";
+    /// '.komet toggle animcull' flips it live; safemode switches it off.
+    /// </summary>
+    public bool CullAnimatableRenderers { get; set; } = true;
+
+    /// <summary>
+    /// Skip rendering firepit contents beyond this many blocks. The renderer declares
+    /// RenderRange 48 but the engine never reads it, so every firepit with contents pays a
+    /// shader switch, ~15 uniforms, a temperature lookup and a light lookup per frame at any
+    /// distance - 4 ms/frame in a ruins area. Skipping is provably state-safe for this one
+    /// renderer: an empty firepit already draws nothing, so successors never depended on its
+    /// state. Never applied while a pot/crucible renderer is attached (those manage the
+    /// cooking sound). 0 = vanilla.
+    /// </summary>
+    public int FirepitContentsMaxDistance { get; set; } = 64;
+
+    /// <summary>
+    /// How long a near firepit's light, temperature and glow colour stay cached, in
+    /// milliseconds. Vanilla looks all three up per firepit per frame: a chunk-data read
+    /// that contends with the network thread while chunks stream in, an attribute-tree walk,
+    /// and a float[4] allocation - measured together at 4.6 ms/frame near a ruin. Light only
+    /// changes on block updates and cooling is slow, so 150 ms staleness is invisible.
+    /// 0 renders near firepits fully vanilla.
+    /// </summary>
+    public int FirepitLightCacheMs { get; set; } = 150;
 
     /// <summary>
     /// Skip the two unconditional glGetError() calls per frame in ClientMain. They are a
@@ -223,10 +296,35 @@ public class KometConfig
     public bool SkipPerFrameGlErrorCheck { get; set; } = true;
 
     /// <summary>
-    /// Time the visibility sweep so .komet can report milliseconds per frame rather than
-    /// event counts. Costs roughly 0.03 ms per frame.
+    /// Run the sun's occlusion query every Nth frame instead of every frame. 1 = vanilla.
+    ///
+    /// SystemRenderSunMoon draws a colour-masked quad purely to measure how much of the sun is
+    /// covered, and reads the result with two glGetQueryObject calls. With mesa_glthread on -
+    /// the radeonsi default - a GL call that returns a value must sync with the driver thread,
+    /// which measured 1.86 ms of an 11.9 ms frame here. The pass writes no pixels and its
+    /// result is time-smoothed into the sun glare over ~50 ms, so sampling it less often
+    /// cannot change what you see.
     /// </summary>
-    public bool MeasureCullTime { get; set; } = true;
+    /// (1 = vanilla, the default since 1.28.3: the `.komet stress` runs measured the
+    /// throttle at -0.11 ms idle and -0.93 +-0.95 ms while streaming - noise around zero
+    /// on current frames - and bisection points at it for cloud artefacts in the seconds
+    /// after teleporting: clouds render in OIT right after this pass, and the restored
+    /// state set is evidently not complete while the renderer list churns. A patch that
+    /// saves nothing and is the prime suspect for a visual artefact earns no default.)
+    public int SunOcclusionQueryInterval { get; set; } = 1;
+
+    /// <summary>
+    /// Tell the driver the particle instance buffers are undefined before overwriting them
+    /// (glInvalidateBufferData), so it renames the storage instead of waiting for the previous
+    /// frame's draw to retire. Measured on 06.09.: 1.543 particles, 48 KB of instance data, and
+    /// 10,43 ms per frame inside UpdateMesh - forty percent of the frame to move 48 KB, which
+    /// is a stall, not a transfer. Safe because the pool writes AliveCount instances and the
+    /// draw reads exactly AliveCount, so nothing reads what invalidation discards. Off until a
+    /// report prices it; '.komet toggle particleorphan' does the A/B in one command.
+    /// </summary>
+    public bool ParticleBufferOrphaning { get; set; }
+
+    // ---- shadows -----------------------------------------------------------------------------
 
     /// <summary>
     /// Tell the shader the range the far shadow map actually covers, so distant shadows fade
@@ -289,50 +387,21 @@ public class KometConfig
     public bool SymmetricShadowBox { get; set; } = true;
 
     /// <summary>
-    /// Check one visibility sweep in every N against what vanilla's FrustumCull would have
-    /// drawn, and log any disagreement. 0 = off.
+    /// Cull the shadow passes against the volume the shadow projection actually keeps, instead
+    /// of vanilla's world-axis estimate of it.
     ///
-    /// This exists because a cache bug shipped and flickered in the field: the engine assigns
-    /// CullVisible and LodLevel to a mesh part AFTER MeshDataPool.TryAdd returns, so the patch
-    /// that folds a newly inserted part into the cache was reading a LodLevel of 0 - which the
-    /// camera pass treats as invisible. Every test passed, because every test built its parts
-    /// fully populated. Only the running game holds the state that breaks it, so the check
-    /// belongs there. It costs one vanilla sweep over one pool every N sweeps; at the default
-    /// and ~290 sweeps a frame that is well under one pool per frame.
+    /// The engine derives the cull range from the shadow distance plus ShadowBoxZExtend - a
+    /// quantity that exists for the DEPTH axis (occluders between the sun and the covered
+    /// volume) and is spent on world X whatever the sun is doing. For the near cascade that is
+    /// a 205 to 255-block band of the world submitted into a map that covers 49: an order of
+    /// magnitude more geometry than can land in it, every vertex of it transformed, and in a
+    /// forest that geometry is foliage. The projection's own volume is known exactly, so the
+    /// range is cut to the world box around it plus slack for a part's own radius.
     ///
-    /// 0 (off) by default since 1.42.0: the bug it was built for is fixed and confirmed fixed in
-    /// the field, and a permanent second opinion on a sweep the benchmark already checks 3120
-    /// ways is the same kind of always-on measurement this release is removing everywhere else.
-    /// '.komet toggle cullcheck' arms it again without a restart, which is what to do the
-    /// moment anything flickers.
+    /// It only ever narrows - where vanilla is tighter, vanilla stands - and what it drops the
+    /// GPU clipped anyway, so the shadow map is unchanged. '.komet toggle shadowclip'.
     /// </summary>
-    public int VerifyCullSweepEvery { get; set; }
-
-    /// <summary>
-    /// Measure GPU time per frame with a GL_TIME_ELAPSED query, shown as "gpu-frame" in the
-    /// HUD. This is the number that separates "CPU-bound" from "GPU-bound" - the underwater
-    /// half-framerate case was undiagnosable without it. Results are collected once a second
-    /// from a query that is already three frames old, so it adds no per-frame driver sync.
-    /// </summary>
-    public bool MeasureGpuTime { get; set; } = true;
-
-    /// <summary>
-    /// Run the sun's occlusion query every Nth frame instead of every frame. 1 = vanilla.
-    ///
-    /// SystemRenderSunMoon draws a colour-masked quad purely to measure how much of the sun is
-    /// covered, and reads the result with two glGetQueryObject calls. With mesa_glthread on -
-    /// the radeonsi default - a GL call that returns a value must sync with the driver thread,
-    /// which measured 1.86 ms of an 11.9 ms frame here. The pass writes no pixels and its
-    /// result is time-smoothed into the sun glare over ~50 ms, so sampling it less often
-    /// cannot change what you see.
-    /// </summary>
-    /// (1 = vanilla, the default since 1.28.3: the `.komet stress` runs measured the
-    /// throttle at -0.11 ms idle and -0.93 +-0.95 ms while streaming - noise around zero
-    /// on current frames - and bisection points at it for cloud artefacts in the seconds
-    /// after teleporting: clouds render in OIT right after this pass, and the restored
-    /// state set is evidently not complete while the renderer list churns. A patch that
-    /// saves nothing and is the prime suspect for a visual artefact earns no default.)
-    public int SunOcclusionQueryInterval { get; set; } = 1;
+    public bool ShadowTightCullBox { get; set; } = true;
 
     /// <summary>
     /// Extra shadow map resolution steps on top of the graphics setting, 1024 texels per axis
@@ -366,6 +435,40 @@ public class KometConfig
     /// slider to 4 mid-session and the engine's own rebuild applies the extra steps.
     /// </summary>
     public int ShadowMapExtraQuality { get; set; } = 1;
+
+    /// <summary>
+    /// Edge length of the NEAR shadow cascade's map in pixels. 0 = the engine's size, which is
+    /// the far map's (6144 at quality 4, 7168 with ShadowMapExtraQuality 1).
+    ///
+    /// The near cascade covers vanilla's 39-block wedge - about 60 x 34 blocks at FoV 70 - so
+    /// a 7168 px map spends over a hundred texels per block on it while the far map, which
+    /// shadows everything beyond 45 blocks, has fifteen. The GPU report priced the near pass
+    /// at 5,8 ms of an 8,9 ms GPU frame for a few dozen chunks: a depth pass costs texels
+    /// times depth complexity, not geometry, and this is the one number that sets the texels.
+    /// The cost goes with the square of this value; 4096 makes the near pass a third of what
+    /// it was, 3072 a fifth.
+    ///
+    /// What the size costs in looks, worked out rather than estimated. fogandlight.fsh takes
+    /// its 3x3 PCF offsets from shadowMapWidthInv, which is the FAR map's - 1/7168 of a UV,
+    /// i.e. 49/7168 = 0,7 cm of world for a 49-block near box, whatever this value is. So the
+    /// penumbra's WIDTH does not move with this setting at all. What moves is the texel the
+    /// edge steps in, and at 4096 the whole 3x3 kernel already spans about one near texel -
+    /// the near cascade is effectively point-sampled at that size, so there is no softening
+    /// left for a smaller map to lose. The ladder, for a 49-block box:
+    ///
+    ///     4096 - 1,2 cm texel, fill 1,00x       2048 - 2,4 cm texel, fill 0,25x
+    ///     3072 - 1,6 cm texel, fill 0,56x       1536 - 3,2 cm texel, fill 0,14x
+    ///
+    /// The default stays at 4096 because a shipped default that changes what everyone's world
+    /// looks like wants a measurement, not arithmetic. In a scene where the near cascade is
+    /// the frame - a forest, where its foliage passes are alpha-tested, uncullable and drawn
+    /// over each other - the two steps below are where the frame is, and the GPU page prices
+    /// them in seconds.
+    ///
+    /// '.komet shadownear 3072' (or any size, 'off' for the engine's) changes it live and
+    /// rebuilds the framebuffers, the same thing the graphics menu does on a change.
+    /// </summary>
+    public int ShadowNearMapSize { get; set; } = 4096;
 
     /// <summary>
     /// Quantise the shadow projection to whole shadow map texels, so the texel grid stands
@@ -403,25 +506,6 @@ public class KometConfig
     public bool ShadowSkipRedundantLod { get; set; } = true;
 
     /// <summary>
-    /// Edge length of the NEAR shadow cascade's map in pixels. 0 = the engine's size, which is
-    /// the far map's (6144 at quality 4, 7168 with ShadowMapExtraQuality 1).
-    ///
-    /// The near cascade covers vanilla's 39-block wedge - about 60 x 34 blocks at FoV 70 - so
-    /// a 7168 px map spends over a hundred texels per block on it while the far map, which
-    /// shadows everything beyond 45 blocks, has fifteen. The GPU report priced the near pass
-    /// at 5,8 ms of an 8,9 ms GPU frame for a few dozen chunks: a depth pass costs texels
-    /// times depth complexity, not geometry, and this is the one number that sets the texels.
-    /// The cost goes with the square of this value; 4096 makes the near pass a third of what
-    /// it was, 3072 a fifth. The map's sampling in the shader is unchanged (the PCF spacing
-    /// comes from the far map), so near shadow edges come out a touch crisper rather than
-    /// blurrier - at 4096 about as vanilla renders them at quality 2.
-    ///
-    /// '.komet shadownear 3072' (or any size, 'off' for the engine's) changes it live and
-    /// rebuilds the framebuffers, the same thing the graphics menu does on a change.
-    /// </summary>
-    public int ShadowNearMapSize { get; set; } = 4096;
-
-    /// <summary>
     /// Back-face culling for the solid chunk passes (Opaque and TopSoil) while they are drawn
     /// into the shadow maps. Vanilla draws the whole shadow pass without culling; the foliage
     /// passes (OpaqueNoCull, BlendNoCull) keep that, they must cast from either side. The solid
@@ -446,6 +530,94 @@ public class KometConfig
     /// report says why. '.komet toggle shadowdepth' flips it.
     /// </summary>
     public bool ShadowDepthOnlySolidPasses { get; set; } = true;
+
+    /// <summary>
+    /// Cap on the near shadow cascade's depth extend, in blocks. 0 = the engine's.
+    ///
+    /// The near pass culls against the shadow projection's own six planes, so what it draws IS
+    /// the clip volume - and that volume's depth is the engine's ShadowBoxZExtend, which for the
+    /// near cascade is 50 + 50*|1-sunY| + 100, i.e. 150 to 200 blocks. That is MORE than the far
+    /// cascade's own extend, for a cascade covering 39 blocks instead of 255: the near volume is
+    /// a 60-block-wide column of the world two hundred blocks deep, and in a forest that column
+    /// is foliage from the ground to the top of every tree in it. A GPU report priced that pass
+    /// at 20 of 24 ms, and it did not move when the map went from 4096 to 2048 px - the cost is
+    /// the geometry, not the fill, and this is the number that sets it.
+    ///
+    /// Roughly linear: 80 blocks against vanilla's 150-200 is about half the volume. What it
+    /// costs is occluders further up-sun than the cap - they stop casting into the NEAR map and
+    /// keep casting in the far one, so their shadow comes out at half strength instead of full
+    /// (fogandlight.fsh adds the two cascades). Flat forest never notices; a mountain up-sun
+    /// does. Default is vanilla because that is a judgement about a particular world;
+    /// '.komet shadowneardepth 80' prices it live on the GPU page.
+    ///
+    /// With ShadowNearDepthFit on - the default - this cap finally means what it says. The
+    /// untranslated ortho spends the extend half up-sun and half down-sun, so before the fit
+    /// half of every block the cap took off came out of the half that could not cast anyway.
+    /// The two compose: the fit removes the down-sun waste at no visual cost, the cap trades
+    /// up-sun reach for speed on top of it. Below roughly twice the cascade's range there is
+    /// nothing left for the fit to cut and the cap is on its own again.
+    /// </summary>
+    public double ShadowNearDepthExtend { get; set; }
+
+    /// <summary>
+    /// Fit the near cascade's depth range to the part of it that can cast, instead of the
+    /// untranslated range the engine projects. Off is exactly vanilla.
+    ///
+    /// The engine extends the near shadow box up-sun by 150-200 blocks - correct, that is where
+    /// occluders live - and then builds the projection with loadOrthoModeMatrix, which writes
+    /// the three scale terms and NO translation. An ortho with no translation clips |z| &lt;=
+    /// length/2 about the light-space origin: it uses the box's LENGTH and never learns where
+    /// the box sits, so half of that extend lands DOWN-sun, ninety-odd blocks of world behind
+    /// every receiver it could be tested against. It is drawn into the near map every frame and
+    /// no fragment of it can darken anything.
+    ///
+    /// This adds the missing translation with the up-sun plane left exactly where vanilla put
+    /// it - so every occluder vanilla drew is still drawn and the image does not change - and
+    /// the down-sun plane pulled up to the last receiver the near map can still serve, which
+    /// shadowcoords.vsh fixes at 1.15 x the cascade's range. Typically a quarter to a third of
+    /// the near cascade's depth, which is the most expensive pass in the frame.
+    ///
+    /// Two things come free: fogandlight.fsh biases the near lookup by a constant 0.0005 in
+    /// NORMALISED depth, so a shorter box shrinks the world-space bias by the same factor (that
+    /// bias is what peter-panning under foliage is made of), and the depth buffer spreads the
+    /// same precision over less world. '.komet toggle shadownearfit' switches it live.
+    /// </summary>
+    public bool ShadowNearDepthFit { get; set; } = true;
+
+    /// <summary>
+    /// Draw into the near shadow map only what can shadow something the camera can see. Off is
+    /// exactly vanilla.
+    ///
+    /// The near cascade's box does not follow the view (ShadowBox.getCameraRotationMatrix is
+    /// the identity), so its map serves receivers in every direction - and the ground behind
+    /// the camera is never on screen. The near map only serves receivers within 1.15 x its
+    /// range, only receivers in the view frustum are drawn, and a caster shades along the light
+    /// direction only: so the shadow projection's four lateral clip planes can be pulled in to
+    /// the light-space extent of that frustum slice, and every caster that can reach a visible
+    /// receiver is still inside. Nothing about the map's coverage or lookup changes; it holds
+    /// "no caster" where nothing on screen could have read one. Typically a third to a half of
+    /// the near pass's geometry, most when looking across the light; nothing when the near
+    /// cascade is retained across frames (ShadowNearUpdateInterval > 1), where the cull steps
+    /// aside. '.komet toggle shadowfootprint' switches it live.
+    /// </summary>
+    public bool ShadowNearFootprintCull { get; set; } = true;
+
+    /// <summary>
+    /// How far leaves and plants cast a shadow, in blocks; 0 is the cascade's own range
+    /// (vanilla). This is the biggest single item the GPU spends its frame on: skipping
+    /// foliage in the shadow maps outright took a settled frame from 6,27 to 4,40 ms, because
+    /// the near cascade shades 315 million fragments of foliage and the far one 250 million,
+    /// against 32 million in the whole camera pass. The shadow maps are orthographic, so a
+    /// grass tuft costs the same shadow texels at 250 blocks as at 20, and the fragments scale
+    /// with the area the cascade covers - cutting the far cascade's 255 blocks to 100 leaves
+    /// 15 % of them.
+    ///
+    /// It IS visible if set too low, which is why it is off: tree leaves and grass tufts sit in
+    /// the same render pass and cannot be told apart at pool granularity, so a low range stops
+    /// a distant forest shading itself. '.komet shadowfoliagerange &lt;blocks&gt;' live, and the
+    /// gpu row prices it within a minute.
+    /// </summary>
+    public double ShadowFoliageRange { get; set; }
 
     /// <summary>
     /// Shortest gap, in frames, between two renders of the far shadow cascade. The shadow
@@ -528,70 +700,61 @@ public class KometConfig
     /// </summary>
     public int ShadowNearUpdateInterval { get; set; } = 1;
 
-    /// <summary>
-    /// Attribute each render stage's time to the individual renderers inside it, so the HUD
-    /// can name what is actually expensive instead of only which stage.
-    ///
-    /// OFF by default since 1.42.0, and the reason is the mod's own headline number. Every
-    /// registered renderer is replaced by a timing decorator, and "roughly fifty renderers a
-    /// frame" - what this comment used to say - is wrong by two orders of magnitude: at view
-    /// distance 1536 the client holds around ten thousand renderer instances, nearly all of
-    /// them block entities. That is ten thousand extra interface dispatches and cache misses
-    /// on EVERY frame, plus two Stopwatch reads apiece on the sampled quarter, plus a linear
-    /// scan of the stage's renderer list every time an unloading block entity unregisters
-    /// itself. All of it is measurement, none of it draws anything, and it is on the same side
-    /// of the ledger as everything this mod removes - it even inflates the frame it reports.
-    ///
-    /// It is still the sharpest tool here when a specific renderer is suspect (it found the
-    /// firepit), so it turns on live with '.komet toggle profiler' and the stress test has a
-    /// phase for it. Turn it on to answer a question, then turn it off again.
-    /// </summary>
-    public bool ProfileRenderers { get; set; }
+    // ---- chunks: loading, upload, tesselation ------------------------------------------------
 
     /// <summary>
-    /// Keep the Before render stage's renderers timed every frame even while the full
-    /// profiler is off. That stage holds only a handful of system renderers (entity
-    /// preparation, chunk mesh uploads, the liquid depth pre-pass, camera, ambient - plus
-    /// whatever other mods put there), so the cost is a few microseconds - but it is where
-    /// the repeated unattributed world-join bursts (60-87 ms of "before" with no GC) live,
-    /// and a hitch line that can say "renderer Before-ree 60 ms" beats one that cannot.
-    /// The full profiler stays available via '.komet toggle profiler' as before.
+    /// Copy chunk mesh data into persistently mapped GPU buffers in bulk instead of one
+    /// element at a time.
+    ///
+    /// Off by default: in 1.22.7 ClientPlatformWindows.allowPStorage is never assigned, so
+    /// persistent mapping is dead code and every upload already goes through glBufferSubData.
+    /// Measured on this install: 0 bulk copies against 342 605 fall-throughs. Kept in case a
+    /// later version or another mod turns persistent storage on.
     /// </summary>
-    public bool AttributeBeforeStage { get; set; } = true;
-
-    /// <summary>Show the on-screen performance overlay right away. Toggle in game with F7.</summary>
-    public bool DebugHudVisible { get; set; }
+    public bool BulkMeshUpload { get; set; }
 
     /// <summary>
-    /// Attribute what is measured to the MOD it came from, and collect what each mod does
-    /// (Harmony patches, registered block/item/entity classes, time spent in its load phases).
+    /// EXPERIMENTAL. Turn on the engine's own persistent-mapping path for chunk VBOs
+    /// (ClientPlatformWindows.allowPStorage, which vanilla never sets). Uploads then write
+    /// straight into mapped GPU memory instead of glBufferSubData into a buffer the GPU may
+    /// still be reading - which is where the upload spikes come from. Implies BulkMeshUpload.
     ///
-    /// It rides on the two profilers that already exist: each renderer and tick listener
-    /// wrapper resolves its owning mod once when it is wrapped and books its ticks into that
-    /// mod's bucket as well, so the per-frame price is one field add per measured call. What it
-    /// costs on top of that is a periodic scan of Harmony's registry and the class registry
-    /// (every ten seconds, like the patch guard's) and a prefix/postfix pair around the mod
-    /// loader's phase call, which runs a few hundred times per session.
-    ///
-    /// Read the caveats on the HUD, not just the numbers: a Harmony patch runs inside the
-    /// engine method it patches, so its time is booked to the engine - which is why the patch
-    /// COUNT is reported next to the milliseconds.
+    /// A path the developers never enable is a path they never tested: if terrain renders
+    /// wrong or the game crashes on world join, set this back to false.
     /// </summary>
-    public bool ProfileMods { get; set; } = true;
-
-    /// <summary>Show the mod profiler overlay right away. It sits in the opposite screen corner
-    /// from the performance HUD; Shift+F7 (or '.komet mods hud') cycles it off / compact / full.
-    /// Shift+F7 rather than a key of its own: this mod already owns F7, and the keys that look
-    /// unused are not.</summary>
-    public bool ModHudVisible { get; set; }
+    public bool ExperimentalPersistentMapping { get; set; }
 
     /// <summary>
-    /// Raster the HUD text on a worker thread instead of inside the frame. The full rebuild
-    /// (cairo raster included) used to land in a single ortho frame - a field log booked it
-    /// as "hud 3,0 / 7,7" hitch shares. Off: the old synchronous path, also the automatic
-    /// fallback if cairo refuses the worker thread. '.komet toggle hudraster' flips it live.
+    /// Cap how long the main thread spends uploading chunk meshes per frame. Vanilla's budget
+    /// grows with the square of the view distance and again with the tesselation backlog,
+    /// which is what makes frame times collapse while moving at high view distance.
     /// </summary>
-    public bool HudBackgroundRaster { get; set; } = true;
+    public bool AdaptiveUploadBudget { get; set; } = true;
+
+    /// <summary>Milliseconds per frame the upload throttle aims for.</summary>
+    public double UploadBudgetTargetMs { get; set; } = 6.0;
+
+    /// <summary>
+    /// Let the upload throttle also react to the whole frame running hot (minus its GC
+    /// pause) while uploads are in flight. Under mesa_glthread the upload clock only sees
+    /// command recording - the driver pays the real copy later in opaque/swap, which is
+    /// where a field log's eight-hitch streaming burst lived while the throttle read 100 %.
+    /// '.komet toggle uploaddruck' flips it live.
+    /// </summary>
+    public bool UploadFramePressure { get; set; } = true;
+
+    /// <summary>
+    /// Also budget the PRIORITY chunk upload queue, which vanilla drains completely in a
+    /// single frame with no limit of any kind. Its designed load is a player block edit -
+    /// one or two chunks - but relight storms (time or season changes, light-baking mods)
+    /// and priority re-tesselations all route through the same queue, and the hitch log
+    /// measured 10-27 ms of upload in single frames while one was running. The budget
+    /// uploads at least one chunk per frame and at least a full chunk mesh's worth of
+    /// vertices (so an edit still appears in the frame it was meshed in) and carries the
+    /// rest into the following frames - deferred, never lost. '.komet toggle prioupload'
+    /// flips it live.
+    /// </summary>
+    public bool BudgetPriorityUploads { get; set; } = true;
 
     /// <summary>
     /// Keep the terrain tesselation thread awake while chunks are queued. Vanilla's thread
@@ -609,25 +772,12 @@ public class KometConfig
     public bool TesselationThreadPriority { get; set; } = true;
 
     /// <summary>
-    /// Skip rendering firepit contents beyond this many blocks. The renderer declares
-    /// RenderRange 48 but the engine never reads it, so every firepit with contents pays a
-    /// shader switch, ~15 uniforms, a temperature lookup and a light lookup per frame at any
-    /// distance - 4 ms/frame in a ruins area. Skipping is provably state-safe for this one
-    /// renderer: an empty firepit already draws nothing, so successors never depended on its
-    /// state. Never applied while a pot/crucible renderer is attached (those manage the
-    /// cooking sound). 0 = vanilla.
+    /// Decompress the neighbourhood of upcoming queue entries on a spare core before the
+    /// tesselation thread needs it. Each tesselation touches 27 chunks; any that are packed
+    /// get unpacked on the critical path otherwise. Idempotent and lock-protected - the
+    /// engine's own compresschunks thread already does the same kind of concurrent access.
     /// </summary>
-    public int FirepitContentsMaxDistance { get; set; } = 64;
-
-    /// <summary>
-    /// How long a near firepit's light, temperature and glow colour stay cached, in
-    /// milliseconds. Vanilla looks all three up per firepit per frame: a chunk-data read
-    /// that contends with the network thread while chunks stream in, an attribute-tree walk,
-    /// and a float[4] allocation - measured together at 4.6 ms/frame near a ruin. Light only
-    /// changes on block updates and cooling is slow, so 150 ms staleness is invisible.
-    /// 0 renders near firepits fully vanilla.
-    /// </summary>
-    public int FirepitLightCacheMs { get; set; } = 150;
+    public bool TesselationNeighbourPrefetch { get; set; } = true;
 
     /// <summary>
     /// Build the 34x34x34 neighbourhood window for the NEXT queued chunk on a worker thread
@@ -672,12 +822,160 @@ public class KometConfig
     public int TesselationPipelineValidateFirstN { get; set; } = 200;
 
     /// <summary>
-    /// Decompress the neighbourhood of upcoming queue entries on a spare core before the
-    /// tesselation thread needs it. Each tesselation touches 27 chunks; any that are packed
-    /// get unpacked on the critical path otherwise. Idempotent and lock-protected - the
-    /// engine's own compresschunks thread already does the same kind of concurrent access.
+    /// Slow the integrated server down when this client cannot keep up with meshing what it
+    /// already received. Measured in a fresh world: 463 chunks/s arriving against 82/s
+    /// tesselated - everything past the client's rate only grows the queue, hammers the chunk
+    /// lock the tesselator needs, and spends cores on worldgen that the tesselation thread is
+    /// waiting for. Singleplayer only; on a real server the client cannot pace anything.
     /// </summary>
-    public bool TesselationNeighbourPrefetch { get; set; } = true;
+    public bool AdaptiveChunkInflow { get; set; } = true;
+
+    /// <summary>Tesselation backlog below which the server runs at full rate.</summary>
+    public int InflowLowWaterChunks { get; set; } = 400;
+
+    /// <summary>Backlog at which the server is throttled all the way down to one column per tick.</summary>
+    public int InflowHighWaterChunks { get; set; } = 2000;
+
+    /// <summary>
+    /// Milliseconds to collect edge-only re-tesselation marks before issuing one per chunk.
+    /// Every arriving chunk marks its six neighbours edge-only, so while a neighbourhood
+    /// streams in packet by packet the same border chunk is re-meshed up to six times
+    /// (measured: 6322 of 7244 marks/s were edge-only during loading). Coalescing turns
+    /// that into one rebuild per chunk per window. Full marks, priority, relight and block
+    /// changes are never delayed.
+    ///
+    /// OFF by default (0) since 1.36.0, by the same rule that retired the sun-query
+    /// throttle: the stress test measured it at -0,12 ms (a small COST, not a saving), and
+    /// it was prime suspect twice for visible holes along water chunk borders on fresh
+    /// terrain - the edge repair of an early-meshed chunk already waits behind thousands
+    /// of full tesselations, and this window stretches that visible gap further. The
+    /// tesselation-thread relief (hundreds of thousands of absorbed rebuilds) never showed
+    /// up as frame time. '.komet toggle edgecoal' enables it live for experiments.
+    /// </summary>
+    public double EdgeRetessCoalesceMs { get; set; }
+
+    /// <summary>
+    /// Move edge-only re-tesselation marks to the front of the tesselation queue, so visible
+    /// border holes close before invisible new chunks mesh.
+    ///
+    /// On fresh terrain a chunk at the load front is meshed before its neighbour arrives, so
+    /// the shared face is culled against the unknown - a visible hole, most obvious on the
+    /// ocean surface. The engine's repair mark waits at the BACK of the queue, behind
+    /// thousands of full tesselations of chunks nobody can see yet (~5 s at the measured
+    /// 371 chunks/s). Promoting the repair changes only WHEN it runs, never what it produces:
+    /// each promoted entry is work vanilla had already queued, handed to the same consumer.
+    /// Capped so player block edits are never buried (at most 64 promotions per 50 ms, none
+    /// while the priority queue is already busy). '.komet toggle edgeprio' flips it live -
+    /// the A/B is judged by eye at the load front, not by frame time.
+    /// </summary>
+    public bool EdgeRetessPriority { get; set; } = true;
+
+    /// <summary>
+    /// Main-thread milliseconds per 20 ms tick the minimap may spend uploading freshly
+    /// generated map pieces; the per-tick piece cap adapts around it (halves when a tick
+    /// overran, doubles up to vanilla's 200 when it had room). The tick profiler's first field
+    /// report named this the dominant hitch bucket of a join flood: WorldMapManager.OnClientTick
+    /// at 2,5-8,5 ms, from hundreds of texture uploads and framebuffer draws per tick while
+    /// chunks stream in. Pieces are never dropped, only spread over the following ticks; an
+    /// opened world map on an idle frame still fills at vanilla speed. 0 = vanilla.
+    /// '.komet toggle minimap' flips it live.
+    /// </summary>
+    public double MinimapPieceBudgetMs { get; set; } = 1.0;
+
+    /// <summary>
+    /// Compose minimap pieces into their 96x96 component texture with a direct sub-image
+    /// upload instead of vanilla's per-piece framebuffer draw (FBO created and destroyed per
+    /// component per tick, staging texture with mipmaps, shader switch, quad draw). The
+    /// second 02.09. report showed the piece cap pinned at 8 and still 1,14 ms per tick -
+    /// 0,14 ms per 4 KB image. Pixels land on the same rows and columns (the texture2texture
+    /// shader does not flip). '.komet toggle minimapdirect' flips it live.
+    /// </summary>
+    public bool MinimapDirectUpload { get; set; } = true;
+
+    /// <summary>
+    /// Main-thread milliseconds per frame the task drain (ClientMain.ExecuteMainThreadTasks:
+    /// every server packet that is not chunk data, plus chunk installs) may run before the
+    /// remainder goes back to the front of the queue with vanilla's own requeue - order is
+    /// kept, nothing is dropped. The 02.09. report had "draussen 17,7 | tasks 16,9 (loadchunk
+    /// 16,8)": a whole batch of chunk installs in one frame. At least 8 tasks always run, the
+    /// budget stretches with the backlog and is ignored above 4096 waiting tasks. Needs
+    /// AttributeMainThreadTasks (the transcribed drain). 0 = vanilla (drain everything).
+    /// '.komet toggle taskbudget' flips it live.
+    /// </summary>
+    public double MainThreadTaskBudgetMs { get; set; } = 3.0;
+
+    // ---- entities ----------------------------------------------------------------------------
+
+    /// <summary>
+    /// Main-thread milliseconds per frame that entity shape (re-)tesselations may take;
+    /// anything beyond is deferred to the following frames (the entity keeps drawing its old
+    /// mesh, a brand-new one appears a few frames later - vanilla already has that async gap).
+    ///
+    /// This is the look-around stutter: BeforeRender tesselates a stale entity shape only
+    /// once it enters the frustum, so turning the camera across a freshly streamed area runs
+    /// the expensive main-thread half (shape clone, clothing/armor StepParentShape, texture
+    /// baking with atlas uploads) for many entities in one frame - measured 12-39 ms spikes
+    /// at 600-1000 grad/s. At least one tesselation per frame always runs, so nothing
+    /// starves. The player's own renderer is structurally unaffected. 0 = vanilla.
+    /// </summary>
+    public double EntityTesselationBudgetMs { get; set; } = 2.0;
+
+    /// <summary>
+    /// Main-thread milliseconds per frame for FINISHING entity loads - Initialize (behaviours,
+    /// animator), chunk registration, renderer creation - nearest entity first. Entities reach
+    /// the client one packet per entity as the server starts tracking them (200 ms batches,
+    /// hundreds at a world join), and each packet used to do all of that at once inside the
+    /// main-thread task drain: a "draussen" burst with an allocation spike behind it. Now the
+    /// cheap half (create + deserialise, which yields the position) runs on arrival and the
+    /// rest is held in distance bins and finished at the frame boundary under this budget,
+    /// at least two per frame (liveness). Any other packet naming a held entity finishes it
+    /// on the spot, so nothing observable changes except WHEN a distant entity appears in a
+    /// burst. Hitch lines carry "entload X". 0 = vanilla. '.komet toggle entload' flips it
+    /// live (off flushes everything held).
+    /// </summary>
+    public double EntityLoadBudgetMs { get; set; } = 1.5;
+
+    /// <summary>
+    /// Generate an entity shape's animation frames on a worker thread before the first entity
+    /// of that shape enters the world. The engine builds them lazily on the main thread the
+    /// first time each animation starts - measured against the game's own shape files:
+    /// chicken-rooster 11,9 ms for its 13 animations, "attack" alone 4,7 ms; the report's "anim
+    /// most expensive 53,1 ms (pig)" is that cost on a bigger shape - once per creature type
+    /// per session, always in the frame a new kind of animal first moves. With the load hold in
+    /// place (EntityLoadBudgetMs above 0) the first held entity of a shape starts a worker, the
+    /// entity waits the few milliseconds the worker needs, and the main thread finds the frames
+    /// ready. A shape that is already in use by a loaded entity is never touched off-thread.
+    /// Needs the entity load hold; without it there is no window. '.komet toggle animwarm'.
+    /// </summary>
+    public bool EntityAnimationPrewarm { get; set; } = true;
+
+    /// <summary>
+    /// Animate entities that are only shadow-rendered (outside the view frustum, inside the
+    /// shadow frustum - most loaded entities at 255 blocks of shadow range) every third frame
+    /// and rendered entities beyond EntityAnimationFarBlocks every second frame, each time
+    /// with the skipped frames' dt folded in: animation time runs exactly as before, sampled
+    /// less often. Own player, near entities and dead ones are always at full rate. Needs
+    /// AttributeEntityBeforeStage. '.komet toggle animlod' flips it live.
+    /// </summary>
+    public bool EntityAnimationLod { get; set; } = true;
+
+    /// <summary>Horizontal distance in blocks beyond which a rendered entity animates
+    /// every second frame (at 86 fps: 43 Hz, on a creature a few pixels tall).</summary>
+    public double EntityAnimationFarBlocks { get; set; } = 48;
+
+    /// <summary>
+    /// Look animation codes up case-insensitively instead of allocating a lowercase copy of
+    /// the key on every animated entity, every frame.
+    /// </summary>
+    public bool AnimationLookupWithoutAlloc { get; set; } = true;
+
+    /// <summary>
+    /// Replace the LINQ .Any() over the active animation dictionary with a plain loop; the
+    /// LINQ version boxes the dictionary enumerator once per animated entity per frame.
+    /// </summary>
+    public bool AnimationCollisionBoxWithoutAlloc { get; set; } = true;
+
+    // ---- memory and the collector ------------------------------------------------------------
 
     /// <summary>
     /// Ask the runtime for SustainedLowLatency, which keeps the garbage collector from doing
@@ -704,21 +1002,52 @@ public class KometConfig
     public double ReclaimEmptyPoolsAfterSeconds { get; set; } = 20.0;
 
     /// <summary>
-    /// Slow the integrated server down when this client cannot keep up with meshing what it
-    /// already received. Measured in a fresh world: 463 chunks/s arriving against 82/s
-    /// tesselated - everything past the client's rate only grows the queue, hammers the chunk
-    /// lock the tesselator needs, and spends cores on worldgen that the tesselation thread is
-    /// waiting for. Singleplayer only; on a real server the client cannot pace anything.
+    /// Replace the engine MeshDataRecycler's storage with a size-class pool behind the same
+    /// API. The vanilla storage discards usable buffers two ways that peak exactly while
+    /// chunks stream in (one mesh per size key - the fifth same-size buffer of a burst is
+    /// thrown away; and a get only accepts a fit within 25 %), which feeds the measured
+    /// ~380 MB/s of tesselation-thread allocation behind the GC-pause hitches while loading.
+    /// Mesh content is byte-identical either way - CloneUsingRecycler copies into whatever
+    /// buffer comes back - this only changes which buffer that is. The HUD/report row
+    /// "mesh-recycler" shows the hit rate and the fresh-allocation rate either way it is
+    /// answered. '.komet toggle recycler' flips it live.
     /// </summary>
-    public bool AdaptiveChunkInflow { get; set; } = true;
+    public bool FastMeshRecycler { get; set; } = true;
 
-    /// <summary>Tesselation backlog below which the server runs at full rate.</summary>
-    public int InflowLowWaterChunks { get; set; } = 400;
+    /// <summary>
+    /// Upper bound in MB on the buffers the replacement pool keeps for reuse. Vanilla's own
+    /// storage holds 300-400 MB for the same purpose (its class comment says so), so the
+    /// default is not new memory - it is the same reserve with the eviction actually enforced
+    /// (oldest first, 15 s idle TTL).
+    /// </summary>
+    public int MeshRecyclerBudgetMb { get; set; } = 384;
 
-    /// <summary>Backlog at which the server is throttled all the way down to one column per tick.</summary>
-    public int InflowHighWaterChunks { get; set; } = 2000;
+    /// <summary>
+    /// Make MeshData.CloneExtraData copy content instead of capacity. The engine clones a
+    /// mesh's custom data parts with Values.Clone() - the FULL backing array. Chunk part
+    /// clones copy from the tesselator's accumulation buffers, which grow to the high-water
+    /// of the biggest chunk ever meshed and mostly carry CustomInts nobody wrote to - so
+    /// every chunk paid high-water-sized copies of zeroes: measured 217 of 255 MB/s on the
+    /// tesselation thread with the mesh recycler already at 100% hits. Uploads are driven by
+    /// Count, not array length, so the only observable change is the garbage that no longer
+    /// exists. Report row "klon-kompakt"; '.komet toggle tightclone' flips it live.
+    /// </summary>
+    public bool TightCustomClones { get; set; } = true;
 
-    // ---- server side (singleplayer: the integrated server runs in the same process) ----
+    /// <summary>
+    /// Recycle the per-face extras and custom-part value arrays of chunk part clones through
+    /// a size-class pool instead of allocating them fresh per part. The mesh recycler keeps a
+    /// part's basic arrays alive between tesselations; these were the remaining fresh
+    /// allocations in that path (~18 MB/s "klone" while streaming), and the worst kind for
+    /// the collector - born on the tesselation thread, promoted while the part waits in the
+    /// upload queue, dead on the render thread. Rented in CloneExtraData, returned by a
+    /// postfix on TesselatedChunkPart.AddToPools after the upload disposed the mesh. Exact:
+    /// nothing in the engine reads these arrays' Length as a count. Report row "extras-pool";
+    /// '.komet toggle extrapool' flips it live.
+    /// </summary>
+    public bool PoolMeshExtras { get; set; } = true;
+
+    // ---- server side (singleplayer: the integrated server runs in the same process) ----------
     // These replace hand edits to servermagicnumbers.json: set in memory at every world
     // start, gone the moment the mod is removed. 0 always means "leave vanilla alone".
 
@@ -780,6 +1109,174 @@ public class KometConfig
     public bool ServerAttributeNoOpSkip { get; set; } = true;
 
     /// <summary>
+    /// Measure the integrated server's allocation per thread and per suspect (worldgen,
+    /// chunk packets, entity simulation, physics, database loads) so the report's
+    /// alloc-quellen line names what used to be "rest" - in the 02.09. join floods 193 of
+    /// 279 MB/s, behind 35 gen0 collections per second and 52 of 54 hitches. Measurement
+    /// only; singleplayer only (a remote server is not this process).
+    /// </summary>
+    public bool ServerAllocAttribution { get; set; } = true;
+
+    // ---- what the mod measures about itself, and what it shows -------------------------------
+
+    /// <summary>
+    /// Time the visibility sweep so .komet can report milliseconds per frame rather than
+    /// event counts. Costs roughly 0.03 ms per frame.
+    /// </summary>
+    public bool MeasureCullTime { get; set; } = true;
+
+    /// <summary>
+    /// Measure GPU time per frame with a GL_TIME_ELAPSED query, shown as "gpu-frame" in the
+    /// HUD. This is the number that separates "CPU-bound" from "GPU-bound" - the underwater
+    /// half-framerate case was undiagnosable without it. Results are collected once a second
+    /// from a query that is already three frames old, so it adds no per-frame driver sync.
+    /// </summary>
+    public bool MeasureGpuTime { get; set; } = true;
+
+    /// <summary>
+    /// Time the particle pools' per-frame work and count what is alive in them.
+    ///
+    /// Measurement only - nothing about the particle system changes. It was the last part of
+    /// the frame with no number attached to it: the mod measures render stages, tick listeners,
+    /// renderers, uploads and culling, and "is it the particles?" could only be answered with an
+    /// opinion. SystemRenderParticles calls OnNewFrame on the main-thread pools inside the
+    /// Opaque and OIT stages, and for those pools that call is the whole physics step plus the
+    /// instance-buffer upload; the off-thread pools only pick up what their own thread produced.
+    /// The report prints the two apart.
+    ///
+    /// The price is eight Stopwatch reads per frame. '.komet toggle particles' switches it live.
+    /// </summary>
+    public bool MeasureParticles { get; set; } = true;
+
+    /// <summary>
+    /// Measure the chunk passes on the GPU with elapsed-time queries, on every third frame.
+    ///
+    /// The per-stage GPU figures are timestamps, written when the command processor REACHES
+    /// them, not when the work before them is done - so whichever stage contains the next
+    /// barrier inherits everything still in flight. A report showed the near shadow pass at
+    /// 17,4 ms for 593.438 triangles and the 17-million-triangle camera pass at 0,0, and three
+    /// optimisations were aimed at the near cascade on the strength of that. GL_TIME_ELAPSED
+    /// ends when the enclosed commands have COMPLETED, and GL_FRAGMENT_SHADER_INVOCATIONS
+    /// counts what the pass shaded. Only one elapsed-time query may be active, so on probe
+    /// frames the whole-frame query is not issued; the frame figure keeps two of three
+    /// samples. Read only when the driver says the result is ready - never a stall.
+    /// '.komet toggle passprobe' switches it live.
+    /// </summary>
+    public bool GpuPassProbe { get; set; } = true;
+
+    /// <summary>
+    /// Check one visibility sweep in every N against what vanilla's FrustumCull would have
+    /// drawn, and log any disagreement. 0 = off.
+    ///
+    /// This exists because a cache bug shipped and flickered in the field: the engine assigns
+    /// CullVisible and LodLevel to a mesh part AFTER MeshDataPool.TryAdd returns, so the patch
+    /// that folds a newly inserted part into the cache was reading a LodLevel of 0 - which the
+    /// camera pass treats as invisible. Every test passed, because every test built its parts
+    /// fully populated. Only the running game holds the state that breaks it, so the check
+    /// belongs there. It costs one vanilla sweep over one pool every N sweeps; at the default
+    /// and ~290 sweeps a frame that is well under one pool per frame.
+    ///
+    /// 0 (off) by default since 1.42.0: the bug it was built for is fixed and confirmed fixed in
+    /// the field, and a permanent second opinion on a sweep the benchmark already checks 3120
+    /// ways is the same kind of always-on measurement this release is removing everywhere else.
+    /// '.komet toggle cullcheck' arms it again without a restart, which is what to do the
+    /// moment anything flickers.
+    /// </summary>
+    public int VerifyCullSweepEvery { get; set; }
+
+    /// <summary>
+    /// Attribute each render stage's time to the individual renderers inside it, so the HUD
+    /// can name what is actually expensive instead of only which stage.
+    ///
+    /// OFF by default since 1.42.0, and the reason is the mod's own headline number. Every
+    /// registered renderer is replaced by a timing decorator, and "roughly fifty renderers a
+    /// frame" - what this comment used to say - is wrong by two orders of magnitude: at view
+    /// distance 1536 the client holds around ten thousand renderer instances, nearly all of
+    /// them block entities. That is ten thousand extra interface dispatches and cache misses
+    /// on EVERY frame, plus two Stopwatch reads apiece on the sampled quarter, plus a linear
+    /// scan of the stage's renderer list every time an unloading block entity unregisters
+    /// itself. All of it is measurement, none of it draws anything, and it is on the same side
+    /// of the ledger as everything this mod removes - it even inflates the frame it reports.
+    ///
+    /// It is still the sharpest tool here when a specific renderer is suspect (it found the
+    /// firepit), so it turns on live with '.komet toggle profiler' and the stress test has a
+    /// phase for it. Turn it on to answer a question, then turn it off again.
+    /// </summary>
+    public bool ProfileRenderers { get; set; }
+
+    /// <summary>
+    /// Keep the Before render stage's renderers timed every frame even while the full
+    /// profiler is off. That stage holds only a handful of system renderers (entity
+    /// preparation, chunk mesh uploads, the liquid depth pre-pass, camera, ambient - plus
+    /// whatever other mods put there), so the cost is a few microseconds - but it is where
+    /// the repeated unattributed world-join bursts (60-87 ms of "before" with no GC) live,
+    /// and a hitch line that can say "renderer Before-ree 60 ms" beats one that cannot.
+    /// The full profiler stays available via '.komet toggle profiler' as before.
+    /// </summary>
+    public bool AttributeBeforeStage { get; set; } = true;
+
+    /// <summary>
+    /// Transcribe SystemRenderEntities.OnBeforeRender with clocks around its two halves
+    /// (EntityRenderer.BeforeRender for visible entities, AnimManager.OnClientFrame for all)
+    /// and keep the frame's most expensive entity, so a "before 19 ms | renderer Before-ree"
+    /// hitch names animation or tesselation and the entity. Also the carrier of the
+    /// animation LOD below. Off = vanilla's loop, untouched.
+    /// </summary>
+    public bool AttributeEntityBeforeStage { get; set; } = true;
+
+    /// <summary>
+    /// Time every main-thread task (ClientMain.ExecuteMainThreadTasks: every non-chunk server
+    /// packet runs there - entity loads, block updates, attribute syncs) so a "draussen"
+    /// hitch names its heaviest task code ("tasks 9,1 (readpacket33 8,2)") and the report
+    /// lists the codes by cost. Two Stopwatch reads per task; the drain itself is a 1:1
+    /// transcription. '.komet toggle mtt' hands the drain back to vanilla.
+    /// </summary>
+    public bool AttributeMainThreadTasks { get; set; } = true;
+
+    /// <summary>
+    /// Wrap the client's game tick listeners (a few dozen system and mod listeners; never
+    /// the thousands of block entity ticks) in timing delegates, so a "tick" hitch names its
+    /// listener and the report ranks them. Stands down automatically while the engine's own
+    /// tick profiler (extendedDebugInfo) is on. '.komet toggle tickprofiler'.
+    /// </summary>
+    public bool ProfileTickListeners { get; set; } = true;
+
+    /// <summary>
+    /// Attribute what is measured to the MOD it came from, and collect what each mod does
+    /// (Harmony patches, registered block/item/entity classes, time spent in its load phases).
+    ///
+    /// It rides on the two profilers that already exist: each renderer and tick listener
+    /// wrapper resolves its owning mod once when it is wrapped and books its ticks into that
+    /// mod's bucket as well, so the per-frame price is one field add per measured call. What it
+    /// costs on top of that is a periodic scan of Harmony's registry and the class registry
+    /// (every ten seconds, like the patch guard's) and a prefix/postfix pair around the mod
+    /// loader's phase call, which runs a few hundred times per session.
+    ///
+    /// Read the caveats on the HUD, not just the numbers: a Harmony patch runs inside the
+    /// engine method it patches, so its time is booked to the engine - which is why the patch
+    /// COUNT is reported next to the milliseconds.
+    /// </summary>
+    public bool ProfileMods { get; set; } = true;
+
+    /// <summary>
+    /// Count every chunk dirty-mark, so the HUD can show marks per second and how many of them
+    /// are edge-only. Three interlocked increments per mark; keep this on.
+    /// </summary>
+    public bool MeasureRetessSources { get; set; } = true;
+
+    /// <summary>
+    /// Additionally capture a stack for every 8th mark, so '.komet retess' can rank WHO keeps
+    /// marking chunks dirty. Built for the settled-scene mystery of ~112 chunks/s re-tesselating
+    /// at an empty queue, and it answered it.
+    ///
+    /// OFF by default since 1.42.0: resolving a captured frame's method metadata costs tens of
+    /// microseconds, and while chunks stream in the marks arrive at thousands per second
+    /// (measured 7244/s), so this was ~900 captures a second on the very threads doing the
+    /// loading. '.komet toggle retess' switches it on while the question is open.
+    /// </summary>
+    public bool SampleRetessSources { get; set; }
+
+    /// <summary>
     /// Allocation attribution for the client's own worker threads (tesselation, network,
     /// relight, compress, chunk visibility, culling, block ticks, particles - one bracket
     /// around each thread's tick) and for every TyronThreadPool task by its caller name. Pure
@@ -801,243 +1298,22 @@ public class KometConfig
     /// </summary>
     public bool AllocSampling { get; set; } = true;
 
-    /// <summary>
-    /// Milliseconds to collect edge-only re-tesselation marks before issuing one per chunk.
-    /// Every arriving chunk marks its six neighbours edge-only, so while a neighbourhood
-    /// streams in packet by packet the same border chunk is re-meshed up to six times
-    /// (measured: 6322 of 7244 marks/s were edge-only during loading). Coalescing turns
-    /// that into one rebuild per chunk per window. Full marks, priority, relight and block
-    /// changes are never delayed.
-    ///
-    /// OFF by default (0) since 1.36.0, by the same rule that retired the sun-query
-    /// throttle: the stress test measured it at -0,12 ms (a small COST, not a saving), and
-    /// it was prime suspect twice for visible holes along water chunk borders on fresh
-    /// terrain - the edge repair of an early-meshed chunk already waits behind thousands
-    /// of full tesselations, and this window stretches that visible gap further. The
-    /// tesselation-thread relief (hundreds of thousands of absorbed rebuilds) never showed
-    /// up as frame time. '.komet toggle edgecoal' enables it live for experiments.
-    /// </summary>
-    public double EdgeRetessCoalesceMs { get; set; }
+    /// <summary>Show the on-screen performance overlay right away. Toggle in game with F7.</summary>
+    public bool DebugHudVisible { get; set; }
+
+    /// <summary>Show the mod profiler overlay right away. It sits in the opposite screen corner
+    /// from the performance HUD; Shift+F7 (or '.komet mods hud') cycles it off / compact / full.
+    /// Shift+F7 rather than a key of its own: this mod already owns F7, and the keys that look
+    /// unused are not.</summary>
+    public bool ModHudVisible { get; set; }
 
     /// <summary>
-    /// Move edge-only re-tesselation marks to the front of the tesselation queue, so visible
-    /// border holes close before invisible new chunks mesh.
-    ///
-    /// On fresh terrain a chunk at the load front is meshed before its neighbour arrives, so
-    /// the shared face is culled against the unknown - a visible hole, most obvious on the
-    /// ocean surface. The engine's repair mark waits at the BACK of the queue, behind
-    /// thousands of full tesselations of chunks nobody can see yet (~5 s at the measured
-    /// 371 chunks/s). Promoting the repair changes only WHEN it runs, never what it produces:
-    /// each promoted entry is work vanilla had already queued, handed to the same consumer.
-    /// Capped so player block edits are never buried (at most 64 promotions per 50 ms, none
-    /// while the priority queue is already busy). '.komet toggle edgeprio' flips it live -
-    /// the A/B is judged by eye at the load front, not by frame time.
+    /// Raster the HUD text on a worker thread instead of inside the frame. The full rebuild
+    /// (cairo raster included) used to land in a single ortho frame - a field log booked it
+    /// as "hud 3,0 / 7,7" hitch shares. Off: the old synchronous path, also the automatic
+    /// fallback if cairo refuses the worker thread. '.komet toggle hudraster' flips it live.
     /// </summary>
-    public bool EdgeRetessPriority { get; set; } = true;
-
-    /// <summary>
-    /// Count every chunk dirty-mark, so the HUD can show marks per second and how many of them
-    /// are edge-only. Three interlocked increments per mark; keep this on.
-    /// </summary>
-    public bool MeasureRetessSources { get; set; } = true;
-
-    /// <summary>
-    /// Additionally capture a stack for every 8th mark, so '.komet retess' can rank WHO keeps
-    /// marking chunks dirty. Built for the settled-scene mystery of ~112 chunks/s re-tesselating
-    /// at an empty queue, and it answered it.
-    ///
-    /// OFF by default since 1.42.0: resolving a captured frame's method metadata costs tens of
-    /// microseconds, and while chunks stream in the marks arrive at thousands per second
-    /// (measured 7244/s), so this was ~900 captures a second on the very threads doing the
-    /// loading. '.komet toggle retess' switches it on while the question is open.
-    /// </summary>
-    public bool SampleRetessSources { get; set; }
-
-    /// <summary>
-    /// Main-thread milliseconds per frame that entity shape (re-)tesselations may take;
-    /// anything beyond is deferred to the following frames (the entity keeps drawing its old
-    /// mesh, a brand-new one appears a few frames later - vanilla already has that async gap).
-    ///
-    /// This is the look-around stutter: BeforeRender tesselates a stale entity shape only
-    /// once it enters the frustum, so turning the camera across a freshly streamed area runs
-    /// the expensive main-thread half (shape clone, clothing/armor StepParentShape, texture
-    /// baking with atlas uploads) for many entities in one frame - measured 12-39 ms spikes
-    /// at 600-1000 grad/s. At least one tesselation per frame always runs, so nothing
-    /// starves. The player's own renderer is structurally unaffected. 0 = vanilla.
-    /// </summary>
-    public double EntityTesselationBudgetMs { get; set; } = 2.0;
-
-    /// <summary>
-    /// Main-thread milliseconds per frame for FINISHING entity loads - Initialize (behaviours,
-    /// animator), chunk registration, renderer creation - nearest entity first. Entities reach
-    /// the client one packet per entity as the server starts tracking them (200 ms batches,
-    /// hundreds at a world join), and each packet used to do all of that at once inside the
-    /// main-thread task drain: a "draussen" burst with an allocation spike behind it. Now the
-    /// cheap half (create + deserialise, which yields the position) runs on arrival and the
-    /// rest is held in distance bins and finished at the frame boundary under this budget,
-    /// at least two per frame (liveness). Any other packet naming a held entity finishes it
-    /// on the spot, so nothing observable changes except WHEN a distant entity appears in a
-    /// burst. Hitch lines carry "entload X". 0 = vanilla. '.komet toggle entload' flips it
-    /// live (off flushes everything held).
-    /// </summary>
-    public double EntityLoadBudgetMs { get; set; } = 1.5;
-
-    /// <summary>
-    /// Generate an entity shape's animation frames on a worker thread before the first entity
-    /// of that shape enters the world. The engine builds them lazily on the main thread the
-    /// first time each animation starts - measured against the game's own shape files:
-    /// chicken-rooster 11,9 ms for its 13 animations, "attack" alone 4,7 ms; the report's "anim
-    /// most expensive 53,1 ms (pig)" is that cost on a bigger shape - once per creature type
-    /// per session, always in the frame a new kind of animal first moves. With the load hold in
-    /// place (EntityLoadBudgetMs above 0) the first held entity of a shape starts a worker, the
-    /// entity waits the few milliseconds the worker needs, and the main thread finds the frames
-    /// ready. A shape that is already in use by a loaded entity is never touched off-thread.
-    /// Needs the entity load hold; without it there is no window. '.komet toggle animwarm'.
-    /// </summary>
-    public bool EntityAnimationPrewarm { get; set; } = true;
-
-    /// <summary>
-    /// Time every main-thread task (ClientMain.ExecuteMainThreadTasks: every non-chunk server
-    /// packet runs there - entity loads, block updates, attribute syncs) so a "draussen"
-    /// hitch names its heaviest task code ("tasks 9,1 (readpacket33 8,2)") and the report
-    /// lists the codes by cost. Two Stopwatch reads per task; the drain itself is a 1:1
-    /// transcription. '.komet toggle mtt' hands the drain back to vanilla.
-    /// </summary>
-    public bool AttributeMainThreadTasks { get; set; } = true;
-
-    /// <summary>
-    /// Wrap the client's game tick listeners (a few dozen system and mod listeners; never
-    /// the thousands of block entity ticks) in timing delegates, so a "tick" hitch names its
-    /// listener and the report ranks them. Stands down automatically while the engine's own
-    /// tick profiler (extendedDebugInfo) is on. '.komet toggle tickprofiler'.
-    /// </summary>
-    public bool ProfileTickListeners { get; set; } = true;
-
-    /// <summary>
-    /// Main-thread milliseconds per 20 ms tick the minimap may spend uploading freshly
-    /// generated map pieces; the per-tick piece cap adapts around it (halves when a tick
-    /// overran, doubles up to vanilla's 200 when it had room). The tick profiler's first field
-    /// report named this the dominant hitch bucket of a join flood: WorldMapManager.OnClientTick
-    /// at 2,5-8,5 ms, from hundreds of texture uploads and framebuffer draws per tick while
-    /// chunks stream in. Pieces are never dropped, only spread over the following ticks; an
-    /// opened world map on an idle frame still fills at vanilla speed. 0 = vanilla.
-    /// '.komet toggle minimap' flips it live.
-    /// </summary>
-    public double MinimapPieceBudgetMs { get; set; } = 1.0;
-
-    /// <summary>
-    /// Compose minimap pieces into their 96x96 component texture with a direct sub-image
-    /// upload instead of vanilla's per-piece framebuffer draw (FBO created and destroyed per
-    /// component per tick, staging texture with mipmaps, shader switch, quad draw). The
-    /// second 02.09. report showed the piece cap pinned at 8 and still 1,14 ms per tick -
-    /// 0,14 ms per 4 KB image. Pixels land on the same rows and columns (the texture2texture
-    /// shader does not flip). '.komet toggle minimapdirect' flips it live.
-    /// </summary>
-    public bool MinimapDirectUpload { get; set; } = true;
-
-    /// <summary>
-    /// Main-thread milliseconds per frame the task drain (ClientMain.ExecuteMainThreadTasks:
-    /// every server packet that is not chunk data, plus chunk installs) may run before the
-    /// remainder goes back to the front of the queue with vanilla's own requeue - order is
-    /// kept, nothing is dropped. The 02.09. report had "draussen 17,7 | tasks 16,9 (loadchunk
-    /// 16,8)": a whole batch of chunk installs in one frame. At least 8 tasks always run, the
-    /// budget stretches with the backlog and is ignored above 4096 waiting tasks. Needs
-    /// AttributeMainThreadTasks (the transcribed drain). 0 = vanilla (drain everything).
-    /// '.komet toggle taskbudget' flips it live.
-    /// </summary>
-    public double MainThreadTaskBudgetMs { get; set; } = 3.0;
-
-    /// <summary>
-    /// Measure the integrated server's allocation per thread and per suspect (worldgen,
-    /// chunk packets, entity simulation, physics, database loads) so the report's
-    /// alloc-quellen line names what used to be "rest" - in the 02.09. join floods 193 of
-    /// 279 MB/s, behind 35 gen0 collections per second and 52 of 54 hitches. Measurement
-    /// only; singleplayer only (a remote server is not this process).
-    /// </summary>
-    public bool ServerAllocAttribution { get; set; } = true;
-
-    /// <summary>
-    /// Transcribe SystemRenderEntities.OnBeforeRender with clocks around its two halves
-    /// (EntityRenderer.BeforeRender for visible entities, AnimManager.OnClientFrame for all)
-    /// and keep the frame's most expensive entity, so a "before 19 ms | renderer Before-ree"
-    /// hitch names animation or tesselation and the entity. Also the carrier of the
-    /// animation LOD below. Off = vanilla's loop, untouched.
-    /// </summary>
-    public bool AttributeEntityBeforeStage { get; set; } = true;
-
-    /// <summary>
-    /// Animate entities that are only shadow-rendered (outside the view frustum, inside the
-    /// shadow frustum - most loaded entities at 255 blocks of shadow range) every third frame
-    /// and rendered entities beyond EntityAnimationFarBlocks every second frame, each time
-    /// with the skipped frames' dt folded in: animation time runs exactly as before, sampled
-    /// less often. Own player, near entities and dead ones are always at full rate. Needs
-    /// AttributeEntityBeforeStage. '.komet toggle animlod' flips it live.
-    /// </summary>
-    public bool EntityAnimationLod { get; set; } = true;
-
-    /// <summary>Horizontal distance in blocks beyond which a rendered entity animates
-    /// every second frame (at 86 fps: 43 Hz, on a creature a few pixels tall).</summary>
-    public double EntityAnimationFarBlocks { get; set; } = 48;
-
-    /// <summary>
-    /// Replace the engine MeshDataRecycler's storage with a size-class pool behind the same
-    /// API. The vanilla storage discards usable buffers two ways that peak exactly while
-    /// chunks stream in (one mesh per size key - the fifth same-size buffer of a burst is
-    /// thrown away; and a get only accepts a fit within 25 %), which feeds the measured
-    /// ~380 MB/s of tesselation-thread allocation behind the GC-pause hitches while loading.
-    /// Mesh content is byte-identical either way - CloneUsingRecycler copies into whatever
-    /// buffer comes back - this only changes which buffer that is. The HUD/report row
-    /// "mesh-recycler" shows the hit rate and the fresh-allocation rate either way it is
-    /// answered. '.komet toggle recycler' flips it live.
-    /// </summary>
-    public bool FastMeshRecycler { get; set; } = true;
-
-    /// <summary>
-    /// Upper bound in MB on the buffers the replacement pool keeps for reuse. Vanilla's own
-    /// storage holds 300-400 MB for the same purpose (its class comment says so), so the
-    /// default is not new memory - it is the same reserve with the eviction actually enforced
-    /// (oldest first, 15 s idle TTL).
-    /// </summary>
-    public int MeshRecyclerBudgetMb { get; set; } = 384;
-
-    /// <summary>
-    /// Make MeshData.CloneExtraData copy content instead of capacity. The engine clones a
-    /// mesh's custom data parts with Values.Clone() - the FULL backing array. Chunk part
-    /// clones copy from the tesselator's accumulation buffers, which grow to the high-water
-    /// of the biggest chunk ever meshed and mostly carry CustomInts nobody wrote to - so
-    /// every chunk paid high-water-sized copies of zeroes: measured 217 of 255 MB/s on the
-    /// tesselation thread with the mesh recycler already at 100% hits. Uploads are driven by
-    /// Count, not array length, so the only observable change is the garbage that no longer
-    /// exists. Report row "klon-kompakt"; '.komet toggle tightclone' flips it live.
-    /// </summary>
-    public bool TightCustomClones { get; set; } = true;
-
-    /// <summary>
-    /// Recycle the per-face extras and custom-part value arrays of chunk part clones through
-    /// a size-class pool instead of allocating them fresh per part. The mesh recycler keeps a
-    /// part's basic arrays alive between tesselations; these were the remaining fresh
-    /// allocations in that path (~18 MB/s "klone" while streaming), and the worst kind for
-    /// the collector - born on the tesselation thread, promoted while the part waits in the
-    /// upload queue, dead on the render thread. Rented in CloneExtraData, returned by a
-    /// postfix on TesselatedChunkPart.AddToPools after the upload disposed the mesh. Exact:
-    /// nothing in the engine reads these arrays' Length as a count. Report row "extras-pool";
-    /// '.komet toggle extrapool' flips it live.
-    /// </summary>
-    public bool PoolMeshExtras { get; set; } = true;
-
-    /// <summary>
-    /// Skip AnimatableRenderer.OnRenderFrame (animated block entities: windmills, pulverizers,
-    /// bellows, swinging doors, modded machines) when the mesh's bounding sphere lies entirely
-    /// outside the frustum of the stage being rendered - the camera frustum in Opaque/OIT, the
-    /// light box in the two shadow stages. Vanilla runs every active instance in four stages
-    /// with a shader switch, a chunk light lookup, ~15 uniforms, a UBO update and a draw, with
-    /// no distance or visibility test at all (its RenderRange is never read by the engine).
-    /// Exact by construction: only geometry that could not produce a fragment is skipped, and
-    /// an idle instance already returns before its first GL call, so no successor renderer
-    /// can depend on this one's GL state. HUD/report row "animatable-gate";
-    /// '.komet toggle animcull' flips it live; safemode switches it off.
-    /// </summary>
-    public bool CullAnimatableRenderers { get; set; } = true;
+    public bool HudBackgroundRaster { get; set; } = true;
 
     /// <summary>
     /// A frame is booked as a hitch (HUD row "ruckler", '.komet hitch', one log line) when it
@@ -1054,4 +1330,5 @@ public class KometConfig
 
     /// <summary>Log a one line summary of the culling statistics every N seconds. 0 disables.</summary>
     public int StatsLogIntervalSeconds { get; set; }
+
 }

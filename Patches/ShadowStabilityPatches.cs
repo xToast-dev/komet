@@ -37,6 +37,16 @@ public static class ShadowStabilityPatches
     /// <summary>Snap offsets applied, so the HUD can show that it is doing something.</summary>
     public static long StatSnaps;
 
+    /// <summary>
+    /// Whether the patch is in place at all - komet.json can leave it out, and then the flag
+    /// above switches nothing.
+    ///
+    /// The toggle used to answer that question with <see cref="StatSnaps"/> == 0, which is also
+    /// true for the first frame after switching it ON: turning it on reported "patch not
+    /// installed" every time, on a build where it was installed and about to work.
+    /// </summary>
+    public static bool Installed { get; private set; }
+
     private static readonly AccessTools.FieldRef<SystemRenderShadowMap, double[]> LightViewRef =
         AccessTools.FieldRefAccess<SystemRenderShadowMap, double[]>("lightViewMatrix");
     private static readonly AccessTools.FieldRef<ClientSystem, ClientMain> GameRef =
@@ -58,6 +68,7 @@ public static class ShadowStabilityPatches
 
         harmony.Patch(ortho, postfix: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowStabilityPatches), nameof(SnapToTexelGrid))));
+        Installed = true;
         Enabled = true;
     }
 

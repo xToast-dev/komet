@@ -6,7 +6,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>Komet</AssemblyName>
     <RootNamespace>Komet</RootNamespace>
-    <Version>1.2.0-pre.4</Version>
+    <Version>1.2.0</Version>
     <!-- Build stamp: the minute this DLL was compiled, carried in the InformationalVersion and
          shown next to the version in HUD, report and chat line (see Measure/KometVersion.cs).
          Computed here rather than kept in a file, so it can never disagree with the binary. -->
@@ -40,9 +40,16 @@
     <Compile Remove="KometBaseline/**" />
     <Compile Remove="bench/**" />
     <Compile Remove="verify/**" />
+    <Compile Remove="alloctool/**" />
     <Compile Remove="_analysis/**" />
     <Compile Remove="**/bin/**" />
     <Compile Remove="**/obj/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Self-attached EventPipe capture for '.komet alloctrace' (allocation ticks with stacks).
+         Pure managed, no native parts; shipped next to Komet.dll in the release zip. -->
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.731102" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,8 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.Text;
 using Komet.Culling;
 using Komet.Guard;
 using Komet.Measure;
+using Komet.Patches;
 using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -42,129 +46,198 @@ public partial class KometModSystem
 
     private void RegisterCommands(ICoreClientAPI api)
     {
-        api.ChatCommands.Create("komet")
-            .WithDescription(Loc.T("komet:cmd-root", "Vintage Story performance patches: status and counters"))
-            .BeginSubCommand("hud")
-                .WithDescription(Loc.T("komet:cmd-hud", "Toggle the on-screen performance overlay (same as F7)"))
-                .HandleWith(_ =>
-                {
-                    hud.Visible = !hud.Visible;
-                    return TextCommandResult.Success(hud.Visible
-                        ? Loc.T("komet:msg-hud-on", "HUD on (F7 toggles)")
-                        : Loc.T("komet:msg-hud-off", "HUD off"));
-                })
-            .EndSubCommand()
-            .BeginSubCommand("stats")
-                .WithDescription(Loc.T("komet:cmd-stats", "Show what the culling patch has been doing since the last reset"))
-                .HandleWith(_ => TextCommandResult.Success(LoggedStats()))
-            .EndSubCommand()
-            .BeginSubCommand("hitch")
-                .WithDescription(Loc.T("komet:cmd-hitch", "Hitch log: every frame over the threshold with its cause and the camera movement. 'reset' clears it"))
-                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
-                .HandleWith(args =>
-                {
-                    if (string.Equals(args[0] as string, "reset", System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        HitchLog.Reset();
-                        return TextCommandResult.Success(Loc.T("komet:msg-hitch-cleared", "hitch log cleared."));
-                    }
-                    var report = HitchLog.BuildReport();
-                    Mod.Logger.Notification("hitch report:\n{0}", report);
-                    return TextCommandResult.Success(report);
-                })
-            .EndSubCommand()
-            .BeginSubCommand("report")
-                .WithDescription(Loc.T("komet:cmd-report", "Everything at once: environment, settings that differ from the default, frame breakdown, hitch log. Lands as one block in client-main.log"))
-                .HandleWith(_ =>
-                {
-                    var report = BuildFullReport();
-                    // The log, not the chat: this is several hundred characters wide by design
-                    // and the chat window wraps it into something nobody can copy back out.
-                    Mod.Logger.Notification("full report:\n{0}", report);
-                    return TextCommandResult.Success(
-                        Loc.T("komet:msg-report-written",
-                            "the report is in client-main.log (between '==== komet report ====' and "
-                            + "'==== end ===='). Copy the whole block."));
-                })
-            .EndSubCommand()
-            .BeginSubCommand("toggle")
-                .WithDescription(Loc.T("komet:cmd-toggle", "Turn a single system on or off: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit, entload, entsync ... - for bisecting or A/B measuring"))
-                .WithArgs(api.ChatCommands.Parsers.Word("system"))
-                .HandleWith(args => TextCommandResult.Success(ToggleSystem(args[0] as string)))
-            .EndSubCommand()
-            .BeginSubCommand("shadownear")
-                .WithDescription(Loc.T("komet:cmd-shadownear", "Size of the near shadow cascade's map in pixels (e.g. 4096), 'off' for the engine's; rebuilds the framebuffers live. No argument: show both maps"))
-                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
-                .HandleWith(args => TextCommandResult.Success(HandleShadowNear(args[0] as string)))
-            .EndSubCommand()
-            .BeginSubCommand("stress")
-                .WithDescription(Loc.T("komet:cmd-stress", "Automatic measurement run, drift-proof by interleaving baselines - moving or flying is fine. Optional: seconds per slice (default 2), or 'stop'"))
-                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
-                .HandleWith(args => TextCommandResult.Success(HandleStress(args[0] as string)))
-            .EndSubCommand()
-            .BeginSubCommand("retess")
-                .WithDescription(Loc.T("komet:cmd-retess", "Who marks chunks dirty? Counters and a sampled ranking of the sources. 'reset' clears it"))
-                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
-                .HandleWith(args =>
-                {
-                    if (string.Equals(args[0] as string, "reset", System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        Patches.RetessSourcePatches.Reset();
-                        return TextCommandResult.Success(Loc.T("komet:msg-retess-cleared", "dirty mark counters cleared."));
-                    }
-                    var report = Patches.RetessSourcePatches.BuildReport();
-                    Mod.Logger.Notification("retess report:\n{0}", report);
-                    return TextCommandResult.Success(report);
-                })
-            .EndSubCommand()
-            .BeginSubCommand("conflicts")
-                .WithDescription(Loc.T("komet:cmd-conflicts", "Who patches komet's methods or komet's own code, and does the engine differ from the verified build? Rescans immediately"))
-                .HandleWith(_ =>
-                {
-                    if (!PatchGuard.EngineChecked)
-                        PatchGuard.CheckEngine(Vintagestory.API.Config.GameVersion.LongGameVersion);
-                    PatchGuard.Scan();
-                    var text = PatchGuard.ReportLines();
-                    Mod.Logger.Notification("patch guard:\n{0}", text);
-                    return TextCommandResult.Success(text);
-                })
-            .EndSubCommand()
-            .BeginSubCommand("mods")
-                .WithDescription(Loc.T("komet:cmd-mods", "What the other mods cost per frame and at load, and what they do (patches, registered classes). 'hud' cycles the overlay (same as Shift+F7), 'reset' clears the per-frame figures"))
-                .WithArgs(api.ChatCommands.Parsers.OptionalWord("arg"))
-                .HandleWith(args =>
-                {
-                    var arg = args[0] as string;
-                    if (string.Equals(arg, "hud", StringComparison.OrdinalIgnoreCase))
-                        return TextCommandResult.Success(CycleModHud());
-                    if (string.Equals(arg, "reset", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ModProfiler.Reset();
-                        return TextCommandResult.Success(Loc.T("komet:msg-mods-reset", "per-mod counters cleared."));
-                    }
-                    if (!ModProfiler.Enabled)
-                        return TextCommandResult.Success(Loc.T("komet:msg-mods-off",
-                            "mod profiling is off (ProfileMods in komet.json)."));
+        var root = api.ChatCommands.Create("komet")
+            .WithDescription(Loc.T("komet:cmd-root", "Vintage Story performance patches: status and counters"));
 
-                    // A report is only worth reading with a fresh inventory behind it.
-                    ScanMods();
-                    var sb = new System.Text.StringBuilder(1200);
-                    ModProfiler.Write(sb, System.Globalization.CultureInfo.CurrentCulture, FrameStats.AvgFrameMs,
-                        Patches.RendererProfiler.Enabled, 10);
-                    var text = sb.ToString().TrimEnd('\n');
-                    Mod.Logger.Notification("mod profile:\n{0}", text);
-                    return TextCommandResult.Success(text);
-                })
-            .EndSubCommand()
-            .BeginSubCommand("safemode")
-                .WithDescription(Loc.T("komet:cmd-safemode", "Every optimisation that changes what is drawn, on or off at once - settles in seconds whether a visual glitch comes from komet"))
-                .HandleWith(_ => TextCommandResult.Success(ToggleSafeMode()))
-            .EndSubCommand()
-            .BeginSubCommand("reset")
-                .WithDescription(Loc.T("komet:cmd-reset", "Reset the counters"))
-                .HandleWith(_ => { ResetStats(); return TextCommandResult.Success(Loc.T("komet:msg-counters-reset", "komet counters reset.")); })
-            .EndSubCommand()
-            .HandleWith(_ => TextCommandResult.Success(LoggedStats()));
+        // The help text's key is derived from the subcommand's name, exactly like a HUD label's
+        // (see Loc.Hud): a command and its description cannot end up under different keys, and
+        // adding one cannot forget the entry. The parser shape is the only thing that varies.
+        void Sub(string name, string help, System.Func<string> run)
+            => root.BeginSubCommand(name)
+                   .WithDescription(Loc.T("komet:cmd-" + name, help))
+                   .HandleWith(_ => TextCommandResult.Success(run()))
+                   .EndSubCommand();
+
+        void SubArg(string name, string help, System.Func<string, string> run, bool required = false)
+            => root.BeginSubCommand(name)
+                   .WithDescription(Loc.T("komet:cmd-" + name, help))
+                   .WithArgs(required ? api.ChatCommands.Parsers.Word("system")
+                                      : api.ChatCommands.Parsers.OptionalWord("arg"))
+                   .HandleWith(args => TextCommandResult.Success(run(args[0] as string)))
+                   .EndSubCommand();
+
+        Sub("hud", "Toggle the on-screen performance overlay (same as F7)", CmdHud);
+        Sub("stats", "Show what the culling patch has been doing since the last reset", LoggedStats);
+        SubArg("hitch", "Hitch log: every frame over the threshold with its cause and the camera movement. 'reset' clears it", CmdHitch);
+        Sub("report", "Everything at once: environment, settings that differ from the default, frame breakdown, hitch log. Lands as one block in client-main.log", CmdReport);
+        SubArg("toggle", "Turn a single system on or off: cull, occlusion, reclaim, sunquery, glerror, prebuild, firepit, entload, entsync ... - for bisecting or A/B measuring", ToggleSystem, required: true);
+        SubArg("shadownear", "Size of the near shadow cascade's map in pixels (e.g. 4096), 'off' for the engine's; rebuilds the framebuffers live. No argument: show both maps", HandleShadowNear);
+        SubArg("shadowneardepth", "Cap on the near cascade's depth in blocks (e.g. 80), 'off' for the engine's 150-200. The one number that sets how much geometry the near shadow pass draws", HandleShadowNearDepth);
+        SubArg("alloctrace", "Records where the game allocates, with call stacks, for N seconds (default 20) into a .nettrace next to the logs - for the repository's alloctool", HandleAllocTrace);
+        SubArg("farmesh", "Distance in blocks beyond which the far LOD picture replaces the engine's mesh (e.g. 500), 'off' or 'on' for the switch, no argument for the state. 0 = the default rule (0.35 x view distance, at least 400)", HandleFarMesh);
+        SubArg("shadowfoliagerange", "Range in blocks beyond which leaves and plants cast no shadow (e.g. 100), 'off' for the cascade's own. The largest single GPU item there is", HandleShadowFoliageRange);
+        SubArg("foliagerange", "Range in blocks beyond which leaves and plants are not drawn (e.g. 600), 'off' for the view distance. Priced by the report's triangles-by-distance rows", HandleFoliageRange);
+        SubArg("shadownearskip", "How many frames the near shadow cascade is drawn in (1 = every frame). Live, so the GPU stage line prices it within a minute", HandleShadowNearSkip);
+        SubArg("stress", "Automatic measurement run, drift-proof by interleaving baselines - moving or flying is fine. Optional: seconds per slice (default 2), or 'stop'", HandleStress);
+        SubArg("retess", "Who marks chunks dirty? Counters and a sampled ranking of the sources. 'reset' clears it", CmdRetess);
+        Sub("conflicts", "Who patches komet's methods or komet's own code, and does the engine differ from the verified build? Rescans immediately", CmdConflicts);
+        SubArg("mods", "What the other mods cost per frame and at load, and what they do (patches, registered classes). 'hud' cycles the overlay (same as Shift+F7), 'reset' clears the per-frame figures", CmdMods);
+        Sub("safemode", "Every optimisation that changes what is drawn, on or off at once - settles in seconds whether a visual glitch comes from komet", ToggleSafeMode);
+        Sub("reset", "Reset the counters", CmdReset);
+        Sub("gui", "Open the performance window (same as '.komet' with no argument, or Ctrl+F7)", OpenOverview);
+
+        // '.komet' with no argument opens the window. It used to print the counters, and
+        // that text has not gone anywhere - it is '.komet stats', which is also what the
+        // window's own views are built from.
+        root.HandleWith(_ => TextCommandResult.Success(OpenOverview()));
+    }
+
+    /// <summary>'.komet hud': the same flip F7 does.</summary>
+    private string CmdHud()
+    {
+        hud.Visible = !hud.Visible;
+        return hud.Visible
+            ? Loc.T("komet:msg-hud-on", "HUD on (F7 toggles)")
+            : Loc.T("komet:msg-hud-off", "HUD off");
+    }
+
+    private string OpenOverview() => OpenWindow(Gui.KometView.Overview);
+
+    // ---- the commands, as methods -----------------------------------------------------
+    // Each of these used to be a lambda inside the registration above. They are methods now
+    // for one reason: the window's buttons call them. A button that reimplemented "generate a
+    // report" or "clear the hitch log" would be a second implementation to keep in agreement
+    // with the first, and the first is the one people paste into bug reports.
+
+    /// <summary>'.komet hitch [reset]'.</summary>
+    internal string CmdHitch(string arg)
+    {
+        if (string.Equals(arg, "reset", StringComparison.OrdinalIgnoreCase))
+        {
+            HitchLog.Reset();
+            return Loc.T("komet:msg-hitch-cleared", "hitch log cleared.");
+        }
+
+        var report = HitchLog.BuildReport();
+        Mod.Logger.Notification("hitch report:\n{0}", report);
+        return report;
+    }
+
+    /// <summary>'.komet report': the whole thing into the log, and a pointer to it in the chat.</summary>
+    internal string CmdReport()
+    {
+        var report = BuildFullReport();
+        // The log, not the chat: this is several hundred characters wide by design and the
+        // chat window wraps it into something nobody can copy back out.
+        Mod.Logger.Notification("full report:\n{0}", report);
+        return Loc.T("komet:msg-report-written",
+            "the report is in client-main.log (between '==== komet report ====' and "
+            + "'==== end ===='). Copy the whole block.");
+    }
+
+    /// <summary>The report itself, for the window's page and its copy button.</summary>
+    internal string ReportText() => BuildFullReport();
+
+    /// <summary>'.komet retess [reset]'.</summary>
+    internal string CmdRetess(string arg)
+    {
+        if (string.Equals(arg, "reset", StringComparison.OrdinalIgnoreCase))
+        {
+            RetessSourcePatches.Reset();
+            return Loc.T("komet:msg-retess-cleared", "dirty mark counters cleared.");
+        }
+
+        var report = RetessSourcePatches.BuildReport();
+        Mod.Logger.Notification("retess report:\n{0}", report);
+        return report;
+    }
+
+    /// <summary>'.komet conflicts': rescan, then the guard's lines.</summary>
+    internal string CmdConflicts()
+    {
+        if (!PatchGuard.EngineChecked)
+            PatchGuard.CheckEngine(Vintagestory.API.Config.GameVersion.LongGameVersion);
+        PatchGuard.Scan();
+        var text = PatchGuard.ReportLines();
+        Mod.Logger.Notification("patch guard:\n{0}", text);
+        return text;
+    }
+
+    /// <summary>'.komet mods [hud|reset]'.</summary>
+    internal string CmdMods(string arg)
+    {
+        if (string.Equals(arg, "hud", StringComparison.OrdinalIgnoreCase))
+            return CycleModHud();
+        if (string.Equals(arg, "reset", StringComparison.OrdinalIgnoreCase))
+        {
+            ModProfiler.Reset();
+            return Loc.T("komet:msg-mods-reset", "per-mod counters cleared.");
+        }
+
+        var text = ModProfileText(10, rescan: true);
+        if (ModProfiler.Enabled) Mod.Logger.Notification("mod profile:\n{0}", text);
+        return text;
+    }
+
+    /// <summary>
+    /// The per-mod table, for the chat reply and for the window's Mods view.
+    ///
+    /// The chat reply rescans the inventory first, because a table nobody refreshed is a stale
+    /// one and mods patch lazily throughout a session. The window does NOT: it composes several
+    /// times a second, and a scan over every loaded assembly's patches at that rate would be
+    /// this window costing more than the thing it reports. It reads what the ten-second scan
+    /// listener already collected, and its Rescan button forces one.
+    /// </summary>
+    internal string ModProfileText(int count, bool rescan)
+    {
+        if (!ModProfiler.Enabled)
+            return Loc.T("komet:msg-mods-off", "mod profiling is off (ProfileMods in komet.json).");
+
+        if (rescan) ScanMods();
+        var sb = new StringBuilder(1200);
+        ModProfiler.Write(sb, CultureInfo.CurrentCulture, FrameStats.AvgFrameMs,
+            RendererProfiler.Enabled, count);
+        return sb.ToString().TrimEnd('\n');
+    }
+
+    /// <summary>'.komet safemode'.</summary>
+    internal string CmdSafeMode() => ToggleSafeMode();
+
+    /// <summary>'.komet stress [seconds|stop]'.</summary>
+    internal string CmdStress(string arg) => HandleStress(arg);
+
+    /// <summary>'.komet reset'.</summary>
+    internal string CmdReset()
+    {
+        ResetStats();
+        return Loc.T("komet:msg-counters-reset", "komet counters reset.");
+    }
+
+    /// <summary>
+    /// Opens the window, or brings it to the view named. Created on first use rather than at
+    /// world start: a player who never types '.komet' never pays for its existence, and the
+    /// window holds a cairo surface and a GL texture once it does exist.
+    /// </summary>
+    internal string OpenWindow(Gui.KometView view)
+    {
+        if (capi == null) return Loc.T("komet:msg-gui-no-world", "the window needs a world.");
+
+        try
+        {
+            window ??= new Gui.KometDialog(capi, this);
+            return window.OpenAt(view)
+                ? Loc.T("komet:msg-gui-open", "komet window open - Ctrl+F7 or Esc closes it, '.komet stats' prints the same figures as text.")
+                : Loc.T("komet:msg-gui-failed", "the window could not be opened - see client-main.log.");
+        }
+        catch (Exception e)
+        {
+            // A window that will not open must answer in the chat, not throw out of the chat
+            // command dispatcher. The counters are still reachable as text either way.
+            Mod.Logger.Error("could not open the komet window:\n{0}", e);
+            try { window?.TryClose(); } catch { /* it never got far enough to be open */ }
+            window = null;
+            return Loc.T("komet:msg-gui-failed", "the window could not be opened - see client-main.log.");
+        }
     }
 
     /// <summary>
@@ -177,35 +250,206 @@ public partial class KometModSystem
     {
         if (string.IsNullOrWhiteSpace(arg))
             return Loc.T("komet:msg-shadow-maps", "shadow maps: far {0}px, near {1}px ({2}px configured, 0 = as far)",
-                Patches.ShadowResPatches.EffectiveMapSize, Patches.ShadowResPatches.EffectiveNearMapSize,
-                Patches.ShadowResPatches.NearMapSize);
+                ShadowResPatches.EffectiveMapSize, ShadowResPatches.EffectiveNearMapSize,
+                ShadowResPatches.NearMapSize);
 
-        int size;
-        if (string.Equals(arg, "off", System.StringComparison.OrdinalIgnoreCase)
-            || string.Equals(arg, "far", System.StringComparison.OrdinalIgnoreCase))
-            size = 0;
-        else if (!int.TryParse(arg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out size)
-                 || size < Patches.ShadowResPatches.NearMapMin || size > Patches.ShadowResPatches.NearMapMax)
+        // 'far' is a second spelling of 'off' here: 0 means the near map follows the far one
+        if (string.Equals(arg, "far", StringComparison.OrdinalIgnoreCase)) arg = "off";
+        if (!TryValue(arg, ShadowResPatches.NearMapMin, ShadowResPatches.NearMapMax, out var px))
             return Loc.T("komet:msg-shadownear-arg", "give a size in pixels (512-16384) or 'off'");
+        var size = (int)px;
 
         var platform = capi?.World is Vintagestory.Client.NoObf.ClientMain game
             ? game.Platform as Vintagestory.Client.NoObf.ClientPlatformWindows
             : null;
-        var result = Patches.ShadowResPatches.TryResizeNear(platform, size);
+        var result = ShadowResPatches.TryResizeNear(platform, size);
         Mod.Logger.Notification("shadownear {0}: {1}", arg, result);
+        return result;
+    }
+
+    /// <summary>
+    /// The argument shape most of the live-tuning commands share: a number inside a range, or
+    /// 'off' for zero. Returns false when the word is neither, so the caller answers with its
+    /// own "give a ... " line - the ranges and the wording differ per command, the parsing
+    /// does not. Invariant culture on purpose: a command argument is typed, not localised.
+    /// </summary>
+    private static bool TryValue(string arg, double min, double max, out double value)
+    {
+        if (string.Equals(arg, "off", StringComparison.OrdinalIgnoreCase)) { value = 0; return true; }
+        return double.TryParse(arg, NumberStyles.Float, CultureInfo.InvariantCulture, out value)
+               && value >= min && value <= max;
+    }
+
+    /// <summary>'.komet shadowfoliagerange [blocks|off]': how far foliage casts, live.</summary>
+    private string HandleShadowFoliageRange(string arg)
+    {
+        var ci = CultureInfo.CurrentCulture;
+        if (string.IsNullOrWhiteSpace(arg))
+            return FastCuller.ShadowFoliageRangeSq > 0
+                ? Loc.T("komet:msg-shadowfoliagerange", "leaves and plants cast a shadow to {0} blocks",
+                    Math.Sqrt(FastCuller.ShadowFoliageRangeSq).ToString("F0", ci))
+                : Loc.T("komet:msg-shadowfoliagerange-off", "leaves and plants cast to the cascade's own range (vanilla)");
+
+        if (!TryValue(arg, 16, 4096, out var blocks))
+            return Loc.T("komet:msg-shadowfoliagerange-arg", "give a range in blocks (16-4096) or 'off'");
+
+        FastCuller.ShadowFoliageRangeSq = blocks > 0 ? blocks * blocks : 0;
+        var result = blocks > 0
+            ? Loc.T("komet:msg-shadowfoliagerange-set", "leaves and plants cast a shadow to {0} blocks - the gpu row prices it within a minute; look at a distant forest before keeping it", blocks.ToString("F0", ci))
+            : Loc.T("komet:msg-shadowfoliagerange-off", "leaves and plants cast to the cascade's own range (vanilla)");
+        Mod.Logger.Notification("shadowfoliagerange {0}: {1}", arg, result);
+        return result;
+    }
+
+    /// <summary>'.komet foliagerange [blocks|off]': the foliage passes' draw range, live.</summary>
+    private string HandleFoliageRange(string arg)
+    {
+        var ci = CultureInfo.CurrentCulture;
+        if (string.IsNullOrWhiteSpace(arg))
+            return FastCuller.FoliageRangeSq > 0
+                ? Loc.T("komet:msg-foliagerange", "foliage drawn to {0} blocks (leaves and plants; the terrain to the view distance)",
+                    Math.Sqrt(FastCuller.FoliageRangeSq).ToString("F0", ci))
+                : Loc.T("komet:msg-foliagerange-off", "foliage drawn to the view distance (vanilla)");
+
+        if (!TryValue(arg, 32, 4096, out var blocks))
+            return Loc.T("komet:msg-foliagerange-arg", "give a range in blocks (32-4096) or 'off'");
+
+        FastCuller.FoliageRangeSq = blocks > 0 ? blocks * blocks : 0;
+        var result = blocks > 0
+            ? Loc.T("komet:msg-foliagerange-set", "foliage drawn to {0} blocks - trees beyond it are trunks; the report's triangle rows price it", blocks.ToString("F0", ci))
+            : Loc.T("komet:msg-foliagerange-off", "foliage drawn to the view distance (vanilla)");
+        Mod.Logger.Notification("foliagerange {0}: {1}", arg, result);
+        return result;
+    }
+
+    /// <summary>'.komet alloctrace [seconds]': the process records its own allocations with stacks.</summary>
+    private string HandleAllocTrace(string arg)
+    {
+        var seconds = 20;
+        if (!string.IsNullOrWhiteSpace(arg)
+            && (!int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out seconds)
+                || seconds < 3 || seconds > 300))
+            return Loc.T("komet:msg-alloctrace-arg", "give a duration in seconds (3-300), default 20");
+
+        var api = capi;
+        var path = AllocTrace.Start(seconds, Vintagestory.API.Config.GamePaths.Logs, result =>
+        {
+            Mod.Logger.Notification("alloctrace: {0}", result);
+            api?.Event.EnqueueMainThreadTask(() => api.ShowChatMessage("[komet] " + result), "komet-alloctrace");
+        });
+        if (path == null)
+            return Loc.T("komet:msg-alloctrace-fail", "allocation trace not started: {0}", AllocTrace.LastError);
+        Mod.Logger.Notification("alloctrace: recording {0} s to {1}", seconds, path);
+        return Loc.T("komet:msg-alloctrace-start", "recording allocations with stacks for {0} s - keep doing what hitches; the file lands next to the logs", seconds);
+    }
+
+    /// <summary>'.komet farmesh [blocks|off|on]': the far LOD's distance and switch, live.</summary>
+    private string HandleFarMesh(string arg)
+    {
+        var ci = CultureInfo.CurrentCulture;
+        string State()
+        {
+            if (!FarMeshPatches.Installed)
+                return Loc.T("komet:msg-no-farmesh", "the far lod patch is not installed - FarMesh in komet.json.");
+            if (!FarMesh.Enabled)
+                return Loc.T("komet:msg-farmesh-off", "far lod OFF: every chunk drawn as tesselated, at every distance (vanilla)");
+            var dist = FarMesh.LastEffectiveSq > 0
+                ? Math.Sqrt(FarMesh.LastEffectiveSq).ToString("F0", ci) + (FarMesh.DistanceSq > 0 ? "" : " (default rule)")
+                : "?";
+            return Loc.T("komet:msg-farmesh", "far lod ON beyond {0} blocks ({1} pictures in the pools, {2} engine parts stopped at the distance){3}",
+                dist, FarMeshPatches.TrackedFar, FarMeshPatches.TrackedNear,
+                FarMesh.Active ? "" : Loc.T("komet:msg-farmesh-inactive", " - not drawn right now: the sweep is off"));
+        }
+
+        if (string.IsNullOrWhiteSpace(arg)) return State();
+        if (!FarMeshPatches.Installed) return State();
+
+        if (string.Equals(arg, "off", StringComparison.OrdinalIgnoreCase))
+        {
+            FarMesh.Enabled = false;
+            Mod.Logger.Notification("farmesh off");
+            return State();
+        }
+        if (string.Equals(arg, "on", StringComparison.OrdinalIgnoreCase))
+        {
+            FarMesh.Enabled = true;
+            Mod.Logger.Notification("farmesh on");
+            return State();
+        }
+        if (!double.TryParse(arg, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out var blocks)
+            || blocks < 0 || blocks > 4096)
+            return Loc.T("komet:msg-farmesh-arg", "give a distance in blocks (0 = the default rule, up to 4096), 'off' or 'on'");
+
+        FarMesh.DistanceSq = blocks > 0 ? blocks * blocks : 0;
+        FarMesh.Enabled = true;
+        var result = Loc.T("komet:msg-farmesh-set", "far lod beyond {0} blocks - chunks already in the pools switch on the next frame; the report's 'far lod' row prices it",
+            blocks > 0 ? blocks.ToString("F0", ci) : "the default rule (0,35 of the view distance, at least 400)");
+        Mod.Logger.Notification("farmesh {0}: {1}", arg, result);
+        return result;
+    }
+
+    /// <summary>
+    /// '.komet shadowneardepth [blocks|off]': the near cascade's depth, live. See
+    /// ShadowPatches.NearDepthExtend for what it trades.
+    /// </summary>
+    private string HandleShadowNearDepth(string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+            return Loc.T("komet:msg-shadowneardepth", "near cascade depth: {0} blocks (the engine wants {1})",
+                ShadowPatches.NearExtendUsed.ToString("F0", CultureInfo.CurrentCulture),
+                ShadowPatches.NearExtendVanilla.ToString("F0", CultureInfo.CurrentCulture));
+
+        if (!TryValue(arg, 8, 400, out var blocks))
+            return Loc.T("komet:msg-shadowneardepth-arg", "give a depth in blocks (8-400) or 'off'");
+
+        ShadowPatches.NearDepthExtend = blocks;
+        var result = Loc.T("komet:msg-shadowneardepth-set", "near cascade depth capped at {0} blocks (0 = the engine's)",
+            blocks.ToString("F0", CultureInfo.CurrentCulture));
+        Mod.Logger.Notification("shadowneardepth {0}: {1}", arg, result);
+        return result;
+    }
+
+    /// <summary>
+    /// '.komet shadownearskip [n]': how often the near cascade is drawn, live.
+    ///
+    /// The far cascade has been throttled since 1.43.0 and the near one has not, because it
+    /// covers the ground right around the player where lag is easiest to see. But when a GPU
+    /// report puts the near cascade at twenty of twenty-four milliseconds, halving how often it
+    /// is drawn is the largest single number on the table - and the retained map is reprojected
+    /// exactly for camera movement (ShadowThrottlePatches.OffsetShadowMatrix), so what actually
+    /// goes stale is only what MOVED: entities, and foliage in the wind. This makes that a
+    /// one-command experiment instead of a config edit and a restart.
+    /// </summary>
+    private string HandleShadowNearSkip(string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+            return Loc.T("komet:msg-shadownearskip", "near cascade: drawn every {0} frame(s)",
+                ShadowThrottlePatches.NearInterval);
+
+        if (!int.TryParse(arg, NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var frames)
+            || frames < 1 || frames > 8)
+            return Loc.T("komet:msg-shadownearskip-arg", "give a number of frames (1-8)");
+
+        ShadowThrottlePatches.SetIntervals(ShadowThrottlePatches.FarInterval,
+            frames, ShadowThrottlePatches.FarMaxSkip);
+        var result = Loc.T("komet:msg-shadownearskip", "near cascade: drawn every {0} frame(s)",
+            ShadowThrottlePatches.NearInterval);
+        Mod.Logger.Notification("shadownearskip {0}: {1}", arg, result);
         return result;
     }
 
     private string HandleStress(string arg)
     {
-        if (string.Equals(arg, "stop", System.StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(arg, "stop", StringComparison.OrdinalIgnoreCase))
             return StressTest.Stop("on request");
         if (safeMode)
             return Loc.T("komet:msg-safemode-blocks", "Safemode is on - take it back with '.komet safemode' first, then test.");
 
         double sliceSeconds = 2;
-        if (arg != null && double.TryParse(arg, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+        if (arg != null && double.TryParse(arg, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out var parsed))
             sliceSeconds = parsed;
 
         return StressTest.Start(BuildStressPhases(), sliceSeconds, roundCount: 3, report =>
@@ -220,7 +464,7 @@ public partial class KometModSystem
     /// configured. Baselines are not listed - the scheduler interleaves one before and
     /// after every test slice, which is what makes the deltas drift-proof.
     /// </summary>
-    private System.Collections.Generic.List<StressTest.Phase> BuildStressPhases() => new()
+    private List<StressTest.Phase> BuildStressPhases() => new()
     {
         new StressTest.Phase { Name = "sweep off (vanilla)",
             Enter = () => FastCuller.Enabled = false,
@@ -236,51 +480,51 @@ public partial class KometModSystem
             // never resurrect a feature that disabled itself (validation limit, worker crash)
             Exit = () => WindowPrebuilder.Enabled = config.TesselationWindowPipelining && !WindowPrebuilder.HardDisabled },
         new StressTest.Phase { Name = "firepit gate off",
-            Enter = () => Patches.FirepitPatches.Enabled = false,
-            Exit = () => Patches.FirepitPatches.Enabled = true },
+            Enter = () => FirepitPatches.Enabled = false,
+            Exit = () => FirepitPatches.Enabled = true },
         new StressTest.Phase { Name = "glerror skip on",
-            Enter = () => Patches.GlErrorPatches.SkipEnabled = true,
-            Exit = () => Patches.GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck },
+            Enter = () => GlErrorPatches.SkipEnabled = true,
+            Exit = () => GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck },
         new StressTest.Phase { Name = "sun query every frame",
-            Enter = () => Patches.SunQueryPatches.Interval = 1,
-            Exit = () => Patches.SunQueryPatches.Interval = config.SunOcclusionQueryInterval },
+            Enter = () => SunQueryPatches.Interval = 1,
+            Exit = () => SunQueryPatches.Interval = config.SunOcclusionQueryInterval },
         new StressTest.Phase { Name = "entity tess budget off",
-            Enter = () => Patches.EntityTessPatches.Enabled = false,
-            Exit = () => Patches.EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0 },
+            Enter = () => EntityTessPatches.Enabled = false,
+            Exit = () => EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0 },
         // Off = everything held finishes at once and every packet goes straight to vanilla.
         // Only streaming scenes (join flood, flying) have entity loads to measure.
         // Off = vanilla's 200 pieces per tick; only measurable while the minimap fills.
         new StressTest.Phase { Name = "minimap budget off (200/tick)",
-            Enter = () => Patches.MinimapPatches.Enabled = false,
-            Exit = () => Patches.MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0 },
+            Enter = () => MinimapPatches.Enabled = false,
+            Exit = () => MinimapPatches.Enabled = config.MinimapPieceBudgetMs > 0 },
         new StressTest.Phase { Name = "minimap direct upload off (FBO)",
-            Enter = () => Patches.MinimapPatches.DirectUpload = false,
-            Exit = () => Patches.MinimapPatches.DirectUpload = config.MinimapDirectUpload },
+            Enter = () => MinimapPatches.DirectUpload = false,
+            Exit = () => MinimapPatches.DirectUpload = config.MinimapDirectUpload },
         // Off = vanilla's whole-queue drain; only a streaming scene has bursts to cut.
         new StressTest.Phase { Name = "task budget off",
-            Enter = () => Patches.MainThreadTaskPatches.BudgetMs = 0,
-            Exit = () => Patches.MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs) },
+            Enter = () => MainThreadTaskPatches.BudgetMs = 0,
+            Exit = () => MainThreadTaskPatches.BudgetMs = Math.Max(0, config.MainThreadTaskBudgetMs) },
         // Off = every entity animates every frame, as vanilla; measurable wherever many
         // entities are loaded (a farm, a join flood).
         new StressTest.Phase { Name = "anim lod off",
-            Enter = () => Patches.EntityAnimPatches.LodEnabled = false,
-            Exit = () => Patches.EntityAnimPatches.LodEnabled = config.EntityAnimationLod },
+            Enter = () => EntityAnimPatches.LodEnabled = false,
+            Exit = () => EntityAnimPatches.LodEnabled = config.EntityAnimationLod },
         new StressTest.Phase { Name = "entity load budget off",
-            Enter = () => { Patches.EntityLoadPatches.Enabled = false; Patches.EntityLoadPatches.FlushAll(); },
-            Exit = () => Patches.EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 },
+            Enter = () => { EntityLoadPatches.Enabled = false; EntityLoadPatches.FlushAll(); },
+            Exit = () => EntityLoadPatches.Enabled = config.EntityLoadBudgetMs > 0 },
         // Server side, singleplayer only: fewer position/attribute packets means less for the
         // integrated server to build and the shared GC to collect - a GC-column effect, like
         // the recycler, not a per-frame CPU one.
         new StressTest.Phase { Name = "entity sync tuning off (server)",
-            Enter = () => { Patches.EntitySyncPatches.DistanceSendRate = false; Patches.EntitySyncPatches.TrackingHysteresis = false; },
-            Exit = () => { Patches.EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
-                           Patches.EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning; } },
+            Enter = () => { EntitySyncPatches.DistanceSendRate = false; EntitySyncPatches.TrackingHysteresis = false; },
+            Exit = () => { EntitySyncPatches.DistanceSendRate = config.ServerEntitySyncTuning;
+                           EntitySyncPatches.TrackingHysteresis = config.ServerEntitySyncTuning; } },
         new StressTest.Phase { Name = "attribute no-op skip off (server)",
-            Enter = () => Patches.EntitySyncPatches.AttributeNoOpSkip = false,
-            Exit = () => Patches.EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip },
+            Enter = () => EntitySyncPatches.AttributeNoOpSkip = false,
+            Exit = () => EntitySyncPatches.AttributeNoOpSkip = config.ServerAttributeNoOpSkip },
         new StressTest.Phase { Name = "edge coalescing off",
-            Enter = () => { Patches.EdgeCoalescePatches.Enabled = false; Patches.EdgeCoalescePatches.FlushAll(); },
-            Exit = () => Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0 },
+            Enter = () => { EdgeCoalescePatches.Enabled = false; EdgeCoalescePatches.FlushAll(); },
+            Exit = () => EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0 },
         // The shadow group. Until 1.40.0 the plan had no phase for any of it, which is why
         // "safemode is faster" could not be attributed: the symmetric box is by far the largest
         // change this mod makes to what the GPU is asked to draw - it replaces vanilla's
@@ -292,33 +536,33 @@ public partial class KometModSystem
         // reads as its remaining cost. The 1.42.x both-cascades version measured +0,72 +-0,08;
         // far-only must come in under that - this phase is what checks it.
         new StressTest.Phase { Name = "shadow box off (vanilla wedge)",
-            Enter = () => Patches.ShadowPatches.SymmetricBox = false,
-            Exit = () => Patches.ShadowPatches.SymmetricBox = config.SymmetricShadowBox },
+            Enter = () => ShadowPatches.SymmetricBox = false,
+            Exit = () => ShadowPatches.SymmetricBox = config.SymmetricShadowBox },
         // The coverage margin is what makes the throttle work while MOVING, so this phase is
         // the one to read during a flight: without it the far cascade is redrawn on almost
         // every frame, with it at the staleness cap. Standing still it costs a few texels of
         // density and saves nothing - the throttle was already skipping.
         new StressTest.Phase { Name = "far shadow coverage margin off (redraw on every step)",
-            Enter = () => { Patches.ShadowPatches.FarBoxMargin = 0; Patches.ShadowThrottlePatches.Invalidate(); },
-            Exit = () => { Patches.ShadowPatches.FarBoxMargin = config.ShadowFarBoxMargin;
-                           Patches.ShadowThrottlePatches.Invalidate(); } },
+            Enter = () => { ShadowPatches.FarBoxMargin = 0; ShadowThrottlePatches.Invalidate(); },
+            Exit = () => { ShadowPatches.FarBoxMargin = config.ShadowFarBoxMargin;
+                           ShadowThrottlePatches.Invalidate(); } },
         // Default-on since 1.43.0; the phase switches it off, so the delta reads as what the
         // throttle SAVES in this scene. It used to save nothing while moving - the movement
         // rule forced a redraw almost every frame - which is what the coverage margin above
         // fixed; with the margin on, this phase reads the same standing still and flying.
         new StressTest.Phase { Name = "shadow throttle off (every frame)",
-            Enter = () => Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1),
-            Exit = () => Patches.ShadowThrottlePatches.SetIntervals(
+            Enter = () => ShadowThrottlePatches.SetIntervals(1, 1, 1),
+            Exit = () => ShadowThrottlePatches.SetIntervals(
                 config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval, config.ShadowFarMaxSkip) },
         // Default-on since 05.09.; the phase draws every face again, so the delta is what the
         // culled back faces cost in this scene. GPU work - visible only in a GPU-bound frame,
         // which the report's "gpu" figure against the frame time tells apart.
         new StressTest.Phase { Name = "shadow backface cull off (every face)",
-            Enter = () => Patches.ShadowCullPatches.Enabled = false,
-            Exit = () => Patches.ShadowCullPatches.Enabled = config.ShadowCullBackfaces },
+            Enter = () => ShadowCullPatches.Enabled = false,
+            Exit = () => ShadowCullPatches.Enabled = config.ShadowCullBackfaces },
         new StressTest.Phase { Name = "shadow depth-only shader off (alpha test everywhere)",
-            Enter = () => Patches.ShadowCullPatches.DepthOnly = false,
-            Exit = () => Patches.ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses },
+            Enter = () => ShadowCullPatches.DepthOnly = false,
+            Exit = () => ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses },
         // No phase for ShadowDistanceMultiplier any more: it has been 1.0 (vanilla) since
         // 1.40.0, so the phase set it to the value it already had and measured pure noise.
         // The grid's cell size, measured in the player's own scene rather than in the harness.
@@ -345,14 +589,16 @@ public partial class KometModSystem
         // CPU - expect it to show only in streaming scenes (fly over fresh terrain), and
         // read it together with the gc column of the hitch log.
         new StressTest.Phase { Name = "mesh recycler off (vanilla store)",
-            Enter = () => Patches.MeshRecyclerPatches.SetEnabled(false),
-            Exit = () => Patches.MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler) },
+            Enter = () => MeshRecyclerPatches.SetEnabled(false),
+            Exit = () => MeshRecyclerPatches.SetEnabled(config.FastMeshRecycler) },
         new StressTest.Phase { Name = "extras pool off (fresh arrays)",
-            Enter = () => { Patches.TightClonePatches.PoolExtras = false; Patches.TightClonePatches.ClearPools(); },
-            Exit = () => Patches.TightClonePatches.PoolExtras = config.PoolMeshExtras },
+            Enter = () => { TightClonePatches.PoolExtras = false; TightClonePatches.ClearPools();
+                            FarLod.PoolArrays = false; FarLod.ClearPools(); },
+            Exit = () => { TightClonePatches.PoolExtras = config.PoolMeshExtras;
+                           FarLod.PoolArrays = config.PoolMeshExtras; } },
         new StressTest.Phase { Name = "animatable gate off (vanilla)",
-            Enter = () => Patches.AnimatableCullPatches.Enabled = false,
-            Exit = () => Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers },
+            Enter = () => AnimatableCullPatches.Enabled = false,
+            Exit = () => AnimatableCullPatches.Enabled = config.CullAnimatableRenderers },
         new StressTest.Phase { Name = "lod3 out of the shadow pass",
             Enter = () => FastCuller.ShadowSkipRedundantLod = true,
             Exit = () => FastCuller.ShadowSkipRedundantLod = config.ShadowSkipRedundantLod },
@@ -362,23 +608,23 @@ public partial class KometModSystem
         // Instrumentation the mod carries is on the same side of the ledger as the work it
         // removes; these three phases are what makes that testable rather than argued.
         new StressTest.Phase { Name = "renderer profiler on (diagnostic)",
-            Enter = () => { Patches.RendererProfiler.Enabled = true; WrapRenderers(); },
-            Exit = () => { Patches.RendererProfiler.Enabled = config.ProfileRenderers;
+            Enter = () => { RendererProfiler.Enabled = true; WrapRenderers(); },
+            Exit = () => { RendererProfiler.Enabled = config.ProfileRenderers;
                            if (config.ProfileRenderers) WrapRenderers(); else UnwrapRenderers(); } },
         new StressTest.Phase { Name = "retess source sampling on (diagnostic)",
-            Enter = () => Patches.RetessSourcePatches.SampleSources = true,
-            Exit = () => Patches.RetessSourcePatches.SampleSources = config.SampleRetessSources },
+            Enter = () => RetessSourcePatches.SampleSources = true,
+            Exit = () => RetessSourcePatches.SampleSources = config.SampleRetessSources },
         new StressTest.Phase { Name = "sweep cross-check on (diagnostic)",
             Enter = () => { CullVerifier.SampleEvery = 512; CullVerifier.Reset(); },
             Exit = () => CullVerifier.SampleEvery = config.VerifyCullSweepEvery },
         // The two always-on attributions, priced like the before-stage attribution: a few
         // Stopwatch reads per frame, but measured rather than assumed.
         new StressTest.Phase { Name = "task attribution off (vanilla drain)",
-            Enter = () => Patches.MainThreadTaskPatches.Enabled = false,
-            Exit = () => Patches.MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks },
+            Enter = () => MainThreadTaskPatches.Enabled = false,
+            Exit = () => MainThreadTaskPatches.Enabled = config.AttributeMainThreadTasks },
         new StressTest.Phase { Name = "tick profiler off",
-            Enter = () => { Patches.TickProfiler.Enabled = false; WrapTickListeners(); },
-            Exit = () => { Patches.TickProfiler.Enabled = config.ProfileTickListeners; WrapTickListeners(); } },
+            Enter = () => { TickProfiler.Enabled = false; WrapTickListeners(); },
+            Exit = () => { TickProfiler.Enabled = config.ProfileTickListeners; WrapTickListeners(); } },
         new StressTest.Phase { Name = "sweep vector kernel off (scalar)",
             Enter = () => FastCuller.VectorCulling = false,
             Exit = () => FastCuller.VectorCulling = config.VectorCulling && FastCuller.VectorAvailable },
@@ -388,363 +634,33 @@ public partial class KometModSystem
     };
 
     /// <summary>
-    /// Flips exactly one drawing-relevant system, so a visual artefact can be bisected while
-    /// it is on screen. Every toggle logs the world's loading state alongside, because the
-    /// strongest confounder so far has been time itself - artefacts reported during streaming
-    /// were gone once the queue drained, whatever was toggled in between.
+    /// Flips exactly one system by name, so a visual artefact can be bisected while it is on
+    /// screen. The systems themselves live in the toggle table (KometModSystem.Toggles.cs); this
+    /// is the chat command's way in, and the window's way in is the same table - a flip made in
+    /// either place runs the same code and prints the same sentence.
     /// </summary>
     private string ToggleSystem(string system)
     {
-        string state;
-        switch (system?.ToLowerInvariant())
-        {
-            case "cull":
-                FastCuller.Enabled = !FastCuller.Enabled;
-                state = "visibility sweep " + (FastCuller.Enabled ? "ON" : "OFF (vanilla)");
-                break;
-            case "occlusion":
-                FastChunkCuller.Enabled = !FastChunkCuller.Enabled;
-                state = "occlusion culling " + (FastChunkCuller.Enabled ? "ON" : "OFF (vanilla)");
-                break;
-            case "reclaim":
-                PoolReclaimer.Enabled = !PoolReclaimer.Enabled;
-                state = "vram reclaimer " + (PoolReclaimer.Enabled ? "ON" : "OFF");
-                break;
-            case "sunquery":
-                Patches.SunQueryPatches.Interval = Patches.SunQueryPatches.Interval > 1 ? 1 : config.SunOcclusionQueryInterval;
-                state = "sun query throttle " + (Patches.SunQueryPatches.Interval > 1 ? "ON" : "OFF (every frame)");
-                break;
-            case "firepit":
-                Patches.FirepitPatches.Enabled = !Patches.FirepitPatches.Enabled;
-                state = "firepit gate " + (Patches.FirepitPatches.Enabled ? "ON" : "OFF (vanilla)");
-                break;
-            case "prebuild":
-                WindowPrebuilder.Enabled = !WindowPrebuilder.Enabled;
-                if (WindowPrebuilder.Enabled) WindowPrebuilder.HardDisabled = false; // explicit user intent overrides a self-disable
-                state = "window pipeline " + (WindowPrebuilder.Enabled ? "ON" : "OFF (vanilla window build)");
-                break;
-            case "glerror":
-                Patches.GlErrorPatches.SkipEnabled = !Patches.GlErrorPatches.SkipEnabled;
-                state = "glGetError skip " + (Patches.GlErrorPatches.SkipEnabled
-                    ? "ON (2 driver syncs/frame saved, VRAM warning off)"
-                    : "OFF (vanilla)");
-                break;
-            case "enttess":
-                Patches.EntityTessPatches.Enabled = !Patches.EntityTessPatches.Enabled;
-                state = "entity tesselation budget " + (Patches.EntityTessPatches.Enabled ? "ON" : "OFF (vanilla)");
-                break;
-            case "shadowmargin":
-                // Off means the retained far map covers only what the fade needs, and the
-                // throttle is back to redrawing on the first step anybody takes.
-                Patches.ShadowPatches.FarBoxMargin =
-                    Patches.ShadowPatches.FarBoxMargin > 0 ? 0.0 : Math.Max(0.0, config.ShadowFarBoxMargin);
-                Patches.ShadowThrottlePatches.Invalidate();
-                state = "far shadow coverage margin " + (Patches.ShadowPatches.EffectiveFarBoxMargin > 0
-                    ? "ON (" + Patches.ShadowPatches.EffectiveFarBoxMargin.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " blocks, redraw after "
-                      + Patches.ShadowThrottlePatches.MoveLimit.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " blocks of camera movement)"
-                    : "OFF (redraw after " + Patches.ShadowThrottlePatches.MoveLimit.ToString("0.##", System.Globalization.CultureInfo.CurrentCulture)
-                      + " blocks - i.e. on nearly every frame while moving)"
-                      + (Patches.ShadowPatches.SymmetricBox ? "" : "; needs the symmetric box"));
-                break;
-            case "shadowbox":
-                Patches.ShadowPatches.SymmetricBox = !Patches.ShadowPatches.SymmetricBox;
-                state = "symmetric shadow box " + (Patches.ShadowPatches.SymmetricBox
-                    ? "ON (cube around the camera)" : "OFF (vanilla wedge)");
-                break;
-            case "simd":
-                if (!FastCuller.VectorAvailable) return Loc.T("komet:msg-no-avx", "this CPU has no AVX - the sweep runs scalar anyway.");
-                FastCuller.VectorCulling = !FastCuller.VectorCulling;
-                state = "sweep vector kernel " + (FastCuller.VectorCulling
-                    ? "ON (4 parts per instruction)" : "OFF (scalar, one part per instruction)");
-                break;
-            case "profiler":
-                // Wrapping/unwrapping needs the event manager, which only exists in a world.
-                Patches.RendererProfiler.Enabled = !Patches.RendererProfiler.Enabled;
-                if (Patches.RendererProfiler.Enabled) WrapRenderers(); else UnwrapRenderers();
-                state = "renderer profiling " + (Patches.RendererProfiler.Enabled
-                    ? "ON (" + Patches.RendererProfiler.StatWrapped + " renderers wrapped - costs frame time)"
-                    : "OFF (vanilla dispatch)");
-                break;
-            case "prioupload":
-                Patches.PrioUploadPatches.Enabled = !Patches.PrioUploadPatches.Enabled;
-                state = "prio upload budget " + (Patches.PrioUploadPatches.Enabled
-                    ? "ON (bursts spread over several frames)"
-                    : "OFF (vanilla: the whole prio queue in one frame)");
-                break;
-            case "beforeattr":
-                Patches.RendererProfiler.AttributeBeforeStage = !Patches.RendererProfiler.AttributeBeforeStage;
-                if (Patches.RendererProfiler.AttributeBeforeStage) WrapRenderers();
-                else if (!Patches.RendererProfiler.Enabled) UnwrapRenderers();
-                state = "before stage attribution " + (Patches.RendererProfiler.AttributeBeforeStage
-                    ? "ON (hitch lines can name the before renderer)"
-                    : "OFF (vanilla dispatch in the before stage)");
-                break;
-            case "uploaddruck":
-                UploadBudget.FramePressureInput = !UploadBudget.FramePressureInput;
-                state = "upload frame pressure " + (UploadBudget.FramePressureInput
-                    ? "ON (hot frames with uploads in flight push the budget down)"
-                    : "OFF (the throttle only sees the upload clock, as before 01.09.)");
-                break;
-            case "hudraster":
-                DebugHud.BackgroundRaster = !DebugHud.BackgroundRaster;
-                state = "hud raster " + (DebugHud.BackgroundRaster
-                    ? "IN THE WORKER (the frame only pays sampling + upload)"
-                    : "SYNCHRONOUS (full rebuild inside the frame, like vanilla overlays)");
-                break;
-            case "retess":
-                Patches.RetessSourcePatches.SampleSources = !Patches.RetessSourcePatches.SampleSources;
-                state = "dirty mark source sampling " + (Patches.RetessSourcePatches.SampleSources
-                    ? "UNCAPPED (every 8th mark with a stack - '.komet retess' shows the ranking)"
-                    : "CAPPED (still active, at most 25 captures/s)");
-                break;
-            case "cullcheck":
-                CullVerifier.SampleEvery = CullVerifier.SampleEvery > 0 ? 0 : Math.Max(1, config.VerifyCullSweepEvery);
-                CullVerifier.Reset();
-                state = "sweep cross-check " + (CullVerifier.SampleEvery > 0
-                    ? "ON (every " + CullVerifier.SampleEvery + "th sweep against vanilla)" : "OFF");
-                break;
-            case "cellsize":
-                SetCellTarget(FastCuller.PartsPerCellTarget == DefaultCellTarget ? 160 : DefaultCellTarget);
-                state = "grid cell target now " + FastCuller.PartsPerCellTarget + " parts per cell";
-                break;
-            case "gapmerge":
-                FastCuller.GapMergeDrawRanges = !FastCuller.GapMergeDrawRanges;
-                state = "gap merging " + (FastCuller.GapMergeDrawRanges
-                    ? "ON (ranges span frustum-clipped parts)"
-                    : "OFF (only seamlessly adjacent ranges)");
-                break;
-            case "recycler":
-                Patches.MeshRecyclerPatches.SetEnabled(!Patches.MeshRecyclerPatches.Enabled);
-                state = "mesh recycler pool " + (Patches.MeshRecyclerPatches.Enabled
-                    ? "ON (size classes, budget " + Patches.MeshRecyclerPatches.BudgetMb + " MB)"
-                    : "OFF (vanilla store, own stock released)");
-                break;
-            case "tightclone":
-                Patches.TightClonePatches.Enabled = !Patches.TightClonePatches.Enabled;
-                state = "tight clone " + (Patches.TightClonePatches.Enabled
-                    ? "ON (custom parts are copied at content size)"
-                    : "OFF (vanilla: capacity-sized copies)");
-                break;
-            case "extrapool":
-                Patches.TightClonePatches.PoolExtras = !Patches.TightClonePatches.PoolExtras;
-                if (!Patches.TightClonePatches.PoolExtras) Patches.TightClonePatches.ClearPools();
-                state = "extras pool " + (Patches.TightClonePatches.PoolExtras
-                    ? "ON (per-face and custom arrays of the chunk parts are recycled)"
-                    : "OFF (vanilla: fresh arrays per part, stock released)");
-                break;
-            case "animcull":
-                Patches.AnimatableCullPatches.Enabled = !Patches.AnimatableCullPatches.Enabled;
-                state = "animatable frustum gate " + (Patches.AnimatableCullPatches.Enabled
-                    ? "ON (animated block entities outside the frustum are skipped)"
-                    : "OFF (vanilla: every instance draws in every stage)");
-                break;
-            case "shadowlod":
-                FastCuller.ShadowSkipRedundantLod = !FastCuller.ShadowSkipRedundantLod;
-                state = "lod3 stand-ins in the shadow pass " + (FastCuller.ShadowSkipRedundantLod
-                    ? "GONE (only the detailed version left)" : "IN (vanilla, both versions)");
-                break;
-            case "shadowcull":
-                Patches.ShadowCullPatches.Enabled = !Patches.ShadowCullPatches.Enabled;
-                state = "shadow pass back-face culling " + (Patches.ShadowCullPatches.Enabled
-                    ? "ON (solid passes draw front faces only into the shadow maps)"
-                    : "OFF (vanilla: every face of every pass)");
-                break;
-            case "shadowdepth":
-                Patches.ShadowCullPatches.DepthOnly = !Patches.ShadowCullPatches.DepthOnly;
-                state = "shadow pass depth-only shader for the solid passes " + (Patches.ShadowCullPatches.DepthOnly
-                    ? "ON" + (Patches.ShadowCullPatches.DepthOnlyState != null ? " (" + Patches.ShadowCullPatches.DepthOnlyState + ")" : "")
-                    : "OFF (vanilla: chunkshadowmap with alpha test for every pass)");
-                break;
-            case "animwarm":
-                Runtime.AnimationWarmup.Enabled = !Runtime.AnimationWarmup.Enabled && Patches.EntityLoadPatches.Enabled;
-                state = "animation frame warm-up " + (Runtime.AnimationWarmup.Enabled
-                    ? "ON (a worker generates a new shape's frames while its first entity is held)"
-                    : Patches.EntityLoadPatches.Enabled ? "OFF (vanilla: generated on the main thread when an animation first plays)"
-                                                        : "OFF - needs the entity load hold ('.komet toggle entload')");
-                break;
-            case "shadowstab":
-                Patches.ShadowStabilityPatches.Enabled = !Patches.ShadowStabilityPatches.Enabled;
-                state = "shadow texel snapping " + (Patches.ShadowStabilityPatches.Enabled
-                    ? "ON" : "OFF (vanilla)")
-                    + (Patches.ShadowStabilityPatches.StatSnaps == 0 ? " - patch not installed, komet.json" : "");
-                break;
-            case "shadowthrottle":
-                if (Patches.ShadowThrottlePatches.Throttling)
-                {
-                    Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1);
-                    state = "shadow throttle OFF (far cascade every frame, vanilla)";
-                }
-                else
-                {
-                    // the config pair when it throttles, else the tested 2/4 - so the toggle
-                    // works even on a config that has throttling off
-                    var far = Math.Max(2, config.ShadowFarUpdateInterval);
-                    var skip = Math.Max(4, config.ShadowFarMaxSkip);
-                    Patches.ShadowThrottlePatches.SetIntervals(far, config.ShadowNearUpdateInterval, skip);
-                    state = $"shadow throttle ON (far cascade every {far}-{skip} frames, movement forces it immediately)";
-                }
-                break;
-            case "shadowfade":
-                Patches.ShadowPatches.FadeFix = !Patches.ShadowPatches.FadeFix;
-                state = "shadow fade fix " + (Patches.ShadowPatches.FadeFix ? "ON" : "OFF (vanilla)");
-                break;
-            case "shadowdist":
-                Patches.ShadowPatches.DistanceMultiplier =
-                    Patches.ShadowPatches.DistanceMultiplier != 1.0 ? 1.0 : Patches.ShadowPatches.ConfiguredMultiplier;
-                state = "shadow distance x" + Patches.ShadowPatches.DistanceMultiplier.ToString("0.##",
-                    System.Globalization.CultureInfo.CurrentCulture)
-                    + (Patches.ShadowPatches.DistanceMultiplier == 1.0 ? " (vanilla)" : "");
-                break;
-            case "edgecoal":
-                if (Patches.EdgeCoalescePatches.Enabled)
-                {
-                    // never strand a held mark: everything pending goes out before vanilla takes over
-                    Patches.EdgeCoalescePatches.Enabled = false;
-                    Patches.EdgeCoalescePatches.FlushAll();
-                    state = "edge coalescing OFF (vanilla, everything flushed)";
-                }
-                else
-                {
-                    // the patch is always applied and runtime-gated, so the toggle can
-                    // enable the experiment even with the config default of 0/off
-                    Patches.EdgeCoalescePatches.Enabled = true;
-                    state = "edge coalescing ON (experimental; the default is off)";
-                }
-                break;
-            case "entload":
-                if (Patches.EntityLoadPatches.Enabled)
-                {
-                    // never strand a held entity: everything pending finishes before vanilla takes over
-                    Patches.EntityLoadPatches.Enabled = false;
-                    Patches.EntityLoadPatches.FlushAll();
-                    state = "entity load budget OFF (vanilla: every entity finishes in its packet task; everything held is loaded now)";
-                }
-                else
-                {
-                    Patches.EntityLoadPatches.Enabled = true;
-                    state = "entity load budget ON (" + Patches.EntityLoadPatches.BudgetMs.ToString("0.#",
-                        System.Globalization.CultureInfo.CurrentCulture) + " ms/frame, nearest entity first)";
-                }
-                break;
-            case "minimap":
-                Patches.MinimapPatches.Enabled = !Patches.MinimapPatches.Enabled;
-                state = "minimap budget " + (Patches.MinimapPatches.Enabled
-                    ? "ON (" + Patches.MinimapPatches.TargetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " ms per tick, the cap adapts)"
-                    : "OFF (vanilla: up to 200 tiles per tick)");
-                break;
-            case "minimapdirect":
-                Patches.MinimapPatches.DirectUpload = !Patches.MinimapPatches.DirectUpload;
-                state = "minimap direct upload " + (Patches.MinimapPatches.DirectUpload
-                    ? "ON (tiles via glTexSubImage2D into the component texture)"
-                    : "OFF (vanilla: a framebuffer draw per tile)");
-                break;
-            case "taskbudget":
-                Patches.MainThreadTaskPatches.BudgetMs = Patches.MainThreadTaskPatches.BudgetMs > 0
-                    ? 0 : (config.MainThreadTaskBudgetMs > 0 ? config.MainThreadTaskBudgetMs : 3.0);
-                state = "task drain budget " + (Patches.MainThreadTaskPatches.BudgetMs > 0
-                    ? "ON (" + Patches.MainThreadTaskPatches.BudgetMs.ToString("0.#", System.Globalization.CultureInfo.CurrentCulture)
-                      + " ms per frame, the remainder goes to the next frame in order)"
-                    : "OFF (vanilla: everything queued runs in this frame)")
-                    + (Patches.MainThreadTaskPatches.Enabled ? "" : " - only takes effect with 'mtt' ON");
-                break;
-            case "animlod":
-                Patches.EntityAnimPatches.LodEnabled = !Patches.EntityAnimPatches.LodEnabled;
-                state = "anim lod " + (Patches.EntityAnimPatches.LodEnabled
-                    ? "ON (shadow-only entities every 3rd, beyond " + Patches.EntityAnimPatches.FarBlocks.ToString("0", System.Globalization.CultureInfo.CurrentCulture)
-                      + " blocks every 2nd frame)"
-                    : "OFF (vanilla: every entity every frame)")
-                    + (Patches.EntityAnimPatches.Enabled ? "" : " - only takes effect with 'entbefore' ON");
-                break;
-            case "entbefore":
-                Patches.EntityAnimPatches.Enabled = !Patches.EntityAnimPatches.Enabled;
-                state = "entity before attribution " + (Patches.EntityAnimPatches.Enabled
-                    ? "ON (pre-render and anim clocked separately, hitch lines name the entity)"
-                    : "OFF (vanilla loop, and therefore no anim lod either)");
-                break;
-            case "clientalloc":
-                Patches.ClientAllocPatches.Enabled = !Patches.ClientAllocPatches.Enabled;
-                state = "client alloc attribution " + (Patches.ClientAllocPatches.Enabled
-                    ? "ON (worker threads and thread pool per caller)" : "OFF");
-                break;
-            case "allocsample":
-                if (AllocSampler.Enabled)
-                {
-                    Measure.FrameStats.PeriodicSample -= AllocSampler.Sample;
-                    AllocSampler.Stop();
-                    state = "alloc sampling OFF";
-                }
-                else
-                {
-                    AllocSampler.Start();
-                    if (AllocSampler.Enabled) Measure.FrameStats.PeriodicSample += AllocSampler.Sample;
-                    state = AllocSampler.Enabled
-                        ? "alloc sampling ON (runtime events, all threads, by type)"
-                        : "alloc sampling could not start: " + AllocSampler.Failure;
-                }
-                break;
-            case "packetsrc":
-                Patches.PacketSourcePatches.Enabled = !Patches.PacketSourcePatches.Enabled;
-                state = "block packet sources (server) " + (Patches.PacketSourcePatches.Enabled ? "ON" : "OFF")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - only measures the integrated server");
-                break;
-            case "serveralloc":
-                Patches.ServerAllocPatches.Enabled = !Patches.ServerAllocPatches.Enabled;
-                state = "server alloc attribution " + (Patches.ServerAllocPatches.Enabled ? "ON" : "OFF")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - only measures the integrated server");
-                break;
-            case "mtt":
-                Patches.MainThreadTaskPatches.Enabled = !Patches.MainThreadTaskPatches.Enabled;
-                state = "main thread task attribution " + (Patches.MainThreadTaskPatches.Enabled
-                    ? "ON (every task is clocked, hitch lines name the packet type)"
-                    : "OFF (vanilla drain)");
-                break;
-            case "tickprofiler":
-                Patches.TickProfiler.Enabled = !Patches.TickProfiler.Enabled;
-                WrapTickListeners();
-                state = "tick profiler " + (Patches.TickProfiler.Enabled
-                    ? "ON (" + Patches.TickProfiler.StatWrapped + " listeners wrapped)"
-                    : "OFF (vanilla delegates)");
-                break;
-            case "entsync":
-                Patches.EntitySyncPatches.DistanceSendRate = !Patches.EntitySyncPatches.DistanceSendRate;
-                Patches.EntitySyncPatches.TrackingHysteresis = Patches.EntitySyncPatches.DistanceSendRate;
-                state = "entity sync tuning (server) " + (Patches.EntitySyncPatches.DistanceSendRate
-                    ? "ON (positions by distance, tracking with hysteresis)"
-                    : "OFF (vanilla: 30 Hz for everything, hard tracking band)")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - only has an effect on a server that runs komet");
-                break;
-            case "attrskip":
-                Patches.EntitySyncPatches.AttributeNoOpSkip = !Patches.EntitySyncPatches.AttributeNoOpSkip;
-                state = "attribute no-op skip (server) " + (Patches.EntitySyncPatches.AttributeNoOpSkip
-                    ? "ON (unchanged attribute paths are not sent)"
-                    : "OFF (vanilla: every dirty path goes out)")
-                    + (capi != null && capi.IsSinglePlayer ? "" : " - only has an effect on a server that runs komet");
-                break;
-            case "edgeprio":
-                if (Patches.EdgeRetessPriorityPatches.Enabled)
-                {
-                    Patches.EdgeRetessPriorityPatches.Enabled = false;
-                    state = "edge retess prio OFF (vanilla order, visible edge repairs wait again)";
-                }
-                else
-                {
-                    Patches.EdgeRetessPriorityPatches.Enabled = true;
-                    // explicit user intent overrides a self-disable
-                    Patches.EdgeRetessPriorityPatches.HardDisabled = false;
-                    state = "edge retess prio ON (visible edge repairs overtake the queue)";
-                }
-                break;
-            default:
-                return Loc.T("komet:msg-unknown-system", "unknown. Systems: ")
-                     + "cull, simd, gapmerge, occlusion, reclaim, recycler, sunquery, glerror, "
-                     + "prebuild, firepit, enttess, entload, minimap, minimapdirect, edgecoal, edgeprio, prioupload, uploaddruck, profiler, "
-                     + "beforeattr, tickprofiler, mtt, taskbudget, entbefore, animlod, serveralloc, clientalloc, allocsample, packetsrc, retess, hudraster, cullcheck, cellsize, shadowbox, shadowmargin, shadowfade, "
-                     + "shadowdist, shadowlod, shadowstab, shadowthrottle, shadowcull, shadowdepth, animwarm, entsync, attrskip";
-        }
+        var entry = Toggles.Find(system);
+        if (entry == null)
+            return Loc.T("komet:msg-unknown-system", "unknown. Systems: ") + Toggles.KeyList();
 
+        // A machine without AVX has no vector kernel to switch. Say so and change nothing,
+        // rather than reporting a flip that did not happen.
+        var blocked = entry.Unavailable?.Invoke();
+        if (blocked != null) return blocked;
+
+        return Announce(entry.Flip());
+    }
+
+    /// <summary>
+    /// A flip, logged and answered with the world's loading state next to it. Every toggle logs
+    /// that, because the strongest confounder so far has been time itself - artefacts reported
+    /// during streaming were gone once the queue drained, whatever was toggled in between.
+    /// Internal so the window's toggle rows leave the same line in the log as the chat command.
+    /// </summary>
+    internal string Announce(string state)
+    {
         var world = $"chunks {Vintagestory.Client.RuntimeStats.chunksReceived:N0} received, "
                     + $"queued {Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation:N0}, "
                     + $"uptime {uptime.Elapsed.TotalSeconds:F0}s";
@@ -763,12 +679,12 @@ public partial class KometModSystem
         if (safeMode)
         {
             if (StressTest.Running) StressTest.Stop("safemode takes over");
-            savedSunInterval = Patches.SunQueryPatches.Interval;
-            savedGlErrorSkip = Patches.GlErrorPatches.SkipEnabled;
-            savedFirepitGate = Patches.FirepitPatches.Enabled;
-            savedEntityTess = Patches.EntityTessPatches.Enabled;
-            savedEdgeCoalesce = Patches.EdgeCoalescePatches.Enabled;
-            savedEdgePriority = Patches.EdgeRetessPriorityPatches.Enabled;
+            savedSunInterval = SunQueryPatches.Interval;
+            savedGlErrorSkip = GlErrorPatches.SkipEnabled;
+            savedFirepitGate = FirepitPatches.Enabled;
+            savedEntityTess = EntityTessPatches.Enabled;
+            savedEdgeCoalesce = EdgeCoalescePatches.Enabled;
+            savedEdgePriority = EdgeRetessPriorityPatches.Enabled;
             AllVanilla();
             Mod.Logger.Notification("safemode ON | queued {0:N0}, uptime {1:F0}s",
                 Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation, uptime.Elapsed.TotalSeconds);
@@ -780,13 +696,13 @@ public partial class KometModSystem
         AllConfigured();
         // a live toggle the user made before entering safemode survives it; only what safemode
         // itself flipped comes back from config
-        Patches.SunQueryPatches.Interval = savedSunInterval;
-        Patches.GlErrorPatches.SkipEnabled = savedGlErrorSkip;
-        Patches.FirepitPatches.Enabled = savedFirepitGate;
-        Patches.EntityTessPatches.Enabled = savedEntityTess;
-        Patches.EdgeCoalescePatches.Enabled = savedEdgeCoalesce;
-        Patches.EdgeRetessPriorityPatches.Enabled =
-            savedEdgePriority && !Patches.EdgeRetessPriorityPatches.HardDisabled;
+        SunQueryPatches.Interval = savedSunInterval;
+        GlErrorPatches.SkipEnabled = savedGlErrorSkip;
+        FirepitPatches.Enabled = savedFirepitGate;
+        EntityTessPatches.Enabled = savedEntityTess;
+        EdgeCoalescePatches.Enabled = savedEdgeCoalesce;
+        EdgeRetessPriorityPatches.Enabled =
+            savedEdgePriority && !EdgeRetessPriorityPatches.HardDisabled;
         Mod.Logger.Notification("safemode OFF | queued {0:N0}, uptime {1:F0}s",
             Vintagestory.Client.RuntimeStats.chunksAwaitingTesselation, uptime.Elapsed.TotalSeconds);
         return Loc.T("komet:msg-safemode-off", "Safemode off - the optimisations run according to komet.json again.");
@@ -804,21 +720,30 @@ public partial class KometModSystem
         FastCuller.ShadowSkipRedundantLod = false;  // both LOD versions into the shadow map again
         FastChunkCuller.Enabled = false;            // occlusion walk -> vanilla
         PoolReclaimer.Enabled = false;              // stop reclaiming; already-empty pools stay empty
-        Patches.SunQueryPatches.Interval = 1;       // sun occlusion query every frame again
-        Patches.GlErrorPatches.SkipEnabled = false; // vanilla error detection back on
-        Patches.FirepitPatches.Enabled = false;     // draw every firepit again
-        Patches.EntityTessPatches.Enabled = false;  // tesselate entity shapes immediately again
-        Patches.AnimatableCullPatches.Enabled = false; // every animated block entity draws in every stage again
-        Patches.EdgeCoalescePatches.Enabled = false;
-        Patches.EdgeCoalescePatches.FlushAll();     // held edge marks go out, nothing strands
-        Patches.EdgeRetessPriorityPatches.Enabled = false; // vanilla queue order again
+        SunQueryPatches.Interval = 1;       // sun occlusion query every frame again
+        GlErrorPatches.SkipEnabled = false; // vanilla error detection back on
+        FirepitPatches.Enabled = false;     // draw every firepit again
+        EntityTessPatches.Enabled = false;  // tesselate entity shapes immediately again
+        AnimatableCullPatches.Enabled = false; // every animated block entity draws in every stage again
+        EdgeCoalescePatches.Enabled = false;
+        EdgeCoalescePatches.FlushAll();     // held edge marks go out, nothing strands
+        EdgeRetessPriorityPatches.Enabled = false; // vanilla queue order again
         // shadows too: box shape, fade range, distance and update cadence all back to
         // vanilla, so "is a shadow artefact ours?" is answerable with one command
-        Patches.ShadowPatches.ToVanilla();
-        Patches.ShadowThrottlePatches.SetIntervals(1, 1, 1);
-        Patches.ShadowStabilityPatches.Enabled = false;
-        Patches.ShadowCullPatches.Enabled = false;      // every face into the shadow maps again
-        Patches.ShadowCullPatches.DepthOnly = false;    // the engine's shader for every pass again
+        ShadowPatches.ToVanilla();
+        ShadowThrottlePatches.SetIntervals(1, 1, 1);
+        ShadowStabilityPatches.Enabled = false;
+        ShadowDepthPatches.Enabled = false;     // the near volume back to the engine's depth
+        ShadowFootprintPatches.Enabled = false; // the near pass drawn for every direction again
+        ShadowCullPatches.SkipFoliage = false;  // the diagnostic skip is never part of a configuration
+        FastCuller.FoliageRangeSq = 0;                  // foliage to the view distance again
+        FastCuller.ShadowFoliageRangeSq = 0;            // foliage casts to the cascade's range again
+        ChunkShaderSwap.Restore();                      // the engine's fragment shader again
+        FastCuller.FrontToBack = false;                 // index order again
+        SpatialPools.Enabled = false;                   // first-fit again for new models
+        FarMesh.Enabled = false;                        // faces at every distance again (next frame)
+        ShadowCullPatches.Enabled = false;      // every face into the shadow maps again
+        ShadowCullPatches.DepthOnly = false;    // the engine's shader for every pass again
     }
 
     /// <summary>The exact inverse: everything back to what komet.json asked for.</summary>
@@ -829,20 +754,29 @@ public partial class KometModSystem
         FastCuller.ShadowSkipRedundantLod = config.ShadowSkipRedundantLod;
         FastChunkCuller.Enabled = config.FastOcclusionCulling;
         PoolReclaimer.Enabled = config.ReclaimEmptyPools;
-        Patches.SunQueryPatches.Interval = config.SunOcclusionQueryInterval;
-        Patches.GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck;
-        Patches.FirepitPatches.Enabled = true;
-        Patches.EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0;
-        Patches.AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
-        Patches.EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0;
-        Patches.EdgeRetessPriorityPatches.Enabled =
-            config.EdgeRetessPriority && !Patches.EdgeRetessPriorityPatches.HardDisabled;
-        Patches.ShadowPatches.ToConfigured(config.SymmetricShadowBox, config.FixShadowFadeCutoff);
-        Patches.ShadowThrottlePatches.SetIntervals(
+        SunQueryPatches.Interval = config.SunOcclusionQueryInterval;
+        GlErrorPatches.SkipEnabled = config.SkipPerFrameGlErrorCheck;
+        FirepitPatches.Enabled = true;
+        EntityTessPatches.Enabled = config.EntityTesselationBudgetMs > 0;
+        AnimatableCullPatches.Enabled = config.CullAnimatableRenderers;
+        EdgeCoalescePatches.Enabled = config.EdgeRetessCoalesceMs > 0;
+        EdgeRetessPriorityPatches.Enabled =
+            config.EdgeRetessPriority && !EdgeRetessPriorityPatches.HardDisabled;
+        ShadowPatches.ToConfigured(config.SymmetricShadowBox, config.FixShadowFadeCutoff);
+        ShadowThrottlePatches.SetIntervals(
             config.ShadowFarUpdateInterval, config.ShadowNearUpdateInterval, config.ShadowFarMaxSkip);
-        Patches.ShadowStabilityPatches.Enabled = config.StabiliseShadowTexels;
-        Patches.ShadowCullPatches.Enabled = config.ShadowCullBackfaces;
-        Patches.ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses;
+        ShadowStabilityPatches.Enabled = config.StabiliseShadowTexels;
+        ShadowDepthPatches.Enabled = ShadowDepthPatches.ConfiguredEnabled;
+        ShadowFootprintPatches.Enabled = ShadowFootprintPatches.ConfiguredEnabled;
+        FastCuller.FoliageRangeSq = config.FoliageRange > 0 ? config.FoliageRange * config.FoliageRange : 0;
+        FastCuller.ShadowFoliageRangeSq = config.ShadowFoliageRange > 0 ? config.ShadowFoliageRange * config.ShadowFoliageRange : 0;
+        ParticlePatches.Orphan = ParticlePatches.ConfiguredOrphan;
+        FastCuller.FrontToBack = FastCuller.ConfiguredFrontToBack;
+        SpatialPools.Enabled = SpatialPools.ConfiguredEnabled;
+        FarMesh.Enabled = FarMesh.ConfiguredEnabled && FarMeshPatches.Installed;
+        FarMesh.DistanceSq = FarMesh.ConfiguredDistanceSq;
+        ShadowCullPatches.Enabled = config.ShadowCullBackfaces;
+        ShadowCullPatches.DepthOnly = config.ShadowDepthOnlySolidPasses;
         SetCellTarget(config.PartsPerCellTarget);
     }
 
@@ -873,38 +807,35 @@ public partial class KometModSystem
         FastCuller.StatRangesBridged = 0;
         FastCuller.StatPartsBridged = 0;
         FastCuller.StatTrisBridged = 0;
-        FastCuller.Workers.StatWaitTicks = 0;
-        FastCuller.Workers.StatRuns = 0;
         FastChunkCuller.StatPasses = 0;
         FastChunkCuller.StatPeakMs = 0;
-        Patches.MeshUploadPatches.StatBytesCopied = 0;
-        Patches.MeshUploadPatches.StatBulkCalls = 0;
-        Patches.MeshUploadPatches.StatFallbackCalls = 0;
+        MeshUploadPatches.StatBulkCalls = 0;
+        MeshUploadPatches.StatFallbackCalls = 0;
         UploadBudget.Reset();
-        Patches.PrioUploadPatches.ResetStats();
-        Patches.EntityTessPatches.ResetStats();
-        Patches.EntityLoadPatches.ResetStats();
-        Patches.MinimapPatches.ResetStats();
-        Patches.MainThreadTaskPatches.Reset();
-        Patches.TickProfiler.Reset();
-        Patches.EntityAnimPatches.ResetStats();
-        Patches.ServerAllocPatches.ResetStats();
-        Patches.ClientAllocPatches.ResetStats();
+        PrioUploadPatches.ResetStats();
+        EntityTessPatches.ResetStats();
+        EntityLoadPatches.ResetStats();
+        MinimapPatches.ResetStats();
+        MainThreadTaskPatches.Reset();
+        TickProfiler.Reset();
+        EntityAnimPatches.ResetStats();
+        ServerAllocPatches.ResetStats();
+        ClientAllocPatches.ResetStats();
         AllocSampler.ResetStats();
-        Patches.PacketSourcePatches.ResetStats();
+        PacketSourcePatches.ResetStats();
         Measure.GpuBusy.Reset();
-        Patches.EntitySyncPatches.ResetStats();
-        FastCuller.Workers.StatContendedInline = 0;
-        Patches.MeshRecyclerPatches.ResetStats();
-        Patches.TightClonePatches.ResetStats();
-        Patches.AnimatableCullPatches.ResetStats();
+        EntitySyncPatches.ResetStats();
+        JobScheduler.ResetStats();
+        MeshRecyclerPatches.ResetStats();
+        TightClonePatches.ResetStats();
+        AnimatableCullPatches.ResetStats();
         FastCuller.StatIncInserts = 0;
         FastCuller.StatIncRemovals = 0;
-        Patches.EdgeRetessPriorityPatches.StatPromoted = 0;
-        Patches.EdgeRetessPriorityPatches.StatSweeps = 0;
-        Patches.EdgeRetessPriorityPatches.StatBusySkips = 0;
+        EdgeRetessPriorityPatches.StatPromoted = 0;
+        EdgeRetessPriorityPatches.StatSweeps = 0;
+        EdgeRetessPriorityPatches.StatBusySkips = 0;
         PoolReclaimer.Reset();
-        Patches.RendererProfiler.Reset();
+        RendererProfiler.Reset();
         ModProfiler.Reset();
         FrameStats.Reset();
         HitchLog.Reset();

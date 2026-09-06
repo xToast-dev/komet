@@ -163,6 +163,9 @@ internal static class Program
         DrawRanges.Run();
         ChunkCullerBench.Run();
         UploadBench.Run();
+        WindowBench.Run();
+        QueueSweepBench.Run();
+        FarLodBench.Run();
 
         var modes = new[]
         {

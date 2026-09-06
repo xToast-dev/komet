@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using HarmonyLib;
 using Komet.Runtime;
 using Vintagestory.API.Client;
@@ -28,32 +29,25 @@ namespace Komet.Culling;
 /// Visibility is a union over rays, so the result does not depend on their order. Marking a
 /// chunk visible sets one bit that is only ever set (never cleared) during the walk, so the
 /// concurrent writes are idempotent.
+///
+/// The walk shares Komet's worker pool with the visibility sweep rather than holding threads of
+/// its own. That used to be the other way round, for a reason that no longer holds: a walk in
+/// flight could hold up a render stage queued behind it, so the two sets were kept apart and a
+/// niceness mechanism was added to stop them fighting over cores. The pool solves it at the
+/// source - the walk is queued at Background, the sweep at Critical, and a worker takes the
+/// sweep the moment it finishes its current slice. Both workloads were already sliced to tens
+/// of microseconds, so that wait is bounded by roughly what an OS wake costs anyway.
 /// </summary>
 public static class FastChunkCuller
 {
     public static bool Enabled = true;
 
-    /// <summary>0 = auto (leave two cores for the game).</summary>
-    public static int MaxThreads;
-
     /// <summary>
-    /// Its own threads, separate from the cull batch's. Sharing one set would mean an occlusion
-    /// walk in flight could hold up a render stage behind it - which is the very stall the
-    /// dedicated threads exist to remove, just moved one level in.
-    /// </summary>
-    public static WorkerSet Workers { get; private set; } = new("komet-occl");
-
-    /// <summary>
-    /// Unix nice increment for the walk's threads. Must be set before <see cref="StartWorkers"/>,
-    /// since a thread's priority is set once when it starts.
+    /// Unix nice increment for the pool's background workers. Must be set before the pool
+    /// starts: nice is a one-way door for an unprivileged thread, so it is applied once when a
+    /// worker starts, and the workers that carry it decline the two queues the frame waits on.
     /// </summary>
     public static int Niceness;
-
-    public static void StartWorkers()
-    {
-        if (Niceness > 0) Workers = new WorkerSet("komet-occl", Niceness);
-        Workers.Start(MaxThreads > 0 ? MaxThreads : WorkerSet.AutoThreads(2));
-    }
 
     /// <summary>Reused across passes; the sink is pure scratch, so each slice gets its own copy
     /// of the template and nothing has to be merged afterwards.</summary>
@@ -211,7 +205,7 @@ public static class FastChunkCuller
             return false; // nothing moved enough to be worth redoing
         }
 
-        var startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        var startTicks = Stopwatch.GetTimestamp();
 
         // A teleport-sized jump opens a burst window in which the rate limit below stands
         // down. Right after arriving somewhere unvisited, the world assembles from nothing:
@@ -222,7 +216,7 @@ public static class FastChunkCuller
         // seconds after every teleport. The limit exists to protect chunksLock during
         // SUSTAINED streaming; a three-second arrival burst is not what it was for.
         if (!samePosition && IsTeleportJump(centerpos, (int)(cameraPos.X / 32.0), (int)(cameraPos.Y / 32.0), (int)(cameraPos.Z / 32.0)))
-            burstUntilTicks = startTicks + 3L * System.Diagnostics.Stopwatch.Frequency;
+            burstUntilTicks = startTicks + 3L * Stopwatch.Frequency;
 
         // Re-runs triggered purely by chunks streaming in are rate limited; a pass whose
         // trigger is the camera crossing a chunk border still runs immediately, because that
@@ -235,7 +229,7 @@ public static class FastChunkCuller
         if (RateLimitApplies(samePosition, MinIntervalMs, startTicks, burstUntilTicks))
         {
             var interval = Math.Max(MinIntervalMs, StatLastMs * 5.0);
-            if ((startTicks - lastPassTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency < interval)
+            if ((startTicks - lastPassTicks) * 1000.0 / Stopwatch.Frequency < interval)
             {
                 StatRateLimited++;
                 return false;
@@ -361,7 +355,7 @@ public static class FastChunkCuller
 
         int fromX = centerpos.X, fromY = centerpos.Y, fromZ = centerpos.Z;
 
-        if (Workers.ThreadCount < 1 || shell.Length < 256)
+        if (JobScheduler.ActiveWorkers < 1 || shell.Length < 256)
         {
             var sink = template;
             for (var i = 0; i < shell.Length; i++) TraceThree(ref sink, shell[i], fromX, fromY, fromZ, aboveHeightLimit);
@@ -379,7 +373,7 @@ public static class FastChunkCuller
                 // A ray is short and their cost varies with how far it gets before hitting
                 // something opaque, so slices are small enough to even out and still amortise
                 // the hand-out over 64 traces.
-                Workers.Run(traceBody, shell.Length, 64);
+                JobScheduler.RunBatch(traceBody, shell.Length, 64, JobKind.Occlusion);
             }
             finally
             {
@@ -390,7 +384,7 @@ public static class FastChunkCuller
 
         Swap();
 
-        var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        var ms = (Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency;
         StatLastMs = ms;
         if (ms > StatPeakMs) StatPeakMs = ms;
         StatPasses++;

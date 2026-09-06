@@ -24,14 +24,25 @@ what else that number is good for.
 In game:
 
 ```
+.komet           open the performance window
+Ctrl+F7          the same window
 F7               toggle the performance HUD
 Shift+F7         toggle the mod profiler HUD: what the other mods cost and do
-.komet           the same numbers, compact, in chat
+.komet stats     the HUD's numbers, compact, in chat
 .komet mods      per-mod costs, patches and load times as text
 .komet report    full diagnostic block written to client-main.log
 .komet safemode  every optimisation that changes what is drawn, off at once —
                  settles in seconds whether a visual glitch comes from this mod
 ```
+
+The window has a page per subject — frametime and its 1 %/0,1 % lows with a live graph,
+CPU by render stage, GPU by pass, culling, entities, chunks, memory, threads, caches,
+other mods, hitches, the runtime toggles as switches, the config, the stress test, patch
+conflicts and the full report with a copy button. Every figure in it is the same figure
+the HUD and `.komet report` show — it reads the mod's measurements, it does not take its
+own — and every button calls the command it is named after. Only the page on screen is
+composed, four times a second, and what that costs is printed on the overview page next
+to the HUD's own cost.
 
 The HUD and the `.komet` replies follow the game language; English and German ship with
 the mod. Logs, reports and hitch lines stay English on purpose: they end up in bug
@@ -97,7 +108,9 @@ permission of Anego Studios; that folder's README lists them with their checksum
 ## Project structure
 
 ```
-KometModSystem.cs   loading, config, the .komet command
+KometModSystem.cs   loading, config, the .komet command and its toggle table
+Gui/                the .komet window: the dialog, the monospace text panel, the
+                    frametime graph
 Culling/            visibility: frustum sweep, occlusion pass, ray traversal
 Runtime/            threads, budgets, pools, samplers under the patches
 Guard/              self-check: foreign patches, engine fingerprint, task codes

@@ -2464,6 +2464,15 @@ weiter, statt zurückzugeben.
   Distanz-Sortierung, auf die ich gesetzt hatte — 64 aufeinanderfolgende Teile sind ein *Ring*
   um den Spieler, und dessen Bounding-Box umspannt den halben Sichtbereich. Räumliche
   Kohärenz innerhalb eines Pools gibt es nur radial, nicht als Box.
+* **Die sichtbaren Flächen mit auf den Fenster-Worker.** `CalculateVisibleFaces(_Fluids)`
+  hängt nur am Fenster, nicht am Meshing des vorigen Chunks — könnte also überlappen. Ruft
+  aber virtuelle `Block`-Methoden auf (auch die fremder Mods) und benutzt `tmpPos` des einen
+  Tesselators. Der nächste greifbare Posten am Ladepfad, aber er braucht dieselbe
+  In-Game-Validierung wie der Fensterbau. Siehe „Drei Posten am Ladepfad" unten.
+* **`OnBeforeFrame` vom Upload-Lock befreien.** Der Upload läuft unter demselben Lock, das der
+  Tesselations-Thread für `EnqueueOrMerge` braucht — sieht nach Kontention aus, ist aber keine:
+  die Upload-Queue steht bei fünf Einträgen gegen 1585 wartende Tesselationen. Umbau eines
+  funktionierenden Systems ohne messbaren Gewinn.
 * ~~**Lücken-Merging bei Draw-Ranges.**~~ Bis 1.49 stand hier „den Aufwand nicht wert" —
   begründet mit einer Szene, die damals GPU-gebunden war. Die 1.47/1.48-Reports zeigten das
   Gegenteil (gpu ~2,5 ms von ~13 ms Frame, 15.749 Ranges über 929 Draw-Calls), also ist es
@@ -3282,3 +3291,1042 @@ HUD: `schatten-takt … · neu nach 14,4 Blöcken`. Report: `far cadence: N von 
 (X % gespart), every 2-4 frames, redraw after 14,4 blocks of camera movement (coverage margin
 16)`. Live: `.komet toggle shadowmargin`, Stress-Phase „far shadow coverage margin off (redraw on
 every step)" — die Phase ist die, die man **im Flug** liest, nicht im Stand.
+
+## Die nahe Kaskade zeichnet ihre Tiefe zur Hälfte umsonst (05.09., spät)
+
+Der GPU-Report ist eindeutig: `shadow 17,2 (far 2,3 = 8,3 when drawn, near 14,9)` von 19,7 ms
+GPU-Frame. Die nahe Kaskade **ist** das Frame. Und sie hat sich nicht bewegt, als die Karte von
+4096 auf 2048 px ging (21,1 → 19,9 ms) — es ist nicht die Füllrate, es ist die Geometrie, die im
+Volumen steckt. Also: wie groß ist das Volumen wirklich, und wovon ist es voll?
+
+### Was die Engine baut
+
+```csharp
+// SystemRenderShadowMap.OnRenderShadowNear
+double num = 30 + 3 * (ClientSettings.ShadowMapQuality - 1);        // 39 bei Qualität 4
+ShadowBox.ShadowBoxZExtend = 50f + 50f * Math.Abs(1f - sunY) + 100f; // 150..200 Blöcke
+```
+
+```csharp
+// ShadowBox.update(), am Ende
+minZ += 0.0;
+maxZ += ShadowBoxZExtend;
+```
+
+Das ist **richtig**, und zwar exakt richtig. Der Lichtraum schaut die Sonne an —
+`Mat4d.LookAt(lightViewMatrix, sunPosition, (0,0,0), (0,1,0))`, also zeigt +z **zur Sonne** — und
+nur Geometrie mit *höherem* Licht-z als ein Empfänger kann ihn beschatten. Deshalb wird die Box
+nach oben verlängert und nur nach oben: `maxZ` steigt, `minZ` bleibt.
+
+### Und was die Projektion daraus macht
+
+```csharp
+private void loadOrthoModeMatrix(double[] projectionMatrix, double width, double height, double length)
+{
+    Mat4d.Identity(projectionMatrix);
+    projectionMatrix[0]  =  2.0 / width;
+    projectionMatrix[5]  =  2.0 / height;
+    projectionMatrix[10] = -2.0 / length;
+    projectionMatrix[15] =  1.0;
+}
+```
+
+Keine Translation. Eine Ortho-Matrix ohne Translation clippt `|z| <= length/2` **um den
+Licht­raum-Ursprung** — sie benutzt nur die *Länge* der Box und erfährt nie, **wo** die Box liegt.
+Die ganze Sorgfalt in `update()` ist damit weg: Das gezeichnete Volumen ist
+`[−length/2, +length/2]`, die Verlängerung landet zur Hälfte oben und **zur Hälfte unten**.
+
+Diese untere Hälfte sind rund neunzig Blöcke Welt *hinter* jedem Empfänger, den sie treffen
+könnte — aus Sicht der Sonne dahinter. Sie wird jedes Frame in die Nahkarte gezeichnet und kann
+kein einziges Fragment verdunkeln.
+
+### Die Untergrenze steht im Shader
+
+Nach unten muss das Volumen nur so weit reichen, wie es noch **Empfänger** gibt, und das legt
+`shadowcoords.vsh` auf die Nachkommastelle fest:
+
+```glsl
+float distanceNear = clamp(
+    ... + max(0.0, len / shadowRangeNear - 0.15)
+, 0.0, 1.0);
+nearSub = shadowCoordsNear.w = clamp(1.0 - distanceNear, 0.0, 1.0);
+```
+
+Das Gewicht der Nahkarte ist null jenseits von `1,15 × shadowRangeNear` = 45 Blöcken. Weiter weg
+liest kein Pixel die Nahkarte mehr, egal was drinsteht. Der Lichtraum ist eine Rotation, also ist
+diese euklidische Schranke zugleich eine Schranke auf das Licht-z. Dazu ein Rand für den Knick
+`max(0.0, shadowCoordsNear.z - 0.98) * 100` — der schneidet die Nahkarte hart ab, nicht weich, ein
+Empfänger darf da nicht hineinlaufen.
+
+### Der Eingriff: ein Term
+
+`ShadowDepthPatches.FitDepthRange`, ein zweiter Postfix auf `loadOrthoModeMatrix` (der erste ist
+das Texel-Snapping, der schreibt `[12]`/`[13]`, dieser `[10]`/`[14]`):
+
+- **Obere Ebene bleibt exakt vanillas** `+length/2`. Damit wird kein Verdecker weggelassen, den
+  vanilla gezeichnet hat — das Bild ändert sich nicht, und das ist der Grund, warum das hier
+  Default sein darf.
+- **Untere Ebene** auf den tiefsten Empfänger, den die Nahkarte noch bedient, plus Knick-Rand.
+- Nie länger als vanilla; wo die neue Ebene tiefer läge als vanillas, gilt vanillas.
+
+Alles Nachgelagerte hängt an derselben Matrix — die gepushte `PMatrix`, `shadowMvpMatrix`,
+`toShadowMapSpaceMatrixNear` und die sechs Ebenen, die `CalcFrustumEquations` aus `PMatrix.Top`
+zieht. Lookup und CPU-Cull folgen von allein.
+
+Mit den Feldzahlen (39-Block-Kaskade, 182 Blöcke Extend, 237 Blöcke Volumen): **27 % der Tiefe
+weg, bei identischem Bild.**
+
+### Gratis dazu
+
+`fogandlight.fsh` zieht für die Nahkarte konstant `0,0005` in **normalisierter** Tiefe ab, also
+`0,0005 × Boxtiefe` in Blöcken. 237 → 172 Blöcke heißt Bias 0,119 → 0,086 Blöcke. Genau diese
+Größe ist das, woraus Peter-Panning unter Laub gemacht ist. Und der Tiefenpuffer verteilt dieselbe
+Präzision über weniger Welt.
+
+### Ferne Kaskade: absichtlich nicht
+
+Derselbe Defekt, aber: 2–6 ms amortisiert gegen 15–18, die Karte wird über Frames behalten und
+reprojiziert (`ShadowThrottlePatches.OffsetShadowMatrix`), und ihre Box wird ohnehin komplett
+ersetzt (`MakeBoxSymmetric`). Eine Kaskade nach der anderen, jede mit einer Zahl dahinter.
+
+### Nachweis
+
+verify prüft die Eigenschaft über 3 Reichweiten × 4 Boxlängen × 4 Kamerapositionen: die obere
+Ebene bewegt sich **nie**, das Volumen wächst **nie**, jeder Empfänger innerhalb `1,15 × range`
+liegt drin und unter Tiefe 0,98, und die beiden Matrixterme bilden den Bereich exakt auf
+`[−1, +1]` ab. Dazu die Gegenprobe, dass der Zuschnitt auf den Feldzahlen mindestens 20 % bringt —
+ein Patch, der nichts spart, soll auffallen.
+
+`ShadowNearDepthFit` in komet.json, `.komet toggle shadownearfit` live, Report:
+`near depth: 182 blocks (the engine's), volume 172 of 237 blocks deep (27 % of it cut down-sun)`.
+
+### Und `.komet shadowneardepth` bedeutet jetzt, was es sagt
+
+Die Kappung des Extends hat vorher das Volumen *symmetrisch* gekürzt — von jedem Block, den sie
+weggenommen hat, kam die Hälfte aus der Hälfte, die ohnehin nichts konnte. Mit dem Fit ist die
+Aufgabenteilung sauber: der Fit nimmt den nutzlosen Teil zum Nulltarif, die Kappung handelt
+darüber hinaus Reichweite gegen Tempo — und nur letzteres ist eine Ermessensfrage.
+
+### Korrektur: 6 %, nicht 27 % — der Lichtraum-Ursprung liegt 50 Blöcke sonnenwärts
+
+Der nächste Report sagte `volume 221 of 236 blocks deep (6 % of it cut down-sun)`. Der Fehler
+in der Rechnung oben: Ich hatte die Kamera bei Licht-z ≈ −1 angenommen („die Einheits-Eye der
+LookAt"). `ClientGameCalendar.Update` setzt aber
+
+```csharp
+SunPosition.Set(SunPositionNormalized).Mul(50f);
+```
+
+und beide LookAts (`lightViewMatrix` beim Zeichnen, `array` für die Cull-Ebenen) setzen ihr Auge
+genau dorthin. Der Lichtraum-Ursprung, um den die Ortho zentriert, ist also **50 Blöcke
+sonnenwärts der Kamera**. Relativ zur Kamera ist vanillas Volumen damit
+`[−236/2 + 50, +236/2 + 50] = [−68, +168]`. Die Empfänger brauchen 45 der 68 nach unten; der Fit
+nimmt den Rest — 15 Blöcke, 6 %. Der Fit selbst hat korrekt gerechnet (er liest `lightView[14]`
+und nimmt nichts an); falsch war nur, was ich daraus versprochen habe. verify rechnet die
+Feldzahlen jetzt mit der Kamera bei −50 nach und verlangt 4–10 %, nicht 20.
+
+**Wichtiger als die Zahl:** Für flaches Gelände sitzt der Preis der Nahkaskade gar nicht in der
+Tiefe. Das Volumen ist ein geneigter Balken 63 × H × 236 entlang der Sonne; er trifft die
+(horizontale) Geländeoberfläche in einem Streifen der Länge `H / sin(Elevation)`. Was gezeichnet
+wird, ist dieser Streifen — samt Bäumen darauf — und der wird von `ShadowBoxZExtend` **nicht**
+kürzer, solange der Balken oben und unten aus dem Gelände herausragt (68 nach unten reicht
+immer, 168 nach oben fast immer). Die Tiefe zählt nur, wo Gelände sonnenwärts in den Balken
+hineinragt: der Berg gegen die Sonne, die Klippe, unter der man steht.
+
+Das macht `.komet shadowneardepth` zu einem schwachen Hebel — und es war zusätzlich ein
+gefährlicher: Bei 80 Blöcken stand die untere Ebene 23 Blöcke unter der Kamera, die Nahkarte
+bedient aber Empfänger bis 45. Auf flachem Boden verloren Empfänger ihren Nah-Schatten, genau
+dort, wo die Kappung „nichts kosten" sollte. Mit dem Fit ist die untere Ebene aus den Empfängern
+abgeleitet und bleibt, wo sie ist, egal was die Kappung mit dem oberen Ende macht — verify
+prüft den 80er-Fall.
+
+### Und ein Fehler im engen Cull-Band von gestern
+
+Dieselbe Fünfzig steckt noch woanders. `TightenCullRange` hat den Bereichstest der Nahkaskade
+auf `halfX + 48` verengt, mit dem Kommentar „plus der Einheits-Eye-Versatz der Lichtmatrix".
+Der Versatz ist nicht eins, er ist `50 · |sun.x|` — bei 35° Sonne 41 Blöcke, und vom Pad bleiben
+nach dem Teilradius (27,7) nur 20. Ein Band von Verdeckern an der sonnenwärtigen Kante des
+Volumens wurde vom Bereichstest verworfen, das die Ebenen behalten hätten: die langen Schatten
+eines Hügels gegen die Sonne, in der Nahkarte weg (in der Fernkarte noch, also halbe Stärke).
+Jetzt ein eigener Term (`ShadowPatches.EyeOffsets`), und verify setzt das Auge dahin, wo das
+Spiel es setzt — ohne den Term fällt der Test durch.
+
+## Die Nahkaskade zeichnet nur noch, was auf etwas Sichtbares fallen kann (05.09., Nacht)
+
+Der GPU-Hebel, der nach alledem übrig bleibt, ist der Streifen selbst: nicht *wie tief*, sondern
+*wie breit* die Nahkaskade zeichnet. Ihre Box folgt dem Blick nicht (`getCameraRotationMatrix`
+ist die Identität), ihre Karte bedient Empfänger in jede Richtung — und der Boden hinter der
+Kamera ist nie auf dem Schirm. Jeder Verdecker, dessen Schatten nur dort landet, wird umsonst
+gezeichnet; im Wald ist das der Großteil der Bäume hinter und neben einem.
+
+Was einen sichtbaren Empfänger erreichen *kann*, ist exakt:
+
+- die Nahkarte bedient Empfänger nur bis `1,15 × range` = 45 Blöcke (`shadowcoords.vsh`);
+- gezeichnet werden nur Empfänger im Kamerafrustum;
+- ein Verdecker beschattet entlang der Lichtrichtung, im Lichtraum die z-Achse.
+
+Ein Verdecker zählt also nur, wenn sein Licht-(x, y) auch ein Empfänger im Frustum-Ausschnitt
+bis 45 Blöcke hat. Und die vier seitlichen Clip-Ebenen der Schattenprojektion sind Ebenen
+konstanten Licht-x bzw. Licht-y. `ShadowFootprintPatches` zieht genau diese vier Ebenen an den
+Ausschnitt heran — an den Ebenen, die die Engine selbst in `PrepareForShadowRendering` gebaut
+hat, erkannt daran, dass ihre Normale senkrecht zum Licht steht (nicht am Index). Pro Ebene:
+das Minimum der vorzeichenbehafteten Distanz über die fünf Ecken des Ausschnitts (konvex, linear
+→ das Minimum liegt in einer Ecke), zusätzlich beschränkt durch Kugelmitte minus Radius; das
+größere der beiden ist immer noch eine untere Schranke. Davon 8° Winkel plus zweimal die Drehung
+des letzten Frames plus 4 Blöcke Pad ab, den Rest rückt die Ebene hinein.
+
+Vanillas `InFrustumShadowPass` und der `FastCuller` lesen dieselben Ebenenfelder — beide Pfade
+folgen, der Cull-Verifier bleibt gültig. Abdeckung, Texelraster und Lookup der Karte ändern sich
+nicht; die Karte enthält „kein Verdecker", wo nichts Sichtbares einen hätte lesen können.
+
+Was das bringt, hängt vom Blick relativ zur Sonne ab: quer zum Licht etwa die Hälfte der
+Geometrie, in oder gegen die Sonne weniger, beim Blick auf den Boden das meiste. Die Zahl steht
+im Report: `near pass: N triangles … | footprint X % of the box`, mit den Dreiecken des
+Kamera-Passes daneben — damit die GPU-Millisekunden der Nahkaskade endlich als ms/Dreieck lesbar
+sind.
+
+Es tritt zurück, wenn die Nahkaskade über Frames behalten wird (`.komet shadownearskip`): eine
+behaltene Karte, auf einen Blick zugeschnitten, wäre für den nächsten falsch. Die Fernkaskade
+bleibt aus demselben Grund unangetastet — ihre Karte *wird* behalten und reprojiziert, und eine
+Drehung ist für sie genau deshalb gratis, weil sie jede Richtung abdeckt.
+
+verify: 3 Elevationen × 3 Azimute × 4 Yaws × 3 Pitches, je 1500 zufällige Sonnenstrahlen durch
+sichtbare Empfänger — jeder Verdecker, den vanilla auf so einem Strahl behalten hat, bleibt;
+die Tiefenebenen bewegen sich nie; mindestens eine Blickrichtung spart etwas.
+
+
+## Der Report, der die Sonde erzwingt: 593k Dreiecke für 17 ms (05.09., spät nachts)
+
+Mit den Dreiecken je Pass im Report steht die Nahkaskade nackt da:
+
+```
+gpu per stage: … shadow 17,5 (far 0,2, near 17,4) | opaque 0,0 …
+near pass: 593.438 triangles in 98 ranges per frame (camera pass 17.266.653 triangles)
+```
+
+593 Tausend Dreiecke gegen 17 Millionen im Kamera-Pass — und die 593k sollen 17 ms kosten, die
+17 Mio. **0,0**. Das ist keine Geometrie, das kann keine sein. Und es ist auch keine
+Füllrate-Aussage, denn die Zeile darüber ist nicht das, was sie zu sein scheint.
+
+### Timestamps sind top-of-pipe
+
+`glQueryCounter(GL_TIMESTAMP)` schreibt die Zeit, wenn der Command-Processor den Befehl
+**erreicht** — nicht, wenn die Arbeit davor **fertig** ist. Draw-Calls werden in Mikrosekunden
+abgesetzt und rechnen später; die nächste Barriere (ein Framebuffer-Clear, eine Textur, in die
+gerade gezeichnet wurde und die jetzt gesampelt wird) hält den CP an, bis alles davor fertig
+ist — und die Spanne, in der diese Barriere liegt, erbt alles, was noch in der Pipeline war.
+Der Clear der Nahkarte ist so eine Barriere. Also landen im „near"-Span: der Nah-Pass selbst
+**plus der Rest des vorigen Frames** — Opaque, OIT, Post. Die 17 Mio. Dreiecke des Kamera-Passes
+kosten nicht 0,0 ms; sie werden in 0,0 ms *abgesetzt* und rechnen in der Schattenspanne des
+nächsten Frames zu Ende.
+
+Drei Optimierungen an der Nahkaskade (Tiefen-Fit, Kappung, Sichtbarkeits-Zuschnitt) wurden auf
+diese Zeile hin gebaut, bevor die Dreiecke daneben standen. Der Fit und der Zuschnitt sind
+korrekt und bleiben — sie sparen, was sie sparen, nur eben von einem kleineren Betrag als
+gedacht. Was fehlt, ist das Instrument, das nicht lügt.
+
+### `GL_TIME_ELAPSED` ist bottom-of-pipe
+
+Eine Elapsed-Query endet, wenn die eingeschlossenen Befehle **abgeschlossen** sind. Eine Klammer
+um einen Pass ist die Zeit, die dieser Pass wirklich gebraucht hat — egal, was davor noch in der
+Pipeline hing. Und `GL_FRAGMENT_SHADER_INVOCATIONS` (ARB_pipeline_statistics_query) zählt, was
+der Pass **schattiert** hat: die eine Zahl, die „Füllrate oder Geometrie" ohne Argument
+entscheidet.
+
+`GpuPassProbe` klammert die solide und die Laub-Hälfte beider Kaskaden (die transpilierte Grenze
+gehört ohnehin `ShadowCullPatches`) und `ChunkRenderer.RenderOpaque`, jedes dritte Frame. Nur
+eine Elapsed-Query darf aktiv sein, also setzt der Frame-Timer in diesen Frames seine eigene aus
+— zwei von drei Samples bleiben ihm. Gelesen wird vier Sonden später und nur, wenn der Treiber
+das Ergebnis als fertig meldet; ein Lesen wartet nie.
+
+```
+gpu per pass (elapsed, every 3. frame): near solid X ms / N Mfrag, near foliage Y ms / M Mfrag | camera opaque Z ms / K Mfrag
+```
+
+### Die Hypothese, die dran ist
+
+65,6 Texel je Block in der Nahkarte, ein Laubdach von der Sonne aus gesehen zehn bis dreißig
+Lagen tief, jede Lage Textur-Fetch plus `discard` (kein früher Tiefen-Write). Das wären
+Hunderte Millionen Fragmente pro Frame — Füllrate, keine Geometrie. Wenn die Sonde das sagt, ist
+der Umbau klar: die Laub-Pässe in eine **kleinere** Tiefenkarte zeichnen (2048² entspricht exakt
+der 32-px-Textur, verliert also kein Alpha-Loch) und per Vollbild-`min` in die 4096²-Karte
+mischen — die solide Geometrie behält ihre Schärfe, das Laub kostet ein Viertel. Wenn die Sonde
+etwas anderes sagt, wird das nicht gebaut. Bis dahin: `.komet toggle shadowfoliage` lässt die
+Laub-Pässe in beiden Schattenkarten weg — ein Blick auf die Frame-Zeit, und die Frage ist
+beantwortet.
+
+### Und die Partikel
+
+`particles: 660 alive on the main pools (16,14 ms/frame)`. `TickFixedStep` macht nur alle
+`PhysicsTickTime` (1/16 s) einen Schritt — 660 Partikel können keine 16 ms Physik sein. Aber
+`glBufferSubData` auf einen Instanzpuffer, den die GPU noch liest, blockiert den Render-Thread,
+bis die GPU aufgeholt hat: das Warten eines GPU-limitierten Frames taucht dort auf, wo die CPU
+als nächstes einen belegten Puffer anfasst. `Platform.UpdateMesh` wird innerhalb von
+`OnNewFrame` geklammert; die Zeile liest jetzt `physics X + upload Y`.
+
+
+## Die Sonde antwortet: die Nahkaskade kostet 1,3 ms, der Kamera-Pass ist der Berg (06.09.)
+
+```
+gpu per pass (elapsed, every 3. frame, 5.106 samples): near solid 0,1 ms / 0 frag, near foliage 1,2 ms / 100 Mfrag | camera opaque 5,2 ms / 23 Mfrag | far when drawn: solid 1,3 ms / 0 frag, foliage 3,4 ms / 131 Mfrag
+near pass: 234.537 triangles (camera pass 6.068.585 triangles)
+particles: 117 alive (0,07 ms/frame: physics 0,00 + upload 0,07)
+```
+
+Bottom-of-pipe gemessen ist die Nahkaskade **1,3 ms** — nicht 17. Die Stage-Zeile daneben sagt
+weiter `near 8,2`, und das ist jetzt ohne Argument als Erbschaft der vorigen Frame-Hälfte
+erklärt. Der teuerste Pass ist der **Kamera-Opaque-Pass: 5,2 ms für 6 Mio. Dreiecke, 23 Mio.
+Fragmente auf 3,7 Mio. Pixel** — sechs Fragmente je Pixel, was bei Dreiecken unter Pixelgröße
+das Quad-Overdraw ist (jedes Sub-Pixel-Dreieck spawnt ein 2×2-Quad). Hochgerechnet auf die
+17 Mio. Dreiecke des Wald-Reports sind das die ~15 ms, die dort als „near" gebucht waren.
+
+Der Nutzer hatte von Anfang an recht: „Blätter/Unkraut". Blätter sind `renderpass:
+OpaqueNoCull` mit `faceCullMode: CollapseMaterial` und einem `lod0Shape` bis 211 Blöcke — aber
+**ohne LOD-2-Ersatz** (`doNotRenderAtLod2` tragen nur die Aquatik-Blöcke). Ein Wald wird also
+Blatt für Blatt bis zur Sichtweite gezeichnet.
+
+### Das Instrument dazu: Dreiecke je Pass × Entfernung × LOD
+
+Der Sweep bucht jedes emittierte Teil in eine (Pass, Band, LOD)-Tabelle — eine Addition je
+Teil, thread-lokal, am Frame-Rand gefaltet. Den Pass liefert ein Prefix auf
+`MeshDataPoolManager.Render` (`PoolPassPatches`), der den Manager per Referenz in
+`ChunkRenderer.poolsByRenderPass` nachschlägt; ein Pool wechselt nie den Manager, also merkt
+sich der Pool-Cache den Pass. Drei Zeilen im Report: je Pass, je Entfernungsband mit
+Laub-Anteil, je LOD.
+
+### Der grobe Hebel, ehrlich bepreist: `.komet foliagerange`
+
+Jenseits der Reichweite werden OpaqueNoCull und BlendNoCull im Kamera-Pass nicht gezeichnet —
+ein Baum dort ist ein Stamm. Technisch eine Kappung der LOD-Distanztabelle für Laub-Pools (der
+Sweep kostet nichts extra), der Cull-Verifier schaut bei diesen Sweeps weg. Default vanilla;
+Safemode schaltet es ab. Der richtige Hebel — ein LOD-2-Ersatz für Blätter oder weniger Flächen
+je Blattblock — kommt, sobald die Histogramm-Zeilen sagen, ob die Dreiecke im Nahbereich oder in
+der Ferne sitzen.
+
+### Partikel: `physics 0,00 + upload 0,07`
+
+Bei 117 Partikeln und einem nicht GPU-limitierten Frame ist der Upload 0,07 ms. Die 16 ms im
+Wald-Report stehen damit noch als „Warten auf die GPU im Upload" im Raum, unbewiesen — die Zeile
+entscheidet es beim nächsten GPU-limitierten Frame.
+
+
+## Pools als Orte: der Kamera-Pass von vorn nach hinten (06.09.)
+
+Die Sonde hat den Kamera-Pass zerlegt: **39 Mio. geshadete Fragmente auf 3,7 Mio. Pixel** —
+zehn je Pixel, eines zählt — und der Fragment-Shader ist etwa die Hälfte des Passes (4,3 ms mit
+vollem, 3,4 ms mit flachem Shader bei 50 % mehr Dreiecken). Der Tiefentest ist ordnungsunabhängig
+in dem, was er *behält*, nicht in dem, was er *kostet*: ein Fragment hinter einer schon
+geschriebenen näheren Tiefe wird verworfen, bevor der Shader läuft; eines, das vor seinem
+Verdecker gezeichnet wird, wird geshadet und dann überschrieben. Von vorn nach hinten zeichnen
+macht aus den meisten der neun anderen Fragmente Verwerfungen.
+
+Das war bisher unmöglich, und der Grund sitzt in `MeshDataPoolManager.AddModel`: „erster Pool
+mit Platz". Chunks kommen in Server- und Tesselationsreihenfolge, also enthält jeder Pool Teile
+von überall, und jeder Pool-Draw deckt die ganze Sicht ab. Sortiert man die Teile *innerhalb*
+eines Pools, ordnet man 1/513 der Welt; zwischen Pools bleibt die Reihenfolge Zufall — und genau
+dort entsteht der Overdraw.
+
+### `SpatialPools`: Routing nach Region
+
+Ein Prefix auf `AddModel` ersetzt die Kandidatenliste: statt aller Pools die des Regions-
+Schlüssels `(x >> 7, z >> 7)` — 128 × 128 Blöcke, alle Höhen (arithmetischer Shift, damit
+negative Koordinaten wie positive flooren; verify prüft −1 und −128). Sind die Pools der Region
+voll, entsteht ein neuer *für die Region* — dieselbe Größenregel, dieselbe Registrierung beim
+Master-Pool, dieselbe Ursprungsregel wie im Original. Vom Reclaimer geleerte Pools (Kapazität 0)
+verweigern `TryAdd` ohnehin und fallen beim nächsten Fehlversuch aus der Regionsliste.
+Mini-Dimensionen (dimension 1) gehen unverändert den Vanilla-Weg; ihre Pools werden per Ursprung
+nachgeschlagen, da darf nichts dazwischen.
+
+Ein Pool ist damit ein Ort. Seine gecachte Box (die der `FastCuller` ohnehin hält) ist klein,
+und **`PoolPassPatches.NotePass` sortiert die Pool-Liste des Managers einmal je Frame nach
+Entfernung**, bevor die Engine-Schleife sie liest — nur im Kamera-Pass; die Schattenpässe sind
+Depth-only und behalten ihre Reihenfolge. Die Liste bleibt dasselbe Objekt, nur die Ordnung
+ändert sich; nichts in der Engine hält Indizes hinein.
+
+### Innerhalb des Pools: Zellen nach Entfernung
+
+Der Sweep emittierte bisher in Index-Reihenfolge (Bitmap-Scan), damit benachbarte Ranges
+verschmelzen. Im sortierten Modus läuft er die Zellen des Gitters nach Entfernung ihres
+Mittelpunkts ab, je Zelle die Buckets in Bucket-Reihenfolge — innerhalb eines Buckets sind die
+Indizes aufsteigend, also überleben die Rücken-an-Rücken-Merges innerhalb einer Zelle. Danach die
+seit dem letzten Rebuild angehängten Teile, die noch keine Zelle haben. Gap-Bridging ist im
+sortierten Sweep aus: es läuft die Teileliste zwischen zwei emittierten Teilen in Indexreihenfolge
+ab, und die gibt es nicht mehr.
+
+Der Cull-Verifier vergleicht Ranges gegen Vanillas Liste *in Emissionsreihenfolge* — er ist
+ordnungsabhängig (verify beweist das mit drei Teilen in falscher Reihenfolge). `Maybe()` sortiert
+die emittierten Ranges deshalb vor dem Vergleich nach Byte-Start zurück: geprüft wird die
+*Menge*, und die ist unverändert.
+
+### Preis und Zahl
+
+Regions-Pools füllen sich ungleichmäßiger als ein globales First-Fit, es gibt also mehr,
+teils halbleere. Der Reclaimer gibt leere zurück; der Report zeigt `draw order: nearest first
+(… pool sorts) | pools: routed by 128-block region, N regions holding M pools, … models routed,
+… pools created, … handed to vanilla`. Und `draw ranges` daneben sagt, was das Bridging gekostet
+hat. `.komet toggle spatialpools` gilt für alle ab dann eingefügten Modelle, `fronttoback` sofort.
+
+### Ergebnis: abgeschaltet, mit Zahl
+
+Der Report nach dem Neubetreten: **1.917 Pools à 56 Teile** (First-Fit: 513 à 289), jeder in
+voller Engine-Größe alloziert — das Vierfache an Videospeicher, Allokationsstände von 0,3 bis
+**7,9 Sekunden**, während der Treiber auslagerte, 21 fps. Regionen von 128 Blöcken sind für einen
+Pass zu leer: viele Chunks tragen in einem gegebenen Pass nichts bei, und ein Pool je Region und
+Manager bleibt bei einem Fünftel der Füllung.
+
+Und das Eigentliche trat nicht ein: **40 Mio. geshadete Fragmente von vorn nach hinten gegen
+39 Mio. in Indexreihenfolge.** Der Tiefentest verwirft unter dem Chunk-Shader nicht früh — ein
+Shader mit `discard` schreibt Tiefe spät, und der frühe Test hat nichts Endgültiges, wogegen er
+verwerfen könnte. Die Zeichenreihenfolge erreicht den Fragment-Shader gar nicht. Ein
+Tiefen-Vorpass gäbe ihm etwas Endgültiges — und kostet ein zweites Front-End (~2,3 ms) plus
+triviale Fragmente, um ~1,8 ms Shading zu sparen: netto Verlust in dieser Szene.
+
+Beides bleibt im Code, per Default aus (`SpatialPools`, `FrontToBack` = false, Layout 21). Was
+übrig ist, hatte das Histogramm vor dem Experiment schon gesagt: weniger Dreiecke jenseits von
+640 Blöcken, sonst nichts.
+
+## Verschmolzene Fernflächen: jenseits von 640 Blöcken Rechtecke statt Blöcke (06.09.)
+
+Das Histogramm hatte es gesagt, das Pool-Experiment hat es bestätigt: der Kamera-Pass wird nur
+durch weniger Dreiecke jenseits von 640 Blöcken billiger. Dort deckt ein Block 1,6 Pixel, und
+die Messung mit flachem Fragment-Shader hatte die Hälfte des Passes im Front-End verortet —
+Dreiecke rastern, die kleiner als ein Pixel sind und trotzdem jedes ein volles 2×2-Fragment-Quad
+anstoßen. Nichts am Bild braucht diese Flächen einzeln: zwanzig Grasoberseiten in 640 Blöcken
+sind eine 32 Pixel lange Linie, deren Textur die Mip-Kette ohnehin auf eine Farbe je Block
+mittelt.
+
+### Was verschmolzen wird — und was nicht
+
+Auf dem Tesselations-Thread, nach `ChunkTesselator.NowProcessChunk`, wird das LOD-1-Mesh jedes
+Opaque- und TopSoil-Teils zerlegt. Verschmolzen werden nur achsenparallele Einheitsflächen:
+vier Vertices in einer Ebene, genau ein Block in jeder Ebenenrichtung, an ganzzahligen
+Positionen; identische Vertex-Flags (Normale, Glow, Z-Offset), kein Wind, keine Spiegelung;
+dieselbe Kachel im Atlas; übereinstimmende Colormap-Daten (Temperatur und Regen in Vierer-
+Stufen); und Vertex-Licht, das über das Rechteck entweder gleich ist oder linear verläuft
+(Toleranz 3/255 je Kanal, geteilte Kanten 2/255). Alles andere — Treppen, Platten, Zäune,
+Meißelblöcke, Laubkreuze, ein Fackel-Gradient — bleibt, wie die Engine es tesseliert hat, und
+wird in jeder Entfernung so gezeichnet. Rechtecke sind auf 16×16 Blöcke begrenzt: die
+Chunk-Shader werten das Rauschen der Saisontönung je Vertex aus und interpolieren über die
+Fläche; ein chunkbreites Rechteck glättete diese Fleckigkeit über 32 Blöcke.
+
+Heraus kommen drei Meshes je Teil: das Engine-Mesh, um die verschmelzbaren Flächen erleichtert
+(an Ort und Stelle kompaktiert, Reihenfolge erhalten); die verschmelzbaren Flächen unverschmolzen
+(`near`); die Rechtecke (`far`). Die Rechtecke behalten die Vertex-Reihenfolge ihrer
+Ursprungsfläche — Winding, Backface-Culling und die SSBO-Face-Packung (v1 = v0 + 2a, v3 = v0 +
+2b, v2 = v0 + 2a + 2b) tragen sich so durch. Das Licht an den vier Ecken kommt von den
+Eckflächen.
+
+### Zwei LOD-Stufen, die die Engine nie vergibt
+
+Beide Extra-Meshes gehen nach `TesselatedChunkPart.AddToPools` in denselben Pool-Manager: die
+Zwillinge mit LOD-Stufe 5, die Rechtecke mit 4, und beide in die Location-Liste des Chunks, so
+dass die Engine sie mit dem Chunk entfernt wie ihre eigenen. Der Sweep zeichnet 5 diesseits der
+Entfernung und 4 jenseits (`BuildLodBounds`, Einträge 4 und 5; die Buckets je Zelle wurden dafür
+von vier auf acht erweitert). `InFrustumAndRange` der Engine liefert für beide Stufen `false` —
+das ist das Sicherheitsnetz: ist der Sweep nicht unser oder das Feature aus, setzt `SyncMode`
+die Zwillinge auf Stufe 1 (überall gezeichnet, wie die Flächen zuvor) und versteckt die
+Rechtecke. Das Bild ist dann die Engine, ohne eine Retesselation. In den Schattenpässen werfen
+die Rechtecke und nicht die Zwillinge: dieselben Oberflächen, ein Bruchteil der Dreiecke. Der
+Cull-Verifier kennt die Regel in seiner Vanilla-Referenz, und die Zufallsläufe der Äquivalenz
+tragen die beiden Stufen, gezeichnet und nicht gezeichnet.
+
+### Der eine Shader-Eingriff
+
+Ein Rechteck trägt auf allen vier Vertices die Kachelmitte als Texturkoordinate. So abgetastet,
+wie die Engine abtastet, zeigt das den Mitteltexel der Kachel über zwanzig Blöcke — einen
+Sprenkel einer rauschigen Textur, gedehnt. Was das Rechteck zeigen muss, ist, was die zwanzig
+Flächen in dieser Entfernung zeigten: die von der Mip-Kette gemittelte Kachel. Also bekommen
+`chunkopaque.fsh` und `chunktopsoil.fsh` einen Umbau am geladenen Quelltext (eine Shader-Mod
+wird geerbt; fehlt der Fetch, schaltet sich das Feature ab): jeder Terrain-Fetch läuft durch
+eine Funktion, die bei jeder Ableitung der Koordinate den normalen Fetch zurückgibt — jede
+tesselierte Fläche spannt ihre Kachel, also hat jede eine — und sonst vier Taps auf der
+gröbsten Mip-Stufe, eine Viertelkachel neben der Mitte. Mit den drei Mip-Stufen der
+Voreinstellung ist die gröbste 4×4 Texel je 32-Pixel-Kachel, jeder bilineare Tap mittelt einen
+2×2-Block, die vier zusammen sind der exakte Kachelmittelwert. Für alles, was die Engine
+tesseliert hat, ist die Variante der alte Fetch plus `fwidth` und ein Vergleich.
+
+Die Uniforms (`kometFarLod` = Mip-Stufe, `kometTileQuarter` = Kachelgröße/4) setzt der
+Render-Prefix des Pool-Managers, wenn das gebundene Programm sie kennt. Ein Shader-Reload der
+Engine ersetzt die Programmobjekte; `FarMeshShaders.Ensure` bemerkt die neue Instanz vor dem
+nächsten Opaque-Pass und legt die Variante erneut an. Beim Verlassen der Welt kommen die
+Engine-Quellen zurück.
+
+### Preis und Erwartung
+
+Der Verschmelzer alloziert außer den zwei Ausgabe-Meshes (aus dem Recycler) nichts; der Report
+bepreist ihn je Teil. Die Rechtecke kosten ihre Vertices zusätzlich zu denen der Engine. Die
+Erwartung aus den Zahlen: 57 % der fernen Dreiecke sind Gelände und Oberboden; wo davon ein
+Großteil zu Rechtecken wird, fällt das Front-End des Kamera-Passes um den Anteil und mit ihm
+die Fragment-Quads, die bisher je Subpixel-Dreieck neu anfingen. Laubkreuze verschmelzen nicht;
+dafür bleibt `.komet foliagerange`. Was das im Wald ausmacht, sagt die Zeile `far mesh` und die
+GPU-Zeile des nächsten Reports — nicht dieser Text.
+
+## `.komet alloctrace`: das Spiel zeichnet seine Allokationen mit Aufrufstapeln auf (06.09.)
+
+Der Sampler im Prozess konnte Thread und Typ nennen — „Int32[] auf dem Tesselations-Thread" —
+und nicht mehr: die Laufzeit liefert ihre Allocation-Ticks an einen Listener ohne den Stapel.
+EventPipe führt zu jedem Tick den Stapel mit, und der Diagnose-Port eines .NET-Prozesses nimmt
+eine Sitzung vom Prozess selbst an. Also zeichnet das Spiel sich N Sekunden lang selbst auf
+(GC-Keyword, verbose) in eine `.nettrace` neben den Logs, dazu eine Beidatei mit den
+Thread-Namen aus `/proc`. Das `alloctool` im Repository macht daraus Bytes je Thread, je Typ, je
+innerster Methode außerhalb der Laufzeit und die häufigsten Stapel je Typ; sein `selftest`
+zeichnet den eigenen Prozess auf und findet eine Churn-Stelle bekannten Namens. Die
+Client-Bibliothek der Diagnose (rein verwaltet) liegt im Zip neben `Komet.dll`.
+
+Was damit zu tun ist, steht in der Starter-Datei des Nutzers: Server-GC (721-ms-Pause) und ein
+großes gen0 (Einzelpausen 40–58 ms) sind beide gemessen und verworfen. Was bleibt, ist weniger
+Müll an der Quelle — und dafür braucht es die Stelle, nicht den Typ.
+
+### Zwei Fehler, die der erste Blick auf den Bildschirm fand (06.09.)
+
+**Das Gelände verschwand.** `TesselatedChunkPart.AddToPools` ruft als letzte Anweisung
+`Dispose()` auf dem Teil auf. Mein Postfix auf `Dispose` — der Aufräumweg für ein Teil, das nie
+in die Pools gelangt — lief damit *innerhalb* von `AddToPools`, vor dessen eigenem Postfix, und
+recycelte die beiden verschmolzenen Meshes, während das Engine-Mesh diese Flächen bereits
+verloren hatte. Jede verschmelzbare Oberfläche der Welt fehlte; übrig blieben Grasbüschel,
+Blumen und Bäume über einer weißen Leere. Die Übergabe geschieht jetzt im **Prefix**: die
+Meshes liegen im `__state` dieses Aufrufs, bevor die Engine irgendetwas disposen kann. Nichts
+daran hängt mehr an der Reihenfolge, in der Harmony zwei Patches ausführt. Die Prüfung dazu
+fährt die echten Engine-Methoden in der echten Reihenfolge und wurde gegengeprüft, indem der
+Fix verkrüppelt wurde — dann schlägt sie an.
+
+**Und es hätte ohnehin nichts gezeichnet.** Die Vorgabe-Entfernung war die Fern-LOD-Grenze der
+Engine, also `min(640, Sichtweite) × lodBiasFar`. Bei Sichtweite 512 und `lodBiasFar 1,0` liegt
+die genau *auf* der Sichtweite: das Band, in dem ein Rechteck gezeichnet würde, ist leer. Die
+Vorgabe ist jetzt diese Grenze, gedeckelt auf sechs Zehntel der Sichtweite, geprüft über fünf
+Kombinationen aus Sichtweite und Bias.
+
+**Ein Wachhund.** Verschmelzen ohne Platzieren ist der eine Fehlerfall, der sich nicht ankündigt
+— die Flächen sind aus dem Engine-Mesh heraus, und ob etwas an ihre Stelle trat, sieht man erst
+am Loch. Werden 24 Teile verschmolzen und keines platziert, schaltet sich das Feature ab, sagt
+es im Log und im Report, und verweist auf `.komet retess`.
+
+## Die Antwort der Messung: das Fern-Mesh scheitert an der Rauheit, und der Schatten ist der Berg (06.09.)
+
+### Fern-Mesh: 1,3 Flächen je Rechteck
+
+Der Report mit Instrumentierung, an derselben Stelle:
+
+| Rechteckgröße | 1 | 2 | 3-4 | 5-8 | 9+ |
+|---|---|---|---|---|---|
+| Anteil | 83 % | 12 % | 4 % | 1 % | 0 % |
+
+97 % der Flächen erfüllen die Regeln, und 23 % von ihnen verschwinden. Die Zeile, die das
+erklärt: **von den Einzelflächen wurden 92 % dadurch gestoppt, dass in der Nachbarzelle
+überhaupt keine Fläche derselben Gruppe lag** — eine andere Ebene oder eine andere Kachel. Das
+ist gewachsenes Gelände, das von Block zu Block die Höhe wechselt. Keine Toleranz reicht dorthin;
+die Lichtregeln machten 7 % aus, die geteilte Kante 0 %.
+
+Verschmelzen setzt Koplanarität voraus. Auf einer Heightmap mit Blockrauheit gibt es keine
+großen koplanaren Flächen. Der Ansatz kann auf natürlichem Boden nicht gewinnen, und das ist
+kein Implementierungsdetail, sondern die Geometrie. Gespart wurden 6 % der Kamera-Dreiecke,
+bezahlt mit 12.130 zusätzlichen Pool-Teilen von 27.400 und 0,28 ms je Teil auf dem
+Tesselations-Thread. **Per Default aus, Layout 23.** Der Code bleibt: auf gebauten, flachen
+Strukturen ist das Verhältnis ein anderes, und die Maschinerie ist genau die, die ein echtes
+Fern-LOD bräuchte.
+
+### Und dann der eigentliche Fund
+
+Ein Umschalten, `.komet toggle shadowfoliage`, an derselben Stelle:
+
+| | Frame | GPU | nahes Laub | fernes Laub | Kamera opaque |
+|---|---|---|---|---|---|
+| mit Laub im Schatten | 6,27 ms | 5,18 ms | 1,8 ms / 315 Mfrag | 3,0 ms / 250 Mfrag | 1,6 ms / 32 Mfrag |
+| ohne | 4,40 ms | 3,80 ms | 0 | 0 | 1,9 ms / 32 Mfrag |
+
+**160 auf 228 fps. Das Laub in den beiden Schattenkarten ist 30 % der Frame-Zeit.** Auf jedes
+Fragment im Kamerabild kommen elf im Schattenlaub. Der ganze Sommer der Optimierung am
+Kamera-Pass — Reihenfolge, Pools, Verschmelzen — bewegte sich um einen Posten von 1,6 ms,
+während 1,9 ms unbeachtet in den Schattenkarten lagen.
+
+Warum so viel: die nahe Karte hat 4096 Pixel für 39 Blöcke, also 80 Texel je Block; bei 17 Grad
+Sonnenhöhe steht die Projektion flach, und jeder Grasbüschel wird mit Alpha-Test hineingezeichnet
+— 19-fache Überzeichnung. Die ferne Karte deckt 255 Blöcke mit 7168 Pixeln.
+
+### Der Hebel: eine Reichweite für werfendes Laub
+
+Schattenkarten sind orthographisch. Ein Grasbüschel kostet in 250 Blöcken Entfernung genau so
+viele Schatten-Texel wie in 20 — die Fragmente skalieren mit der **Fläche**, die die Kaskade
+deckt, nicht mit der Entfernung des Werfers. Die ferne Kaskade von 255 auf 100 Blöcke zu
+beschneiden lässt 15 % ihrer Laub-Fragmente übrig.
+
+`ShadowFoliageRange` (`.komet shadowfoliagerange <blocks>`) verengt dafür das achsenparallele
+Band des Sweeps — denselben Test, den die Engine macht, nur enger — und zwar für die
+Laub-Pässe und keinen anderen. Die Prüfung fährt beide Richtungen: ein solider Pass darf nie
+verengt werden (das wären Löcher im Schatten), und keiner darf je geweitet werden.
+
+**Per Default aus.** Blätter und Grasbüschel liegen im selben Render-Pass und sind auf
+Pool-Granularität nicht zu trennen; eine zu kurze Reichweite nimmt einem fernen Wald die
+Eigenverschattung. Das ist sichtbar, und diese Entscheidung gehört dem Nutzer, nicht der
+Vorgabe.
+
+## Korrektur und ein neuer Verdächtiger (06.09., zweite Szene)
+
+### Der Schattenlaub-Fund war ortsabhängig
+
+Dieselbe Sonde, andere Stelle, andere Tageszeit:
+
+| | Sonnenhöhe | Nahband | nahes Laub | Kamera opaque |
+|---|---|---|---|---|
+| Sumpf, Sichtweite 512 | 17 Grad | 224 x 55 Blöcke | 1,8 ms / 315 Mfrag | 1,6 ms / 32 Mfrag |
+| Ebene, große Sichtweite | 61 Grad | 121 x 55 Blöcke | 0,5 ms / 43 Mfrag | 10,7 ms / 48 Mfrag |
+
+Bei flacher Sonne zieht sich die Box der nahen Kaskade in der Welt lang, und ihr Laub wird zum
+größten Posten des Frames. Bei hoher Sonne ist sie kompakt und kostet fast nichts. **Der Fund
+gilt für flache Sonne und kurze Sichtweite, nicht allgemein.** Die Reichweite bleibt ein Regler,
+keine Vorgabe. Der Report nennt jetzt die Dreiecke beider Kaskaden, damit ihre Wirkung in einem
+Befehl sichtbar ist statt in einer Minute Mittelung.
+
+### 10,43 ms für 48 Kilobyte
+
+Der Report der zweiten Szene, CPU-gebunden bei 68 % GPU-Auslastung:
+
+```
+particles: 1.543 alive on the main pools (10,91 ms/frame: physics 0,48 + upload 10,43)
+```
+
+Die Partikel-Pools schreiben je Frame drei Instanz-Puffer: Flags, CustomFloats, CustomBytes.
+Bei 1.543 lebenden Partikeln sind das 6, 24 und 18 Kilobyte. 48 KB in 10,43 ms wäre eine
+Übertragungsrate von 4,6 MB/s — das ist keine Übertragung, das ist Warten.
+
+`glBufferSubData` auf einen Puffer, den die GPU noch liest, hat zwei Möglichkeiten: bis zum
+Ende des betreffenden Draws blockieren, oder den Treiber eine Schattenkopie anlegen lassen. Die
+Instanz-Puffer der Partikel werden in jedem Frame neu geschrieben und in jedem Frame gezeichnet,
+also genau der Fall, der blockiert.
+
+`glInvalidateBufferData` sagt „der alte Inhalt spielt keine Rolle mehr". Der Treiber vergibt
+dann neuen Speicher, statt zu synchronisieren — der Puffer wird umbenannt, nicht abgewartet. Das
+ist hier aus einem nennbaren Grund sicher: der Pool schreibt `AliveCount` Instanzen, und der
+Draw-Aufruf liest genau `AliveCount`. Was die Invalidierung verwirft, liest nie jemand.
+
+Per Default aus, bis ein Report es bepreist. `.komet toggle particleorphan` macht den A/B in
+einem Befehl, und die Partikel-Zeile sagt, welchen Weg sie gerade nimmt.
+
+---
+
+## Drei Posten am Ladepfad, und einer davon war messbar (06.09., Aufräumrunde)
+
+Der Engpass beim Laden ist unverändert der eine Tesselations-Thread. Diese Runde nimmt ihm
+Arbeit ab, die er gar nicht tun müsste, und nimmt dem Lock, das er dauernd braucht, Verkehr weg.
+
+### Der Rand-Sweep hat die halbe Warteschlange durchgehasht
+
+Der Sweep für die Randreparaturen (`EdgeRetessPriorityPatches`) rotiert `dirtyChunks` alle
+50 ms einmal komplett — auf dem Tesselations-Thread, unter `dirtyChunksLock`. Eine Rotation
+über die öffentliche API von `UniqueQueue` kostet **vier Hash-Operationen je Schlüssel**:
+`Dequeue` nimmt ihn aus dem `HashSet`, `Enqueue` legt ihn sofort wieder hinein. Für Schlüssel,
+die die Queue überhaupt nicht verlassen. Und die Queue, um die es geht, hält bei genau der
+Chunk-Flut, für die der Sweep gebaut wurde, Zehntausende davon.
+
+Jetzt rotiert der Sweep die *innere* `Queue` und fasst das Set nur für die höchstens 64
+Schlüssel an, die wirklich befördert werden. Gleiche Queue, gleiche Reihenfolge, gleiches
+Ergebnis. Gemessen (`./build.sh bench`, Abschnitt `edge sweep rotation`):
+
+```
+     backlog   via UniqueQueue   inner queue   speedup    saved per second
+         200           0,013ms       0,003ms     4,66x             0,21 ms/s
+        2000           0,114ms       0,023ms     4,87x             1,82 ms/s
+       12000           0,624ms       0,111ms     5,60x            10,25 ms/s
+       45000           1,107ms       0,183ms     6,07x            18,50 ms/s
+```
+
+Vier Läufe, einer davon oben. Die tiefen Zeilen streuen (der erste Lauf zeigte für 45.000
+einmal 2,08 ms und damit 10,9x — ein Ausreißer, vermutlich ein Wachstumsschritt des HashSet);
+belastbar sind **4,6–5,1x** oben und **5,8–6,8x** unten. Die 45.000 sind die Warteschlange,
+gegen die die Zuflussbremse gebaut wurde. Dort ist das knapp 1 ms je Sweep weniger auf dem
+Tesselations-Thread — und dieselbe Verkürzung der Haltezeit von `dirtyChunksLock`, unter dem
+der Netz-Thread jeden ankommenden Chunk einträgt.
+
+Der API-Weg bleibt als Rückfall, falls ein Spiel-Update die beiden Felder verschiebt.
+`verify` fährt **beide** Wege durch dieselben Zusicherungen — Reihenfolge, Erhaltungs-Fuzz, und
+neu: Set und Queue müssen hinterher übereinstimmen (`Count` liest das Set, der Enumerator die
+Queue). Gegengeprüft, indem das `set.Remove` aus dem schnellen Weg entfernt wurde: der Test
+schlägt an.
+
+### Der Nachbar-Prefetcher hat dieselben 32 Einträge dreihundertmal die Sekunde abgelaufen
+
+Der Prefetcher schaut 32 Queue-Einträge voraus und entpackt die 27 Nachbarn jedes Eintrags,
+schläft 2 ms und fängt von vorn an. Der Tesselator verbraucht in 2 ms **weniger als einen**
+Chunk — zwei aufeinanderfolgende Schnappschüsse sind also praktisch identisch. Fast jeder
+Durchgang waren damit 32 `chunksLock`-Nahmen und rund 860 Dictionary-Zugriffe für Chunks, die
+der vorige Durchgang schon entpackt hatte. `chunksLock` ist nicht irgendein Lock: der
+Tesselations-Thread nimmt es für jede Nachbarschaft, die er liest, der Netz-Thread für jeden
+Chunk, der ankommt.
+
+Er merkt sich jetzt die Einträge, die er abgelaufen ist, und schläft 20 ms statt 2, wenn ein
+Durchgang nichts Neues fand — 32 Einträge Vorlauf sind bei ~4 ms je Chunk über hundert
+Millisekunden, ein längeres Nickerchen kann den Vorlauf nicht leerlaufen lassen. Das Set gehört
+dem Worker allein: ein Weltwechsel erhöht eine Epoche, die er beim nächsten Durchgang selbst
+abräumt, statt dass ein fremder Thread ein `HashSet` unter einem laufenden `Add` löscht.
+Danebenliegen kostet weiterhin nur Arbeit, die ohnehin angefallen wäre — ein Chunk, den der
+Pool nach dem Überspringen wieder packt, wird vom Tesselator entpackt, genau wie vor diesem
+Worker.
+
+### Die Fenster-Vorhersage zeigte regelmäßig auf einen Chunk, der nie gemesht wird
+
+Der Fenster-Prebuilder sagte den vordersten Queue-Eintrag voraus. Genau der ist aber
+regelmäßig einer, den `TesselateChunk` fallen lässt, *bevor* es je ein Fenster baut: ein Chunk,
+der fehlt, der leer ist (bei großer Sichtweite ist der halbe Chunk-Turm über dem Boden Luft),
+oder der noch nicht vom Server geladen ist. Eine solche Vorhersage kostet den Vorlauf doppelt:
+der Worker baut nichts (`BuildWindow` bricht bei leerer Mitte ab), und der Chunk, den der
+Tesselator wirklich erreicht, zahlt den vollen Fensterbau von ~1,2 ms.
+
+Die Vorhersage überspringt jetzt bis zu acht solcher Einträge, in **einer** Nahme von
+`chunksLock`, und schlägt den Schlüssel direkt in der Chunk-Map nach: der Queue-Schlüssel *ist*
+der Chunk-Schlüssel — `SetChunkDirty` schlägt den Chunk damit nach, bevor es ihn einreiht — und
+beide Markierungs-Trichter stehen im Engine-Fingerprint, ein Umbau daran fällt also im
+Drift-Check auf statt still danebenzuliegen. Falsch liegen ist in beide Richtungen umsonst: ein
+Chunk, der zwischen Vorhersage und Pop aufhört leer zu sein, lässt den Tesselator sein Fenster
+selbst bauen — wie vor jeder Vorhersage. Die Report-Zeile `window pipeline` zählt die
+übersprungenen Einträge, damit „bringt das hier etwas" eine Zahl hat und keine Behauptung ist.
+
+### Und was dabei bewusst liegen blieb
+
+`ChunkTesselatorManager.OnBeforeFrame` lädt die fertigen Meshes **unter**
+`tessChunksQueueLock` hoch — demselben Lock, das der Tesselations-Thread am Ende jedes Chunks
+für `EnqueueOrMerge` braucht. Das sieht nach Lock-Kontention aus, bis man die eigene Messung
+liest: `warteschl. 1585/5` — 1585 Chunks warten auf die Tesselation, **fünf** auf den Upload.
+Die Queue ist kurz, weil die Tesselation der Engpass ist, also wird das Lock kaum gehalten. Ein
+Umbau von `OnBeforeFrame` wäre ein Umbau eines funktionierenden Systems ohne messbaren Gewinn.
+
+Ebenso `CalculateVisibleFaces` und `CalculateVisibleFaces_Fluids`: sie hängen nur am Fenster,
+nicht am Meshing des vorigen Chunks, könnten also auf denselben Worker wie der Fensterbau. Sie
+rufen aber `AllowSnowCoverage`, `ShouldMergeFace` und `SideIsSolid` auf — virtuelle Methoden
+beliebiger `Block`-Unterklassen, also auch fremder Mods — und benutzen `tmpPos`, ein Feld des
+einen `ChunkTesselator`. Das ist der nächste greifbare Posten am Ladepfad, aber er braucht
+dieselbe In-Game-Validierung, die der Fensterbau bekommen hat, nicht bloß ein Argument.
+
+### Das Schalter-Fenster passte nicht in seinen Rahmen
+
+Zwei unabhängige Überläufe auf der `.komet`-Seite mit den Schaltern, beide daher, dass die
+Seite für die *Entwurfsgröße* gesetzt und in *irgendeiner* Größe gezeichnet wurde.
+
+Nach unten: dreizehn Schalter in festem 32er-Raster fangen 44 unter der Oberkante an und enden
+460 tiefer; der Boden des Inhaltsfelds liegt bei 443. Bei kleinem Fenster oder hoher
+GUI-Skalierung wurden die letzten Schalter und die komplette Meldungszeile *unter* den Rahmen
+gezeichnet. Raster, Schaltergröße und Panelhöhe kommen jetzt aus dem Platz, der da ist, und die
+acht Gruppenknöpfe brechen auf so viele Zeilen um, wie ihre längste Beschriftung braucht,
+statt rechts hinauszulaufen.
+
+Nach rechts: ein Schalter, der auf dieser Maschine nicht umlegbar ist, hängt seinen Grund an
+die Zeile — und die Zeile ging an das statische Textelement der Engine, das auf die
+Feld*breite* umbricht und dann über die Feld*höhe* hinaus weiterzeichnet. Ein satzlanger Grund
+wurde quer über die Beschriftung des nächsten Schalters gemalt. Eine Zeile ist jetzt eine
+Zeile, auf die Zellen ihres Feldes gekürzt; der ganze Satz steht einen Klick entfernt im Panel
+darunter, wo er ohnehin immer landete und korrekt umbricht.
+
+`verify` prüft jede Gruppe in jeder Fenstergröße der bestehenden Layout-Prüfung, mal vier
+Knopfbreiten, wie sie eine Übersetzung erzeugen kann: Knöpfe im Inhalt, Schalter nicht in die
+Zeile darunter ragend, Beschriftungen in ihren Feldern, Panel weder über der letzten Zeile noch
+aus dem Rahmen — und nie unter lesbare Höhe geschrumpft. Es waren genau die Schalterzeilen, die
+der bestehenden Prüfung „jede Seite passt in ihr Panel" entgangen sind: sie werden als
+Elemente komponiert, nicht von `TextPanel` gerastert.
+
+---
+
+## Ein Worker-Pool statt vier Thread-Sätzen, die nichts voneinander wussten (06.09.)
+
+Bis hierher hielt Komet **vier unabhängige Thread-Sätze**: fünf Cull-Helfer, vier
+Occlusion-Helfer, einen eigenen Thread für den Fenster-Vorbau und einen für den
+Nachbar-Prefetch — dazu Animations-Vorbau und HUD-Raster auf dem geteilten .NET-ThreadPool.
+Jeder Satz bemaß sich an der Kernzahl, ohne von den anderen zu wissen: **elf Threads auf sechs
+physischen Kernen**, neben dem Render-Thread, dem Tesselations-Thread der Engine und den
+Worldgen-Threads des eingebauten Servers.
+
+Keiner konnte einem anderen einen Thread leihen. Und die beiden, auf die es ankommt — der Sweep
+auf der Frame-Deadline und der Occlusion-Walk, der Kerne millisekundenlang hält — kollidierten
+oft genug, dass dafür eigens ein Niceness-Mechanismus gebaut wurde.
+
+### Was der Pool ist
+
+`JobScheduler` ersetzt alles davon. Ein Worker ist **keiner Arbeitslast zugeordnet**; er nimmt
+den wertvollsten wartenden Job. Zwei Formen teilen sich den Pool:
+
+* **Fork/Join** (`RunBatch`), der Aufrufer blockiert: der Sweep als `Critical`, der
+  Occlusion-Walk als `Background`. Die Scheiben werden über einen Interlocked-Zähler dynamisch
+  vergeben, der Aufrufer arbeitet mit, und **die Fertigstellung wird in *Arbeit* gezählt, nicht
+  in Workern** — ein Helfer, der nie aufgewacht ist, kann niemanden aufhalten. Das ist
+  unverändert die Lehre aus dem 01.09.-Log (9,7–11 ms Sweep-Warten ohne GC-Pause).
+* **Fire-and-forget** (`Submit`) mit Dedup-Schlüssel: Fenster-Vorbau (`High`), Nachbar-Unpack
+  (`Normal`), HUD-Raster (`Background`), Animations-Vorbau (`Idle`).
+
+Beide Batch-Lasten waren ohnehin auf **Zehntel-Millisekunden-Scheiben** geschnitten (Occlusion
+64 Positionen ≈ 30 µs, Cull acht Scheiben je Worker ≈ 15 µs). Ein `Critical`-Job wartet also
+etwa so lange, wie ein OS-Wecken ohnehin kostet — das ist die Messung, die den geteilten Pool
+überhaupt zulässig macht.
+
+### Gemessen
+
+`./build.sh bench`, fünf Läufe je Konfiguration, Median der Sweep-Kosten pro Frame:
+
+```
+4 Pool-Worker   0,703  0,711  0,700  0,702   -> 0,70 ms
+5 Pool-Worker   0,701  0,693  0,825  0,989   -> 0,70-0,83 ms
+alter Zustand (5 dedizierte Cull-Helfer)     -> 0,77 ms
+```
+
+Dieselbe Arbeit auf **weniger** Threads, nicht langsamer. Genau darum geht es: Die elf Threads
+waren kein Durchsatz, sie waren Überbuchung.
+
+### Die Regeln, und warum sie so lauten
+
+**Ein Batch-Ticket wird nie storniert.** `CancelKind` ist für Fire-and-forget-Arbeit, deren
+Welt weggegangen ist. Ein Fork/Join-Aufrufer ist das nicht: er hängt in diesem Moment an seinen
+Scheiben. Die erste Fassung stornierte auch die — der Stresstest lieferte daraufhin Batches mit
+Scheiben, die stillschweigend nie gelaufen waren. Ein halb gecullter Frame ist schlimmer als
+ein später.
+
+**Jeder N-te Zugriff fängt unten an.** Strikte Priorität ließe den Animations-Vorbau hinter
+einem Sweep verhungern, der dreimal pro Frame feuert. Ein Zähler, mehr kostet es nicht, und die
+Wartezeit ganz unten ist damit auf N Zugriffe begrenzt statt auf „wenn die Maschine mal ruhig
+ist".
+
+**Der Dedup-Schlüssel ersetzt das handgeschriebene „schon gesehen".** Ein Chunk, der eingereiht
+ist oder gerade läuft, wird nicht noch einmal eingereiht — genau die Eigenschaft, für die der
+Prefetcher vorher ein eigenes `HashSet` mit Epochenzähler brauchte.
+
+**Niceness bleibt eine Einbahnstraße.** `setpriority` darf ein unprivilegierter Thread nur
+*erhöhen*, nie zurücknehmen. Ein Worker, der nice geworden ist, kann die Frame-Deadline nicht
+mehr bedienen — deshalb lehnen genau diese Worker die beiden obersten Queues ab. Bei
+`OcclusionThreadNiceness = 0` (Default) ist der Pool vollständig symmetrisch.
+
+### Wie viele Worker
+
+Die Obergrenze ist **physische Kerne minus zwei** — einer für den Render-Thread, einer für den
+Tesselator, die beiden, denen dieser Pool nie einen Kern wegnehmen darf — gedeckelt bei acht,
+Boden eins. Hardware-Threads werden bewusst nicht gezählt: beide Batch-Lasten sind
+speichergebundene lineare Scans, ein SMT-Geschwister bringt Warteschlange statt Durchsatz.
+
+Von dort regelt der Pool selbst: einen Worker zurück, wenn ein Frame über dem 1,5-fachen des
+gleitenden Mittels lag *und* der Pool beschäftigt war; wieder her, wenn der Tesselations-Rückstand
+sagt, dass die Jobs des Pools auf dem kritischen Pfad dessen liegen, worauf der Spieler wartet;
+auf eins herunter, wenn nichts wartet. Die GC-Pause wird vorher abgezogen — aus demselben Grund
+wie bei der Upload-Drossel: eine Pause friert *alle* Threads ein und ist kein Beleg dafür, dass
+der Pool dem Render-Thread Kerne wegnimmt. Threads werden dafür nie erzeugt oder zerstört; wer
+über dem Ziel liegt, parkt.
+
+### Der Monitor
+
+`.komet` → Threads/Jobs zeigt Worker (beschäftigt/wach/untätig, Auslastung), Schlangenlänge,
+Jobs/s, fertig/verworfen/doppelt, die Wartezeit des Aufrufers je Batch und die
+Hauptthread-Übergabe — dann **eine Zeile je Worker** mit Zustand, Chunk und Laufzeit, dazu eine
+Aufschlüsselung je Arbeitslast. Er liest flüchtige Felder ohne Lock: eine Zeile, die einen Job
+alt ist, ist der richtige Preis für einen Monitor, der den Pool nichts kostet.
+
+**Es gibt bewusst kein `GENERATING`, `TESSELLATING` oder `UPLOADING`.** Chunk-Erzeugung sind die
+Worldgen-Threads des Servers, Chunk-Laden ist der Netz-Thread plus Hauptthread-Tasks, und
+Tesselation, Meshing und der GPU-Upload sind Engine-Threads, die keine Mod einplanen kann — der
+Tesselator, weil `BlockEntity.OnTesselation` ein öffentlicher Erweiterungspunkt ist, den jede
+Content-Mod gegen einen Single-Thread-Vertrag implementiert, der Upload wegen des GL-Kontexts.
+Solche Zustände zu erfinden wäre eine Lüge an genau der Stelle, an der man nachsieht, wohin die
+Zeit gegangen ist.
+
+
+
+## Fern-LOD: jenseits der Distanz Zellen statt Blöcke (06.09., abends)
+
+Zwei Reports von derselben Stelle, eine Minute auseinander:
+
+| | Frame | Dreiecke Kamera-Pass | davon 640+ | GPU opaque |
+|---|---|---|---|---|
+| Blick auf den Boden | 5,3 ms = 189 fps | 125.000 | 0 | 1,0 ms / 13 Mfrag |
+| Blick zum Horizont, Sichtweite 1536 | 19,0 ms = 53 fps | 16,1 Mio. | 12,7 Mio. | 11,7 ms / 15 Mfrag |
+
+Die CPU war es nicht: Sweep 2,2 ms auf fünf Threads, Tick 0,3 ms, Upload 0,2 ms, die 14,8 ms
+„opaque" der CPU sind das Warten auf die GPU. Die GPU-Füllrate war es auch nicht: 15 Mio.
+Fragmente auf 3,7 Mio. Pixel, dieselbe Größenordnung wie beim Boden-Blick. Und die reine
+Primitiv-Rate auch nicht — 1,4 Mrd. Dreiecke/s ist für eine RX 9070 XT wenig. Was übrig bleibt,
+ist das Front-End: `chunkopaque.vsh` exportiert rund dreizehn vec4 je Vertex (Position, uv,
+Fog, Normale, Weltposition, Kameraposition, zwei Schattenkoordinaten, zwei Colormap-uvs, …)
+und rechnet bis zu acht 3D-Value-Noise-Aufrufe (Saison, Frost, Wind), und jedes
+Sub-Pixel-Dreieck zahlt das für zwei Vertices. Der einzige Hebel ist: weniger Dreiecke dort
+draußen. Das Verschmelzen koplanarer Flächen (vorheriger Abschnitt) hatte gezeigt, dass es die
+nicht liefern kann — 1,3 Flächen je Rechteck auf gewachsenem Gelände.
+
+### Downsampling braucht keine Koplanarität
+
+`Runtime/FarLod.cs` baut aus dem, was die Engine tesseliert hat, das Bild eines Chunks in
+Zellen von 2×2×2 Blöcken:
+
+* Eine **Einheitsfläche** (achsenparallel, genau eine Einheit in beiden Ebenenrichtungen, an
+  ganzzahligen Positionen, mit gepackter Vertex-Normale entlang der konstanten Achse) markiert
+  den Block hinter sich als **fest** und den davor als **Luft**. Alles andere — Graskreuze,
+  Blätterwürfel (um y gedreht, also nie achsenparallel), Treppen, Zäune, Platten, Meißelblöcke —
+  ist eine **Restfläche**, zugeordnet dem Block, in dem ihr Schwerpunkt liegt.
+* Luft **flutet** von den bekannten Luftblöcken durch das Unbekannte, nur innerhalb des Chunks
+  und eine Reihe nach oben in den Rand (eine Zelle am Chunk-Dach ist bis zu einen Block dicker
+  als ihre Blöcke; ihre Oberseite braucht darüber Luft). Was die Flut nicht erreicht, ist
+  verschüttet. Der seitliche Rand steht für die Nachbarchunks, über die die Flächen genau eines
+  sagen: der Block vor einer Fläche ist Luft. Die Flut dort hindurch laufen zu lassen, hieße,
+  das Gelände des Nachbarn überall dort Luft zu nennen, wo der Himmel die Chunkgrenze berührt —
+  jede Randzelle bekäme eine Seitenfläche in den Nachbarn hinein, unsichtbar und ein Drittel
+  mehr Dreiecke.
+* Eine **Zelle** ist fest, wenn einer ihrer Blöcke fest ist, sonst Luft, wenn einer Luft ist,
+  sonst verschüttet. Das Bild ist also nie dünner als die Welt, nur bis zu einen Block dicker —
+  deshalb klaffen zwischen Nachbarchunks auf verschiedenen Stufen keine Lücken.
+* Eine feste Zelle bekommt je Luft-Nachbarn **eine Fläche**, die die äußerste Quellfläche dieser
+  Richtung in der Zelle kopiert: Kachel, die vier Vertex-Lichter, Flags, Colormap-Daten,
+  Gras-uv, Indexmuster und Eckenreihenfolge. Winding und SSBO-Face-Packung tragen sich durch,
+  kein Shader wird angefasst; die Kachel liegt über zwei Blöcke gespannt, was in der Entfernung,
+  in der die Zelle gezeichnet wird, ohnehin der Mip-Mittelwert ist.
+* Jede Zelle behält höchstens **einen Restblock**: den mit den meisten Flächen, um zwei
+  skaliert um die Zellecke in x und z und um den Zellboden in y — ein Gras auf der oberen
+  Zellhälfte steht damit auf der dicker gewordenen Zelloberseite statt darin. Ein doppelt so
+  großes Gras, wo vier standen, ist bei vier Pixeln dasselbe Grün.
+
+**Stufe 2** ist derselbe Build auf der Ausgabe von Stufe 1 mit Einheit 2: Zellen von vier
+Blöcken. Gemessen (`./build.sh bench`, Zeile `far lod build`) an einem Chunk mit 6.462 Flächen —
+Grasoberseiten, Erdseiten mit Grat, Gras auf zwei Fünfteln der Spalten, vier Bäume: **1.820
+Flächen auf Stufe 1 (3,6×), 654 auf Stufe 2 (9,9×), beide Stufen zusammen etwa 1,2 ms** auf
+dem Tesselations-Thread. Davon Klassifikation 0,5, Flut 0,2, Emission 0,25.
+
+### Die Anbindung: vier LOD-Stufen, die die Engine nie vergibt
+
+`FarMeshPatches` (der Name blieb, die Schalter heißen weiter `FarMesh…`) hakt sich an denselben
+drei Stellen ein wie das Verschmelzen: Postfix auf `NowProcessChunk` (Tesselations-Thread,
+beide Stufen bauen), Präfix/Postfix um `AddToPools` (Übergabe im Präfix, weil der Engine-Rumpf
+mit `Dispose` endet — siehe oben), Präfix auf `RenderOpaque` für den Modus-Abgleich. Neu ist,
+dass **die Engine-Meshes unangetastet bleiben**: ein Teil mit Bild wird nur umgestuft.
+
+| Stufe | was | gezeichnet |
+|---|---|---|
+| 5 | das LOD-1-Mesh der Engine, wenn das Teil ein Bild hat | bis zur Distanz D |
+| 4 | Stufe-1-Bild | D bis 2D |
+| 6 | Stufe-2-Bild | jenseits 2D |
+| 7 | Stufe-1-Bild ohne Stufe-2-Geschwister | D bis Sichtweite |
+
+`InFrustumAndRange` der Engine liefert für alle vier `false` — das Sicherheitsnetz: ist der
+Sweep nicht unser oder das Feature aus, setzt `SyncMode` die Stufe-5-Teile auf 1 zurück und
+versteckt die Bilder. Die Schattenpässe zeichnen nur die Engine-Meshes (5 wirft wie 1, die
+Bilder nie): ein Bild ist bis zu einen Block dicker als die Welt, und das sähe man als Schatten
+vor den Füßen. D = `max(400, 0,35 × Sichtweite)` (538 bei 1536: 88 % der sichtbaren Fläche
+liegen dahinter), `.komet farmesh <Blöcke>` verschiebt es live, `FarMeshTier2` bzw. `.komet
+toggle farlod2` schaltet die zweite Stufe.
+
+**Stufe 2 und der Rand-Retess.** Die Engine tesseliert die Zwei-Block-Schale eines Chunks
+allein neu, wenn ein Nachbar sich ändert; Zellen von vier liegen über Schale und Mitte. Stufe 2
+wird deshalb aus Mitte und Schale gebaut und **hängt an der Location-Liste des ersten
+Mittelteils**; ein Schalen-Retess lässt sie stehen (bei vierfacher Distanz ist ein geänderter
+Block in der Schale nichts, was jemand sieht) und stuft seine neuen Stufe-1-Bilder so ein, dass
+sie enden, wo Stufe 2 beginnt (ein Register je Chunkposition sagt ihm, dass es eine gibt). Ein
+Chunk ohne Mittelteil hält Stufe 2 an der Schale und baut sie mit ihr neu. Im Schalen-Build
+gilt die Mitte als unbekannt, und die Flut betritt sie nicht — sonst bekäme die Schale Flächen
+gegen das Bild der Mitte, das noch in den Pools steht.
+
+**Wachhund.** Bauen ohne Platzieren hieße: die Engine-Meshes enden an der Distanz und dahinter
+steht nichts — die Welt endete bei D. Also zählt der Postfix Übergaben und Platzierungen, und
+ab 24 Übergaben ohne Bild schaltet sich das Feature ab und sagt es im Log und Report.
+
+### Geprüft, ohne Spiel
+
+Ein 16×16-Plateau wird exakt zu 8×8 Zelloberseiten mit Kachel, Licht, Flags und Indexmuster der
+Quelle und ohne erfundene Randwand; zwölf zufällige Wellengelände (mit Grat und Klippen) ergeben
+**exakt** das Zellbild, das sich aus der Heightmap allein berechnet — auf beiden Stufen, Ober-
+seiten im TopSoil-Teil, Seiten im Opaque-Teil, jede Oberseite von der höchsten Spalte ihrer
+Zelle; Gras kommt je Zelle einmal heraus, verdoppelt, auf der Zelloberseite stehend; ein
+Schalen-Build erfindet keine Fläche gegen die Mitte, ein voller Build flutet sie; die Übergabe
+übersteht die Dispose-Reihenfolge der Engine, und die Stufen 4/5/6/7 kommen so heraus, wie die
+Hosting-Regeln es sagen; der Sweep zeichnet jede Stufe in ihrem Band und in keinem Schattenpass
+ein Bild, und der Cull-Verifier stimmt zu.
+
+### Was der nächste Report sagen muss
+
+Die Zeile `far lod` (Flächen rein/raus je Build, ms je Chunk, Bilder in den Pools, Dreiecke je
+Frame als Stufe 1, Stufe 2, Engine-innerhalb) und `camera pass by lod`. Erwartung aus den
+Zahlen: die 12,7 Mio. jenseits 640 fallen auf ein Drittel bis ein Viertel, die 4,4 Mio. im Band
+211–640 zur Hälfte (D liegt bei 538); Frame beim Horizontblick von 19 auf 9–11 ms. Was man
+anschauen muss: die Kante bei D (ein Block Versatz, drei Pixel), Wälder (Blätterwürfel je Zelle
+einer, doppelt groß), Gebäude jenseits D (ein Repräsentant je Zelle bei Treppen und Zäunen).
+
+### Was liegen blieb
+
+* **Der Build auf einem Worker statt dem Tesselations-Thread.** 1,2 ms auf 2,4 ms Tesselation
+  sind ein Drittel weniger Chunk-Durchsatz beim Streamen. Auslagern ginge (Job je Chunk,
+  Präfix von `AddToPools` wartet, falls der Job noch läuft), verlangt aber, dass die
+  Engine-Meshes bis dahin unangetastet bleiben — `MergeIfEqual` disposed Teile auf dem
+  Tesselations-Thread, während ein Worker sie liest. Erst, wenn die Report-Zeile zeigt, dass
+  es nötig ist.
+* Liquid, Transparent, Meta, Decor bekommen kein Bild (Liquid bräuchte die CustomFloats des
+  Liquid-Passes); sie werden wie bisher in jeder Entfernung gezeichnet.
+* Eine Zellfläche, für die es in der Zelle keine Quellfläche der Richtung gibt (ein
+  Treppenrücken, der die Nachbarfläche wegkullt), wird ausgelassen und gezählt (`cell faces
+  without a source face`).
+
+## Der Feldtest: das Fern-LOD wirkt, und drei Posten fressen den Gewinn (06.09., nachts)
+
+Zwei Reports von derselben Stelle, anderthalb Stunden nach den beiden oben:
+
+| Blick zum Horizont | vorher | mit Fern-LOD |
+|---|---|---|
+| Frame | 19,01 ms = 53 fps | 8,85 ms = 113 fps |
+| Kamera-Pass Dreiecke | 16,1 Mio. | 6,9 Mio. |
+| GPU-Frame | 14,89 ms | 6,95 ms |
+| Kamera-Opaque (Elapsed-Sonde) | 11,7 ms / 15 Mfrag | 4,2 ms / 30 Mfrag |
+
+Und derselbe Blick auf den Boden: **189 → 170 fps**. Der Nutzer sagte „hat nichts gebracht" —
+das Gefühl kam von den Rucklern: **152/min statt 101/min, 241 von 276 mit GC-Pause**, einzelne
+gen0/gen1-Pausen bis 44 ms. Die Mittelwerte sagen das Gegenteil, das Spielgefühl folgt aber den
+Rucklern. Drei Posten waren dafür verantwortlich, alle drei jetzt behoben.
+
+### 1. Die Bilder lagen in denselben Pools wie die Engine-Meshes
+
+`AddModel` nimmt den ersten Pool mit Platz. Also lag jedes Bild im Indexpuffer **zwischen** zwei
+Engine-Teilen — und diesseits der Distanz ist ein Bild unsichtbar, das Engine-Teil sichtbar.
+Jedes unsichtbare Teil zerschneidet einen Lauf, den der Sweep sonst zu einer Range verschmilzt:
+emittierte Ranges je Roh-Range fielen beim Bodenblick von **3,2 auf 1,6**, Draw-Calls stiegen
+von 454 auf 812. Und weil jeder Pool in jeder Ansicht irgendetwas Sichtbares enthielt, wurde
+jeder Pool gezeichnet.
+
+`SpatialPools` hatte das Routing schon — nach Region, per Default aus. Es bekommt jetzt
+**Lanes**: `SpatialPools.Lane` wird um genau einen `AddModel`-Aufruf gesetzt und schickt das
+Modell in einen Pool-Satz, in den sonst nichts kommt. Drei Lanes: Engine-Meshes (im
+`AddToPools`-Präfix gesetzt, im Postfix gelöscht), Stufe 1, Stufe 2. Damit sind die Teile eines
+Pools alle im selben Entfernungsband sichtbar, ihre Ranges verschmelzen wieder, und ein Pool
+ohne etwas im Band kostet keinen Draw-Call.
+
+**Kein zusätzlicher Videospeicher.** Was einen Pool füllt, ist das Vertex-Budget (500.000), nicht
+die Teilegrenze: der Feldreport zeigt 516 von 3000 möglichen Teilen je Pool. Die Bilder sind
+kleiner, passen also mehr Teile in dasselbe Budget — die Pool-Zahl bleibt proportional zu den
+Vertices. Genau das war der Grund, warum das Regions-Routing seinerzeit scheiterte (1.917 Pools
+à 56 Teile, vierfacher Videospeicher); hier tritt er nicht ein, und die Lane kostet höchstens
+einen halbvollen Pool je Lane und Manager.
+
+### 2. Jedes Ausgabe-Mesh allozierte ein frisches int[]
+
+`MeshData.Dispose` setzt `CustomInts` und `CustomShorts` auf null, **bevor** das Mesh in den
+Recycler geht. Ein recyceltes Mesh kommt also grundsätzlich ohne sie an, und jedes der zwei
+Bilder je Teil brauchte ein neues int[] (bei TopSoil dazu ein short[]). Die Alloc-Stichprobe:
+**31 MB/s `Int32[]` auf dem Tesselations-Thread**. Sie kommen jetzt aus einer eigenen
+Größenklassen-Ablage (`FarLod.Ints`/`.Shorts`, dieselbe `ArrayPoolByClass` wie die Extras des
+Klon-Kompakts, eigene Budgets), und `FarLod.Release` gibt sie zurück, sobald `AddModel`
+hochgeladen hat — der Upload ist synchron, die Arrays sind danach frei.
+
+Gemessen im Bench gegen einen echten Recycler (`far lod build`): **45,6 KB je Chunk-Build ohne
+Ablage, 0,8 KB mit**. Der Bench legt sich dafür einen `MeshDataRecycler` über einen
+`DispatchProxy` an — ohne ihn allozierte jedes Ausgabe-Mesh auch seine Basis-Arrays, und die
+Zahl hätte den Effekt verdeckt, um den es geht.
+
+Der Doppelrückgabe-Fall ist die eine Falle: zwei Rückgaben desselben Arrays hieße, zwei Mieter
+teilen sich eines. `Release` nullt die Custom-Parts vor `Dispose`, also gibt der zweite Aufruf
+nichts zurück — und `Dispose` selbst setzt `Recyclable` zurück, recycelt das Mesh also auch
+nicht zweimal. Der Test fährt genau das.
+
+### 3. Teile, für die sich ein Bild nicht lohnt
+
+Ein Dutzend Blumen in `BlendNoCull` kostete zwei Pool-Teile, zwei Einträge in jedem Sweep und
+zwei Draw-Ranges, um eine Handvoll Dreiecke zu sparen. Unter **96 Flächen** bleibt ein Teil
+jetzt ganz aus dem Build heraus und zeichnet sein eigenes Mesh in jeder Entfernung weiter. Seine
+Blöcke sind dann nicht im Zellbild — was den Nachbarzellen nur Flächen **hinzufügen** kann
+(ihre Nachbarzelle gilt als Luft), nie eine wegnehmen. Kein Loch, keine Delle.
+
+### Was danach noch offen ist
+
+Der Kamera-Pass ist weiter 60 % der GPU-Zeit: **30 Mio. Fragmente gegen 15 Mio. vorher** bei
+3,7 Mio. Pixeln. Die Dreiecke sind gefallen, die Fragmente gestiegen — Zellen sind bis zu einen
+Block dicker als die Blöcke, die sie ersetzen, also deckt derselbe Hügel mehr Pixel. Der Gewinn
+ist vom Front-End in die Füllrate gewandert. Der nächste Hebel dort ist die Ferndistanz selbst
+(`.komet farmesh <Blöcke>`): sie steht auf `max(400, 0,35 × Sichtweite)` = 538, und diesseits
+davon zeichnet die Engine noch 2,7 Mio. Dreiecke. 350 statt 538 verschiebt davon gut die Hälfte
+ins Zellbild — bezahlt mit einer sichtbaren Ein-Block-Stufe in 350 Blöcken Entfernung. Das ist
+eine Entscheidung für Augen, nicht für einen Default.
+

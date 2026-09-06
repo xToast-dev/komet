@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -71,18 +72,12 @@ public static class MainThreadTaskPatches
     /// <summary>Frames cut short by the budget, and tasks pushed to a later frame.</summary>
     public static long StatBudgetCuts, StatDeferredTasks;
 
-    private sealed class Entry
-    {
-        public long Ticks;      // accumulated in the current frame
-        public double Ms;       // smoothed per frame
-        public long Calls;
-    }
+    private static readonly Measure.MsLedger Ledger = new();
 
-    private static readonly Dictionary<string, Entry> Entries = new(64);
+    /// <summary>Codes are a bounded vocabulary (packet ids plus a handful of named tasks); the
+    /// cap only guards against a mod generating unique codes per call.</summary>
     private const int MaxEntries = 256;
     private const string Overflow = "(andere)";
-    private const double Alpha = 1.0 / 64.0;
-    private static readonly double TicksToMs = 1000.0 / Stopwatch.Frequency;
 
     /// <summary>Tasks run since start, and the single longest one seen (code + ms).</summary>
     public static long StatTasks;
@@ -99,7 +94,7 @@ public static class MainThreadTaskPatches
     /// <summary>
     /// The lock the network thread's enqueue and this drain share - resolved by NAME, because
     /// its type is not the same on every client. Vanilla declares it <c>object</c> and takes
-    /// it with Monitor; the Optimum fork (v0.3.14) declares it <c>System.Threading.Lock</c> and
+    /// it with Monitor; the Optimum fork (v0.3.14) declares it <c>Lock</c> and
     /// enters it with EnterScope. A field reference compiled into IL carries the field's type,
     /// so the vanilla binding threw MissingFieldException on the first frame of the fork
     /// (1.2.0-pre.3 crashed in the connecting screen). Read once per game instance, never per
@@ -160,7 +155,7 @@ public static class MainThreadTaskPatches
             throw new InvalidOperationException("ClientMain.MainThreadTasksLock not found");
         if (LockField.FieldType != typeof(object) && LockField.FieldType != typeof(Lock))
             throw new InvalidOperationException("ClientMain.MainThreadTasksLock is a " + LockField.FieldType.FullName
-                + " - this drain knows object (vanilla) and System.Threading.Lock (Optimum), nothing else");
+                + " - this drain knows object (vanilla) and Lock (Optimum), nothing else");
         harmony.Patch(target, prefix: new HarmonyMethod(typeof(MainThreadTaskPatches), nameof(Prefix)));
     }
 
@@ -235,7 +230,7 @@ public static class MainThreadTaskPatches
             // vanilla's rule: a suspend mid-drain hands the remainder back (and empties this queue)
             if (suspended()) { requeue(); break; }
             // the budget uses the same hand-back, so order and the requeue semantics are vanilla's
-            if (OverBudget(budgetMs, (t1 - started) * TicksToMs, ran, reversed.Count))
+            if (OverBudget(budgetMs, (t1 - started) * Measure.MsLedger.TicksToMs, ran, reversed.Count))
             {
                 StatBudgetCuts++;
                 StatDeferredTasks += reversed.Count;
@@ -273,7 +268,7 @@ public static class MainThreadTaskPatches
     internal static void Note(string code, long ticks)
     {
         StatTasks++;
-        var ms = ticks * TicksToMs;
+        var ms = ticks * Measure.MsLedger.TicksToMs;
         // "readpacket58" becomes "readpacket58=ExchangeBlock" - the id table is the engine's own
         code = TaskCodes.Describe(code ?? "?");
         Measure.FrameStats.AddMainThreadTask(code, ms);
@@ -283,48 +278,20 @@ public static class MainThreadTaskPatches
             StatWorstCode = code;
         }
 
-        if (!Entries.TryGetValue(code, out var e))
-        {
-            // Codes are a bounded vocabulary (packet ids plus a handful of named tasks);
-            // the cap only guards against a mod generating unique codes per call.
-            if (Entries.Count >= MaxEntries)
-            {
-                code = Overflow;
-                if (!Entries.TryGetValue(code, out e)) Entries[code] = e = new Entry();
-            }
-            else Entries[code] = e = new Entry();
-        }
+        var e = Ledger.Bucket(code, MaxEntries, Overflow);
         e.Ticks += ticks;
         e.Calls++;
     }
 
-    /// <summary>Folds the finished frame into the per-code averages. Every frame, whether or
-    /// not a code ran - the figure is "ms per frame", and a quiet frame is a real zero.</summary>
-    public static void EndFrame()
-    {
-        foreach (var kv in Entries)
-        {
-            var e = kv.Value;
-            e.Ms += (e.Ticks * TicksToMs - e.Ms) * Alpha;
-            e.Ticks = 0;
-        }
-    }
+    public static void EndFrame() => Ledger.EndFrame();
 
     /// <summary>The heaviest task codes by smoothed ms per frame, with their call totals.</summary>
-    public static List<(string code, double ms, long calls)> Top(int count)
-    {
-        var all = new List<(string, double, long)>(Entries.Count);
-        foreach (var kv in Entries)
-            if (kv.Value.Ms > 0.005) all.Add((kv.Key, kv.Value.Ms, kv.Value.Calls));
-        all.Sort((a, b) => b.Item2.CompareTo(a.Item2));
-        if (all.Count > count) all.RemoveRange(count, all.Count - count);
-        return all;
-    }
+    public static List<(string code, double ms, long calls)> Top(int count) => Ledger.Top(count);
 
-    public static int Count => Entries.Count;
+    public static int Count => Ledger.Count;
 
     /// <summary>One report line: the drain's per-frame cost and its top codes.</summary>
-    public static void Write(StringBuilder sb, int count, System.Globalization.CultureInfo ci)
+    public static void Write(StringBuilder sb, int count, CultureInfo ci)
     {
         var top = Top(count);
         sb.AppendFormat(ci, "main thread tasks: {0:F2} ms/frame, {1:N0} since start",
@@ -349,7 +316,7 @@ public static class MainThreadTaskPatches
 
     public static void Reset()
     {
-        foreach (var kv in Entries) { kv.Value.Ticks = 0; kv.Value.Ms = 0; kv.Value.Calls = 0; }
+        Ledger.Reset();
         StatTasks = 0;
         StatWorstMs = 0;
         StatWorstCode = null;

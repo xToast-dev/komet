@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Text;
 using System.Threading;
 using HarmonyLib;
+using Komet.Measure;
 using Vintagestory.Server;
 
 
@@ -42,8 +43,7 @@ public static class PacketSourcePatches
     private static long sampled;
     private const int SampleEveryNth = 16;
     internal const int MaxCapturesPerSecond = 25;
-    private static long bucketStartTicks;
-    private static int bucketTaken;
+    private static readonly CaptureBudget Budget = new(MaxCapturesPerSecond);
     private static long countingSince;
 
     private static readonly ConcurrentDictionary<string, long> Sources = new();
@@ -112,16 +112,7 @@ public static class PacketSourcePatches
     }
 
     /// <summary>At most <see cref="MaxCapturesPerSecond"/> captures per rolling second.</summary>
-    internal static bool BucketAllows(long nowTicks)
-    {
-        var start = Volatile.Read(ref bucketStartTicks);
-        if (nowTicks - start >= Stopwatch.Frequency)
-        {
-            if (Interlocked.CompareExchange(ref bucketStartTicks, nowTicks, start) == start)
-                Volatile.Write(ref bucketTaken, 0);
-        }
-        return Interlocked.Increment(ref bucketTaken) <= MaxCapturesPerSecond;
-    }
+    internal static bool BucketAllows(long nowTicks) => Budget.Allows(nowTicks);
 
     /// <summary>Total single-block packets per second since the counters were reset.</summary>
     public static double PerSecond
@@ -171,8 +162,7 @@ public static class PacketSourcePatches
         Interlocked.Exchange(ref StatSet, 0);
         Sources.Clear();
         countingSince = Stopwatch.GetTimestamp();
-        Volatile.Write(ref bucketStartTicks, 0);
-        Volatile.Write(ref bucketTaken, 0);
+        Budget.Reset();
     }
 
     public static void Clear()

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Text;
 using HarmonyLib;
 
@@ -105,24 +107,82 @@ public static class PatchGuard
     public static int Scan()
     {
         var current = new List<Finding>();
-        foreach (var method in Harmony.GetAllPatchedMethods())
+        foreach (var method in Harmony.GetAllPatchedMethods()) Inspect(current, method);
+        return Publish(current);
+    }
+
+    // ---- the same scan, in slices ------------------------------------------------------
+    //
+    // A full scan measured 12,6 ms in the field, on the render thread, and the hitch log named
+    // it once the periodic listeners got names of their own. The cost is per METHOD, not in the
+    // registry walk: Harmony keeps a patched method's info serialised and GetPatchInfo rebuilds
+    // it on every call, so ~150 patched methods are ~150 deserialisations. Nothing about that
+    // has to happen in one frame - the guard's job is to notice a lazily applied patch
+    // eventually, not within a frame - so the periodic path walks the same list a couple of
+    // milliseconds at a time and publishes when it reaches the end.
+    //
+    // The one-shot callers (world join, '.komet conflicts') keep the whole scan: there the
+    // answer is wanted now, and once.
+
+    private static MethodBase[] walking;
+    private static int walkIndex;
+    private static List<Finding> walkFindings;
+
+    /// <summary>
+    /// One slice of a periodic scan, bounded by a time budget. Returns true on the slice that
+    /// finished a scan - that is the one that published its findings.
+    /// </summary>
+    public static bool ScanSlice(double budgetMs)
+    {
+        if (walking == null)
         {
-            HarmonyLib.Patches info;
-            try { info = Harmony.GetPatchInfo(method); }
-            catch (Exception) { continue; }
-            if (info == null) continue;
-
-            var onOurCode = method.DeclaringType?.Assembly == ownAssembly;
-            var oursPresent = false;
-            foreach (var owner in info.Owners) if (IsOwn(owner)) { oursPresent = true; break; }
-            if (!onOurCode && !oursPresent) continue;
-
-            var ours = DescribeOurs(info, out var ourPrefixCanSkip, out var ourPrefixPriority, out var ourPrefixIndex, out var ourTranspiler, out var measurementOnly);
-            Collect(current, method, info.Transpilers, "transpiler", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
-            Collect(current, method, info.Prefixes, "prefix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
-            Collect(current, method, info.Postfixes, "postfix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
-            Collect(current, method, info.Finalizers, "finalizer", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+            var all = new List<MethodBase>();
+            foreach (var m in Harmony.GetAllPatchedMethods()) all.Add(m);
+            walking = all.ToArray();
+            walkIndex = 0;
+            walkFindings = new List<Finding>();
         }
+
+        var t0 = Stopwatch.GetTimestamp();
+        var budget = (long)(budgetMs * Stopwatch.Frequency / 1000.0);
+        while (walkIndex < walking.Length)
+        {
+            Inspect(walkFindings, walking[walkIndex++]);
+            // one timestamp per method against ~80 us of work per method
+            if (Stopwatch.GetTimestamp() - t0 >= budget) break;
+        }
+
+        if (walkIndex < walking.Length) return false;
+        Publish(walkFindings);
+        return true;
+    }
+
+    /// <summary>Everything one patched method contributes to a scan.</summary>
+    private static void Inspect(List<Finding> into, MethodBase method)
+    {
+        HarmonyLib.Patches info;
+        try { info = Harmony.GetPatchInfo(method); }
+        catch (Exception) { return; }
+        if (info == null) return;
+
+        var onOurCode = method.DeclaringType?.Assembly == ownAssembly;
+        var oursPresent = false;
+        foreach (var owner in info.Owners) if (IsOwn(owner)) { oursPresent = true; break; }
+        if (!onOurCode && !oursPresent) return;
+
+        var ours = DescribeOurs(info, out var ourPrefixCanSkip, out var ourPrefixPriority, out var ourPrefixIndex, out var ourTranspiler, out var measurementOnly);
+        Collect(into, method, info.Transpilers, "transpiler", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+        Collect(into, method, info.Prefixes, "prefix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+        Collect(into, method, info.Postfixes, "postfix", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+        Collect(into, method, info.Finalizers, "finalizer", onOurCode, ours, ourPrefixCanSkip, ourTranspiler, ourPrefixPriority, ourPrefixIndex, measurementOnly);
+    }
+
+    /// <summary>Swaps a finished scan in and reports what is new about it. A slice in progress
+    /// is dropped: whatever published is newer than whatever it had walked so far.</summary>
+    private static int Publish(List<Finding> current)
+    {
+        walking = null;
+        walkFindings = null;
 
         Findings.Clear();
         Findings.AddRange(current);
@@ -312,7 +372,7 @@ public static class PatchGuard
     /// </summary>
     public static string FingerprintOf(MethodBase m)
     {
-        IEnumerable<KeyValuePair<System.Reflection.Emit.OpCode, object>> body;
+        IEnumerable<KeyValuePair<OpCode, object>> body;
         try { body = PatchProcessor.ReadMethodBody(m); }
         catch (Exception) { return null; }
 
@@ -346,8 +406,8 @@ public static class PatchGuard
             case FieldInfo fi: return (fi.DeclaringType?.FullName ?? "?") + "::" + fi.Name;
             case Type t: return t.FullName ?? t.Name;
             case string s: return "\"" + s + "\"";
-            case System.Reflection.Emit.Label l: return "L" + l.GetHashCode().ToString(CultureInfo.InvariantCulture);
-            case System.Reflection.Emit.LocalBuilder lb: return "V" + lb.LocalIndex + ":" + (lb.LocalType?.FullName ?? "?");
+            case Label l: return "L" + l.GetHashCode().ToString(CultureInfo.InvariantCulture);
+            case LocalBuilder lb: return "V" + lb.LocalIndex + ":" + (lb.LocalType?.FullName ?? "?");
             case LocalVariableInfo lv: return "V" + lv.LocalIndex + ":" + (lv.LocalType?.FullName ?? "?");
             case ParameterInfo pi: return "P" + pi.Position;
             case IFormattable f: return f.ToString(null, CultureInfo.InvariantCulture);

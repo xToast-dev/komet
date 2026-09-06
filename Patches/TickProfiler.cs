@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using HarmonyLib;
 using Vintagestory.Common;
@@ -35,24 +36,17 @@ public static class TickProfiler
 {
     public static bool Enabled = true;
 
-    internal sealed class Entry
-    {
-        public long Ticks;
-        public double Ms;
-        public long Calls;
-    }
-
     /// <summary>The timing decorator; one instance per wrapped listener.</summary>
     internal sealed class Timed
     {
         internal readonly Action<float> Inner;
-        private readonly Entry entry;
+        private readonly Measure.MsLedger.Entry entry;
 
         /// <summary>The mod whose code this listener is, resolved once at wrap time - see
         /// RendererProfiler.Timed.Mod for why it is not a per-call lookup.</summary>
         internal readonly Measure.ModProfiler.Entry Mod;
 
-        public Timed(Action<float> inner, Entry entry, Measure.ModProfiler.Entry mod)
+        public Timed(Action<float> inner, Measure.MsLedger.Entry entry, Measure.ModProfiler.Entry mod)
         {
             Inner = inner;
             this.entry = entry;
@@ -70,9 +64,7 @@ public static class TickProfiler
         }
     }
 
-    private static readonly Dictionary<string, Entry> Entries = new(64);
-    private const double Alpha = 1.0 / 64.0;
-    private static readonly double TicksToMs = 1000.0 / Stopwatch.Frequency;
+    private static readonly Measure.MsLedger Ledger = new();
 
     private static readonly AccessTools.FieldRef<EventManager, List<GameTickListener>> Listeners =
         AccessTools.FieldRefAccess<EventManager, List<GameTickListener>>("GameTickListenersEntity");
@@ -108,7 +100,7 @@ public static class TickProfiler
             }
             var mod = Measure.ModProfiler.Of(OwnerOf(h));
             if (countMods) mod.Listeners++;
-            l.Handler = new Timed(h, Bucket(NameOf(h)), mod).Invoke;
+            l.Handler = new Timed(h, Ledger.Bucket(NameOf(h)), mod).Invoke;
             wrapped++;
         }
         StatTotal = total;
@@ -138,7 +130,7 @@ public static class TickProfiler
         // closures live in nested "<>c__DisplayClass" types; name them after the outer type
         if (typeName.StartsWith("<>") && type?.DeclaringType != null) typeName = type.DeclaringType.Name;
         var method = h.Method.Name;
-        if (method.StartsWith("<"))
+        if (method.StartsWith('<'))
         {
             var end = method.IndexOf('>');
             method = end > 1 ? method.Substring(1, end - 1) + "()" : "lambda";
@@ -157,68 +149,28 @@ public static class TickProfiler
         return type;
     }
 
-    private static Entry Bucket(string name)
-    {
-        if (!Entries.TryGetValue(name, out var e)) Entries[name] = e = new Entry();
-        return e;
-    }
-
-    /// <summary>Folds the finished frame into the averages; every frame, so a listener that
-    /// did not fire this frame is a real zero in "ms per frame".</summary>
+    /// <summary>Folds the finished frame into the averages, and the mod profiler's with it.</summary>
     public static void EndFrame()
     {
-        foreach (var kv in Entries)
-        {
-            var e = kv.Value;
-            e.Ms += (e.Ticks * TicksToMs - e.Ms) * Alpha;
-            e.Ticks = 0;
-        }
-        // every frame, like the buckets above: a listener that did not fire is a real zero
+        Ledger.EndFrame();
+        // the same every-frame fold, for the same reason: a mod that ticked nothing this frame
+        // is a real zero, not a stale average
         Measure.ModProfiler.FoldTick();
     }
 
-    /// <summary>The frame's most expensive listener, raw ticks - valid only between the frame
-    /// boundary's hitch detection and EndFrame, like the renderer profiler's.</summary>
-    public static (string name, double ms)? TopOfCurrentFrame()
-    {
-        string bestName = null;
-        long best = 0;
-        foreach (var kv in Entries)
-        {
-            if (kv.Value.Ticks > best)
-            {
-                best = kv.Value.Ticks;
-                bestName = kv.Key;
-            }
-        }
-        return bestName == null ? null : (bestName, best * TicksToMs);
-    }
+    /// <summary>The frame's most expensive listener - valid only between the frame boundary's
+    /// hitch detection and EndFrame, like the renderer profiler's.</summary>
+    public static (string name, double ms)? TopOfCurrentFrame() => Ledger.TopOfCurrentFrame();
 
-    public static List<(string name, double ms, long calls)> Top(int count)
-    {
-        var all = new List<(string, double, long)>(Entries.Count);
-        foreach (var kv in Entries)
-            if (kv.Value.Ms > 0.005) all.Add((kv.Key, kv.Value.Ms, kv.Value.Calls));
-        all.Sort((a, b) => b.Item2.CompareTo(a.Item2));
-        if (all.Count > count) all.RemoveRange(count, all.Count - count);
-        return all;
-    }
+    public static List<(string name, double ms, long calls)> Top(int count) => Ledger.Top(count);
 
     /// <summary>Everything the wrapped listeners account for per frame; against the tick
     /// total, the remainder is block entity ticks and delayed callbacks.</summary>
-    public static double TotalMs
-    {
-        get
-        {
-            double sum = 0;
-            foreach (var kv in Entries) sum += kv.Value.Ms;
-            return sum;
-        }
-    }
+    public static double TotalMs => Ledger.TotalMs;
 
-    public static int Count => Entries.Count;
+    public static int Count => Ledger.Count;
 
-    public static void Write(StringBuilder sb, int count, System.Globalization.CultureInfo ci, double tickMs)
+    public static void Write(StringBuilder sb, int count, CultureInfo ci, double tickMs)
     {
         var top = Top(count);
         sb.AppendFormat(ci, "tick-listener: {0} gewickelt, {1:F2} von {2:F2} ms/frame erklaert (rest = block-entities, delayed callbacks)",
@@ -235,8 +187,5 @@ public static class TickProfiler
         sb.Append('\n');
     }
 
-    public static void Reset()
-    {
-        foreach (var kv in Entries) { kv.Value.Ticks = 0; kv.Value.Ms = 0; kv.Value.Calls = 0; }
-    }
+    public static void Reset() => Ledger.Reset();
 }

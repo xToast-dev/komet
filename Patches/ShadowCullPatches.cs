@@ -82,6 +82,19 @@ public static class ShadowCullPatches
     /// Set at world start; null keeps the engine's program (culling still applies).</summary>
     public static ClientMain Game;
 
+    /// <summary>True between the solid and the foliage half of a shadow pass - set at the
+    /// transpiled boundary, cleared when RenderShadow returns.</summary>
+    public static bool InFoliageHalf { get; private set; }
+
+    /// <summary>
+    /// Diagnostic: skip the foliage passes (BlendNoCull, OpaqueNoCull) of BOTH shadow maps -
+    /// leaves, grass and crops stop casting. It changes the picture on purpose: it is the
+    /// one-command answer to "is the shadow pass paying for the foliage?", read off the GPU
+    /// row while it is on. '.komet toggle shadowfoliage'; never on by config.
+    /// </summary>
+    public static bool SkipFoliage;
+    public static long StatFoliageSkipped;
+
     private static ShaderProgram solid;
     private static bool solidFailed;
     private static bool solidActive;
@@ -97,11 +110,42 @@ public static class ShadowCullPatches
                      ?? throw new InvalidOperationException("ChunkRenderer.RenderShadow not found");
         harmony.Patch(render, transpiler: new HarmonyMethod(
             AccessTools.Method(typeof(ShadowCullPatches), nameof(CullSolidPasses))));
+        // the end of the foliage half: closes the probe's bracket and the half itself
+        harmony.Patch(render, postfix: new HarmonyMethod(
+            AccessTools.Method(typeof(ShadowCullPatches), nameof(AfterRenderShadow))));
+
+        var poolRender = AccessTools.Method(typeof(MeshDataPoolManager), nameof(MeshDataPoolManager.Render),
+                             [typeof(Vintagestory.API.MathTools.Vec3d), typeof(string), typeof(EnumFrustumCullMode)])
+                         ?? throw new InvalidOperationException("MeshDataPoolManager.Render not found");
+        harmony.Patch(poolRender, prefix: new HarmonyMethod(
+            AccessTools.Method(typeof(ShadowCullPatches), nameof(SkipFoliageRender))));
+    }
+
+    /// <summary>Which cascade RenderShadow is drawing into: the prefix on
+    /// PrepareForShadowRendering remembered it, and nothing between there and here changes it.</summary>
+    private static bool Far => ShadowPatches.PreparingFarCascade;
+
+    /// <summary>Runs when RenderShadow returns: the foliage half is over.</summary>
+    public static void AfterRenderShadow()
+    {
+        InFoliageHalf = false;
+        Measure.GpuPassProbe.End(Far ? Measure.GpuPassProbe.Pass.FarFoliage : Measure.GpuPassProbe.Pass.NearFoliage);
+    }
+
+    /// <summary>A pool manager's Render inside the foliage half of a shadow pass, while the
+    /// diagnostic skip is on, draws nothing. Everywhere else it is untouched.</summary>
+    public static bool SkipFoliageRender()
+    {
+        if (!SkipFoliage || !InFoliageHalf) return true;
+        StatFoliageSkipped++;
+        return false;
     }
 
     /// <summary>What the first GlDisableCullFace of RenderShadow now does.</summary>
     public static void BeginSolidPasses(ClientPlatformAbstract platform)
     {
+        InFoliageHalf = false;
+        Measure.GpuPassProbe.Begin(Far ? Measure.GpuPassProbe.Pass.FarSolid : Measure.GpuPassProbe.Pass.NearSolid);
         if (Enabled)
         {
             platform.GlCullFaceBack();
@@ -155,6 +199,9 @@ public static class ShadowCullPatches
     public static void EndSolidPasses(ClientPlatformAbstract platform)
     {
         platform.GlDisableCullFace();
+        Measure.GpuPassProbe.End(Far ? Measure.GpuPassProbe.Pass.FarSolid : Measure.GpuPassProbe.Pass.NearSolid);
+        Measure.GpuPassProbe.Begin(Far ? Measure.GpuPassProbe.Pass.FarFoliage : Measure.GpuPassProbe.Pass.NearFoliage);
+        InFoliageHalf = true;
         if (!solidActive) return;
         solidActive = false;
         try

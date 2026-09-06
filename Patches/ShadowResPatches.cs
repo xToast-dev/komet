@@ -160,7 +160,7 @@ public static class ShadowResPatches
     /// rebuild, not per frame - and a framebuffer the driver will not accept at the new size
     /// is put back to the engine's before anything renders into it.
     /// </summary>
-    public static void ResizeNearMap(System.Collections.Generic.List<FrameBufferRef> __result)
+    public static void ResizeNearMap(List<FrameBufferRef> __result)
     {
         NearSetupRan = true;
         NearMapSizeApplied = 0;

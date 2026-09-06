@@ -60,6 +60,55 @@ public static class StressTest
     /// <summary>One line for the HUD while the test runs, null otherwise.</summary>
     public static string StatusLine { get; private set; }
 
+    /// <summary>
+    /// The table the last finished run produced, kept for the window. Until it existed the
+    /// result lived in the chat and in client-main.log, and a run that finished while the
+    /// player was looking somewhere else was gone. Null before the first run completes.
+    /// </summary>
+    public static string LastReport { get; private set; }
+
+    /// <summary>
+    /// The table as it stands right now: every system that already has a measured slice with
+    /// baselines on both sides of it. The very same arithmetic the final report uses - fewer
+    /// rounds, so wider error bars, and the report says so itself by printing the round count
+    /// next to each spread. Falls back to the last finished run when nothing is running.
+    /// </summary>
+    public static string LiveReport()
+        => Running && slices != null && schedule != null && systems != null
+            ? BuildReport(slices, schedule, systems)
+            : LastReport;
+
+    /// <summary>Which slice of how many - the progress the window draws as a bar.</summary>
+    public static int SliceIndex => sliceIndex;
+    public static int SliceCount => schedule?.Length ?? 0;
+    public static int RoundCount => rounds;
+    public static double SecondsPerSlice => secondsPerSlice;
+
+    /// <summary>How many systems this run walks through, so the window can say what is left.</summary>
+    public static int SystemCount => systems?.Count ?? 0;
+
+    /// <summary>The name of the system in the slice being measured, or null during a baseline.</summary>
+    public static string CurrentPhase
+    {
+        get
+        {
+            var c = CurrentSystem();
+            return c >= 0 && systems != null && c < systems.Count ? systems[c].Name : null;
+        }
+    }
+
+    /// <summary>What the slice being measured has collected so far. Frames of 0 means it is
+    /// still settling - the window says "settling" rather than showing a mean of nothing.</summary>
+    public static (int frames, double avgMs, double worstMs) CurrentSliceStats
+    {
+        get
+        {
+            if (!Running || slices == null || sliceIndex < 0 || sliceIndex >= slices.Count) return (0, 0, 0);
+            var s = slices[sliceIndex];
+            return (s.Frames, s.AvgMs, s.WorstMs);
+        }
+    }
+
     private static List<Phase> systems;
     private static int[] schedule;              // per slice: system index or -1
     private static List<Slice> slices;
@@ -149,6 +198,7 @@ public static class StressTest
                 Running = false;
                 StatusLine = null;
                 var table = BuildReport(slices, schedule, systems);
+                LastReport = table;
                 systems = null;
                 slices = null;
                 schedule = null;

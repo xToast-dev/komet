@@ -71,13 +71,40 @@ public static class CullVerifier
             case EnumFrustumCullMode.CullInstant:
                 return !loc.Hide && loc.CullVisible[buf] && culler.InFrustum(loc.FrustumCullSphere);
             case EnumFrustumCullMode.CullInstantShadowPassNear:
+                // the far pictures never cast (see FastCuller); the engine's mesh of a part
+                // that has one (level 5) casts like level 1; not drawn, the pictures are
+                // hidden and the engine's answer stands for every level
+                if (Runtime.FarMesh.Active && Runtime.FarMesh.IsPicture(loc.LodLevel)) return false;
                 return !loc.Hide && loc.CullVisible[buf] && culler.InFrustumShadowPass(loc.FrustumCullSphere);
             case EnumFrustumCullMode.CullInstantShadowPassFar:
+                if (Runtime.FarMesh.Active && Runtime.FarMesh.IsPicture(loc.LodLevel)) return false;
                 return !loc.Hide && loc.CullVisible[buf]
                        && culler.InFrustumShadowPass(loc.FrustumCullSphere) && loc.LodLevel >= 1;
             case EnumFrustumCullMode.CullNormal:
-                return !loc.Hide && loc.CullVisible[buf]
-                       && culler.InFrustumAndRange(loc.FrustumCullSphere, loc.FrustumVisible, loc.LodLevel);
+                if (loc.Hide || !loc.CullVisible[buf]) return false;
+                if (loc.LodLevel == Runtime.FarMesh.LodNear || Runtime.FarMesh.IsPicture(loc.LodLevel))
+                {
+                    // The far LOD's levels are not the engine's; this is the sweep's rule for
+                    // them restated: level 5 is a LOD 1 part within the far distance
+                    // (inclusive), 4 a picture from there to twice the distance (inclusive),
+                    // 6 one beyond that, 7 one from the distance to the view distance - or,
+                    // with the pictures not drawn, level 5 is plain LOD 1 and the rest never show.
+                    if (!culler.InFrustumAndRange(loc.FrustumCullSphere, loc.FrustumVisible, 1)) return false;
+                    if (!Runtime.FarMesh.Active) return loc.LodLevel == Runtime.FarMesh.LodNear;
+                    var s = loc.FrustumCullSphere;
+                    double d = FastCuller.PlayerPosOf(culler).HorDistanceSqTo(s.x, s.z);
+                    var farSq = Runtime.FarMesh.EffectiveDistanceSq(culler);
+                    var tier2 = Runtime.FarMesh.Tier2;
+                    var far2Sq = tier2 ? Runtime.FarMesh.EffectiveDistance2Sq(culler) : double.PositiveInfinity;
+                    switch (loc.LodLevel)
+                    {
+                        case Runtime.FarMesh.LodNear: return d <= farSq;
+                        case Runtime.FarMesh.LodFar: return d > farSq && (!tier2 || d <= far2Sq);
+                        case Runtime.FarMesh.LodFar2: return tier2 && d > far2Sq;
+                        default: return d > farSq;
+                    }
+                }
+                return culler.InFrustumAndRange(loc.FrustumCullSphere, loc.FrustumVisible, loc.LodLevel);
             default:
                 return !loc.Hide;
         }
@@ -165,12 +192,16 @@ public static class CullVerifier
     /// Called after a sweep has written the pool. Cheap until the sample counter fires; the
     /// full check costs one vanilla sweep over that one pool.
     /// </summary>
+    [ThreadStatic] private static int[] sortedStartsTls, sortedSizesTls, sortKeysTls;
+
     public static void Maybe(MeshDataPool pool, FrustumCulling culler, EnumFrustumCullMode mode)
     {
         var every = SampleEvery;
         if (every <= 0 || reports >= MaxReports) return;
         if (--countdown > 0) return;
         countdown = every;
+        // a foliage pool under the foliage range legitimately differs from vanilla
+        if (FastCuller.IsFoliageCapped(pool, mode)) return;
 
         try
         {
@@ -209,8 +240,27 @@ public static class CullVerifier
             }
 
             StatChecked++;
-            var problem = Compare(pool.indicesStartsByte, pool.indicesSizes, pool.indicesGroupsCount,
-                                     want, allowed);
+            // A sorted sweep emits the same ranges in another order. Compare walks vanilla's
+            // list in emit order, so the emitted ranges are put back into byte order first -
+            // what is drawn is the set, and the set is what the check is for.
+            var starts = pool.indicesStartsByte;
+            var sizes = pool.indicesSizes;
+            var groups = pool.indicesGroupsCount;
+            if (FastCuller.FrontToBack && mode == EnumFrustumCullMode.CullNormal && groups > 1)
+            {
+                var sortedStarts = sortedStartsTls ??= new int[groups * 2 + 64];
+                var sortedSizes = sortedSizesTls ??= new int[groups + 64];
+                if (sortedStarts.Length < groups * 2) sortedStartsTls = sortedStarts = new int[groups * 2 + 64];
+                if (sortedSizes.Length < groups) sortedSizesTls = sortedSizes = new int[groups + 64];
+                var keys = sortKeysTls ??= new int[groups + 64];
+                if (keys.Length < groups) sortKeysTls = keys = new int[groups + 64];
+                for (var g = 0; g < groups; g++) { keys[g] = starts[g * 2]; sortedSizes[g] = sizes[g]; }
+                Array.Sort(keys, sortedSizes, 0, groups);
+                for (var g = 0; g < groups; g++) sortedStarts[g * 2] = keys[g];
+                starts = sortedStarts;
+                sizes = sortedSizes;
+            }
+            var problem = Compare(starts, sizes, groups, want, allowed);
             if (problem == null) return;
 
             StatMismatches++;

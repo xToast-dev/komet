@@ -23,6 +23,9 @@ internal sealed class ArrayPoolByClass<T>
     private readonly object gate = new();
     private readonly int elementSize;
 
+    /// <summary>Upper bound on bytes held by THIS pool; beyond it returns are dropped.</summary>
+    public int BudgetMb = 64;
+
     public long HeldBytes;
     public long StatHits, StatMisses, StatReturns, StatDropped;
 
@@ -36,30 +39,38 @@ internal sealed class ArrayPoolByClass<T>
     public T[] Rent(int count, T[] source)
     {
         if (count <= 0) return Array.Empty<T>();
-        var log = Math.Max(MinLog, BitOperations.Log2((uint)count - 1) + 1); // ceil(log2(count)), min class
-        T[] a = null;
-        if (log <= MaxLog)
-        {
-            lock (gate)
-            {
-                var st = classes[log];
-                if (st != null && st.Count > 0)
-                {
-                    a = st.Pop();
-                    HeldBytes -= (long)a.Length * elementSize;
-                    StatHits++;
-                }
-                else StatMisses++;
-            }
-            a ??= new T[1 << log];
-        }
-        else
-        {
-            StatMisses++;
-            a = new T[count];
-        }
+        var a = RentBlank(count);
         Array.Copy(source, a, count);
         return a;
+    }
+
+    /// <summary>
+    /// An array of at least <paramref name="count"/> elements, holding whatever its previous
+    /// tenant left. For a caller that writes every element it will later declare - the far
+    /// LOD's outputs, whose Count grows face by face as they are written.
+    /// </summary>
+    public T[] RentBlank(int count)
+    {
+        if (count <= 0) return Array.Empty<T>();
+        var log = Math.Max(MinLog, BitOperations.Log2((uint)count - 1) + 1); // ceil(log2(count)), min class
+        if (log > MaxLog)
+        {
+            StatMisses++;
+            return new T[count];
+        }
+        lock (gate)
+        {
+            var st = classes[log];
+            if (st != null && st.Count > 0)
+            {
+                var a = st.Pop();
+                HeldBytes -= (long)a.Length * elementSize;
+                StatHits++;
+                return a;
+            }
+            StatMisses++;
+        }
+        return new T[1 << log];
     }
 
     public void Return(T[] a)
@@ -72,7 +83,7 @@ internal sealed class ArrayPoolByClass<T>
         var bytes = (long)len * elementSize;
         lock (gate)
         {
-            if (HeldBytes + bytes > (long)Patches.TightClonePatches.ExtrasPoolBudgetMb << 20) { StatDropped++; return; }
+            if (HeldBytes + bytes > (long)BudgetMb << 20) { StatDropped++; return; }
             (classes[log] ??= new Stack<T[]>()).Push(a);
             HeldBytes += bytes;
             StatReturns++;

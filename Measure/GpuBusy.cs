@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 
 namespace Komet.Measure;
@@ -99,7 +100,7 @@ public static class GpuBusy
             {
                 // "card1" yes, "card1-DP-1" (a connector) no
                 var name = Path.GetFileName(card);
-                if (name.Length < 5 || !char.IsDigit(name[4]) || name.IndexOf('-') >= 0) continue;
+                if (name.Length < 5 || !char.IsDigit(name[4]) || name.Contains('-')) continue;
                 var candidate = Path.Combine(card, "device", "gpu_busy_percent");
                 if (!File.Exists(candidate)) continue;
                 if (TryParse(File.ReadAllText(candidate), out _)) return candidate;
@@ -114,8 +115,8 @@ public static class GpuBusy
     {
         percent = -1;
         if (text == null) return false;
-        if (!int.TryParse(text.Trim(), System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture, out var p)) return false;
+        if (!int.TryParse(text.Trim(), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var p)) return false;
         if (p < 0 || p > 100) return false;
         percent = p;
         return true;

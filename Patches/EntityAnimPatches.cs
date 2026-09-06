@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using HarmonyLib;
 using Vintagestory.API.Common.Entities;
@@ -215,7 +216,7 @@ public static class EntityAnimPatches
 
     private static double Blend(double cur, double sample, bool first) => first ? sample : cur + (sample - cur) * Alpha;
 
-    public static void Write(StringBuilder sb, System.Globalization.CultureInfo ci)
+    public static void Write(StringBuilder sb, CultureInfo ci)
     {
         sb.AppendFormat(ci, "entity before: pre-render {0:F2} ms ({1:F0} visible), anim {2:F2} ms ({3:F0} per frame, {4:N0} skipped)",
             AvgBeforeMs, AvgRendered, AvgAnimMs, AvgAnimated, StatSkipped);

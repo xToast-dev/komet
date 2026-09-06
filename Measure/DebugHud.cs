@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Cairo;
 using HarmonyLib;
 using Vintagestory.API.Client;
@@ -18,7 +20,7 @@ namespace Komet.Measure;
 /// <see cref="ExtraSection"/>.
 ///
 /// It is also the overlay MACHINERY for the second HUD: <see cref="Komet.Measure.ModHud"/>
-/// derives from this and replaces only <see cref="ComposeText"/> and <see cref="SampleWorld"/>.
+/// derives from this and replaces only <see cref="ComposeText"/> and <see cref="SampleWorld()"/>.
 /// Everything that was hard to get right here - the off-thread raster, the state machine that
 /// keeps a view change from flashing the previous view, the adaptive rebuild interval, the
 /// "an overlay must never become the stutter it reports" guard - is paid for once and holds
@@ -34,9 +36,80 @@ public class DebugHud : IRenderer
 {
     public delegate void SectionWriter(StringBuilder sb, double frameMs);
 
-    private const int LabelWidth = 13;
-    private const int ValueWidth = 9;
-    private static readonly string Rule = new('─', 48);
+    // ---- the fixed-width geometry the rows are formatted to ----------------------------
+    //
+    // Every surface this mod prints to is pre-formatted monospace, but they are not all the
+    // same width. The F7 overlay sizes its box to the longest line it produced, so its 48
+    // columns are a shape rather than a limit. The '.komet' window has a panel of a fixed
+    // width, and there the same rows were simply cut off at the border: the tick-listener and
+    // main-thread lines lost their tail mid-word, the section rules stopped halfway across the
+    // panel, and renderer names cut to the overlay's 13-column label turned three different
+    // renderers into three identical rows.
+    //
+    // So the geometry is ambient: the narrow one is the default that every existing surface
+    // gets, and the window widens it around its own compose. Both run on the main thread, one
+    // after the other, and <see cref="Widened"/> puts the old values back even when a page
+    // throws - which is what makes a static safe here.
+
+    private const int NarrowLabel = 13;
+    private const int NarrowValue = 9;
+    private const int NarrowRule = 48;
+
+    /// <summary>The widest label a wide surface pads to. Room for the longest name the
+    /// profiler pages actually carry ('Before-Sheydercollect...') without pushing the value
+    /// column so far right that the short rows read as a gap.</summary>
+    private const int WideLabel = 22;
+
+    private static int labelWidth = NarrowLabel;
+    private static int valueWidth = NarrowValue;
+    private static int ruleCells = NarrowRule;
+
+    private static readonly string Rule = new('─', NarrowRule);
+
+    /// <summary>The label column rows are padded to - what a writer cuts its own names to, so
+    /// that the value column stays a column. See <see cref="Label"/>.</summary>
+    public static int LabelWidth => labelWidth;
+
+    /// <summary>
+    /// Widens the row geometry for one compose of a wide surface: 'using var _ =
+    /// DebugHud.WideText(columns);'. Anything narrower than the overlay's own rule keeps the
+    /// narrow geometry - a panel that small cannot spend 22 columns on labels.
+    /// </summary>
+    internal static Widened WideText(int columns) => new(columns);
+
+    internal readonly struct Widened : IDisposable
+    {
+        private readonly int label, value, rule;
+
+        public Widened(int columns)
+        {
+            label = labelWidth;
+            value = valueWidth;
+            rule = ruleCells;
+            if (columns < NarrowRule + 12) return;
+            labelWidth = WideLabel;
+            valueWidth = NarrowValue;
+            ruleCells = Math.Min(columns, 200);
+        }
+
+        public void Dispose()
+        {
+            labelWidth = label;
+            valueWidth = value;
+            ruleCells = rule;
+        }
+    }
+
+    /// <summary>
+    /// A name cut to the label column, with the cut marked. Unmarked truncation is worse than
+    /// a long name: three renderers whose names differ after the thirteenth character became
+    /// three rows reading 'Before-Sheyde', which looks like the same renderer counted thrice.
+    /// </summary>
+    public static string Label(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "";
+        return name.Length <= labelWidth ? name : string.Concat(name.AsSpan(0, labelWidth - 1), "…");
+    }
 
     /// <summary>ClientMain.chunkRenderer and ClientWorldMap.chunks are internal.</summary>
     private static readonly AccessTools.FieldRef<ClientMain, ChunkRenderer> ChunkRendererRef =
@@ -104,12 +177,49 @@ public class DebugHud : IRenderer
     /// <summary>An off-thread raster threw once (cairo built without threads?): stay on the
     /// synchronous path for the rest of the session instead of failing four times a second.
     /// Static like the interval - one overlay per process, and Compose() reports it.</summary>
+    /// <summary>
+    /// How a background raster reaches a worker. The optimising mod points this at its own job
+    /// pool, where the raster sits behind everything the frame is waiting for; the baseline
+    /// leaves it null and rasters on the render thread. That split is deliberate - the baseline
+    /// is the measuring stick, and it must not quietly acquire the machinery it is measuring
+    /// against. Returns false when nothing took the work, which keeps the HUD synchronous
+    /// rather than frozen on stale text.
+    /// </summary>
+    public static Func<Action, bool> RasterDispatch;
+
     private static bool rasterBroken;
 
-    private System.Threading.Tasks.Task rasterTask;
+    /// <summary>
+    /// A background raster in flight, and how it ended. The pool has no Task to await, so the
+    /// handshake is explicit: the job signals the event on every path and parks its exception
+    /// here, which the main thread reads on the frame that finds the event set. Nothing else
+    /// may touch surface or ctx while <see cref="rasterInFlight"/> is true - NextStep only
+    /// allows Start and RebuildNow when it is not.
+    /// </summary>
+    private readonly ManualResetEventSlim rasterDone = new(false);
+    private volatile bool rasterInFlight;
+    private volatile Exception rasterFailure;
+    private string[] rasterLines;
+    private int rasterW, rasterH;
     private double pendingMainMs, pendingRasterMs;
 
-    private LoadedTexture texture;
+    /// <summary>
+    /// Two textures, used in turn, and the index of the one currently on screen.
+    ///
+    /// The raster already runs on a worker; what stayed on the render thread is the upload, and
+    /// glTexSubImage2D into a texture the GPU is still reading for a frame in flight blocks
+    /// until it is done with it. A field log has one frame at 63 ms with 29,2 ms of it booked
+    /// here, on a GPU 85 % busy - the overlay was not rastering for 29 ms, it was waiting for
+    /// the driver. Writing into whichever texture is NOT on screen gives the GPU a full refresh
+    /// of slack, for a second copy of a HUD-sized texture.
+    /// </summary>
+    private readonly LoadedTexture[] textures = new LoadedTexture[2];
+    private int front;
+
+    /// <summary>The texture currently on screen - what every "have we got something to draw"
+    /// test asks, and what the renderer draws.</summary>
+    private LoadedTexture texture => textures[front];
+
     private CairoFont font;
     private readonly TextBackground background;
     private float accum;
@@ -250,10 +360,11 @@ public class DebugHud : IRenderer
         lastDrawCalls = now;
 
         accum += dt;
-        texture ??= new LoadedTexture(capi);
+        textures[0] ??= new LoadedTexture(capi);
+        textures[1] ??= new LoadedTexture(capi);
         font ??= CairoFont.WhiteSmallText().WithFont("monospace").WithFontSize(15f);
 
-        switch (NextStep(dirty, rasterTask != null, rasterTask?.IsCompleted ?? false,
+        switch (NextStep(dirty, rasterInFlight, rasterInFlight && rasterDone.IsSet,
                          accum, rebuildInterval, texture.TextureId != 0))
         {
             case Step.WaitInvisible:
@@ -262,11 +373,11 @@ public class DebugHud : IRenderer
                 // flicker this state machine exists to kill.
                 return;
             case Step.RebuildNow:
-                if (rasterTask != null)
+                if (rasterInFlight)
                 {
                     // completed, but composed for the state before the change - discard the
                     // output and force the repaint (lastText already holds ITS text)
-                    rasterTask = null;
+                    rasterInFlight = false;
                     lastText = "";
                 }
                 RebuildSync();
@@ -350,27 +461,63 @@ public class DebugHud : IRenderer
         pendingMainMs = mainMs;
         // The task owns surface and ctx until it completes. Nothing else can touch them in
         // between: NextStep only allows Start and RebuildNow when no raster is in flight.
-        rasterTask = System.Threading.Tasks.Task.Run(() =>
+        // Komet's own pool rather than a ThreadPool task: the raster is background work that
+        // must never sit behind the game's chunk tasks, and the pool already knows to run it
+        // only when nothing the frame is waiting for wants a worker.
+        rasterLines = lines;
+        rasterW = width;
+        rasterH = height;
+        rasterDone.Reset();
+        rasterFailure = null;
+        rasterInFlight = true;
+        if (RasterDispatch?.Invoke(RasterJob) != true)
         {
-            var r0 = Stopwatch.GetTimestamp();
+            // no pool (startup, teardown): stay on the render thread rather than never
+            // finishing the rebuild
+            rasterInFlight = false;
             Raster(lines, width, height);
+            Upload();
+            FoldRebuild(pendingMainMs + ElapsedMs(t0));
+        }
+    }
+
+    /// <summary>
+    /// The raster, on a pool worker. It owns surface and ctx for its whole run; the event is
+    /// set on every path, because a raster that never signals leaves the state machine waiting
+    /// for a frame that never comes and the HUD frozen on stale text.
+    /// </summary>
+    private void RasterJob()
+    {
+        var r0 = Stopwatch.GetTimestamp();
+        try
+        {
+            Raster(rasterLines, rasterW, rasterH);
+        }
+        catch (Exception e)
+        {
+            rasterFailure = e;
+        }
+        finally
+        {
             pendingRasterMs = ElapsedMs(r0);
-        });
+            rasterDone.Set();
+        }
     }
 
     /// <summary>The main-thread tail of a background raster: hand the pixels to the driver.</summary>
     private void FinishRaster()
     {
-        var t = rasterTask;
-        rasterTask = null;
-        if (t.IsFaulted)
+        rasterInFlight = false;
+        var failure = rasterFailure;
+        rasterFailure = null;
+        if (failure != null)
         {
             // cairo (or its font map) refused the worker thread on this platform - stay
             // synchronous for the session and repaint, so the HUD never freezes on stale text
             rasterBroken = true;
             lastText = "";
             capi.Logger.Warning("{0} HUD: background raster failed, synchronous from now on: {1}",
-                title, t.Exception?.GetBaseException()?.Message);
+                title, failure.Message);
             return;
         }
         var uploadMs = Upload();
@@ -405,35 +552,69 @@ public class DebugHud : IRenderer
     /// overlay that reports something other than the terrain has nothing to sample here.</summary>
     protected virtual void SampleWorld()
     {
+        // The pool walk (GetStats + CalcFragmentation over every mesh pool) feeds rows only
+        // the full view shows. The compact view - the view people actually play with - earns
+        // its smallness by not paying for them either.
+        if (Compact) return;
+
+        SampleWorld(capi, ref world);
+        vramBytes = world.VramBytes;
+        renderedTris = world.RenderedTris;
+        allocatedTris = world.AllocatedTris;
+        poolCount = world.PoolCount;
+        fragmentation = world.Fragmentation;
+        loadedChunks = world.LoadedChunks;
+    }
+
+    private WorldSample world;
+
+    /// <summary>
+    /// What one walk over the chunk renderer costs to learn, in one place. A struct rather than
+    /// six out parameters because there is now a second reader - the window - and two readers
+    /// of a six-value tuple is where the argument order starts going wrong.
+    /// </summary>
+    public struct WorldSample
+    {
+        public long VramBytes;
+        public long RenderedTris;
+        public long AllocatedTris;
+        public int PoolCount;
+        public float Fragmentation;
+        public int LoadedChunks;
+    }
+
+    /// <summary>
+    /// The one walk over the chunk renderer and the chunk map, shared by the overlay and the
+    /// window. It is not free - GetStats and CalcFragmentation both traverse every mesh pool -
+    /// so it is called on a refresh cadence and never per frame, and both callers pay for it
+    /// exactly once each time they rebuild.
+    ///
+    /// The per-second rates (GC, allocation, CPU, tesselation) are NOT here: they fold at the
+    /// frame boundary (see FrameStats.SampleIntervalSeconds), so a report written with every
+    /// overlay closed still has them. Folding them here once meant zeros in exactly that case.
+    /// </summary>
+    public static void SampleWorld(ICoreClientAPI capi, ref WorldSample s)
+    {
         try
         {
-            if (capi.World is not ClientMain game) return;
+            if (capi?.World is not ClientMain game) return;
 
-            // The pool walk (GetStats + CalcFragmentation over every mesh pool) feeds rows
-            // only the full view shows. The compact view - the view people actually play
-            // with - earns its smallness by not paying for them either.
-            if (!Compact)
+            var renderer = ChunkRendererRef(game);
+            if (renderer != null)
             {
-                var renderer = ChunkRendererRef(game);
-                if (renderer != null)
-                {
-                    renderer.GetStats(out var used, out var rendered, out var allocated);
-                    vramBytes = used;
-                    renderedTris = rendered;
-                    allocatedTris = allocated;
-                    poolCount = renderer.QuantityModelDataPools();
-                    fragmentation = renderer.CalcFragmentation();
-                }
-
-                if (game.WorldMap != null) loadedChunks = ChunksRef(game.WorldMap)?.Count ?? 0;
+                renderer.GetStats(out var used, out var rendered, out var allocated);
+                s.VramBytes = used;
+                s.RenderedTris = rendered;
+                s.AllocatedTris = allocated;
+                s.PoolCount = renderer.QuantityModelDataPools();
+                s.Fragmentation = renderer.CalcFragmentation();
             }
-            // The per-second rates (GC, allocation, CPU, tesselation) fold at the frame
-            // boundary now - see FrameStats.SampleIntervalSeconds - so the overlay only reads
-            // them. Folding them here meant a report with the overlay off printed zeros.
+
+            if (game.WorldMap != null) s.LoadedChunks = ChunksRef(game.WorldMap)?.Count ?? 0;
         }
         catch
         {
-            vramBytes = 0;
+            s.VramBytes = 0;
         }
     }
 
@@ -538,7 +719,9 @@ public class DebugHud : IRenderer
     private double Upload()
     {
         var t0 = Stopwatch.GetTimestamp();
-        capi.Gui.LoadOrUpdateCairoTexture(surface, false, ref texture);
+        var next = front ^ 1;
+        capi.Gui.LoadOrUpdateCairoTexture(surface, false, ref textures[next]);
+        front = next;
         var uploadMs = ElapsedMs(t0);
         AvgUploadMs = AvgUploadMs <= 0 ? uploadMs : AvgUploadMs * 0.8 + uploadMs * 0.2;
         return uploadMs;
@@ -604,11 +787,15 @@ public class DebugHud : IRenderer
         Row(sb, label, Pct(ms, frame), Ms(ms), tail);
     }
 
-    /// <summary>One aligned row: label, an optional value column, an optional millisecond column.</summary>
+    /// <summary>One aligned row: label, an optional value column, an optional millisecond column.
+    /// Padded into the builder rather than through PadLeft/PadRight, which allocated a padded
+    /// copy of both columns for every row of every rebuild.</summary>
     public static void Row(StringBuilder sb, string label, string value = null, string ms = null, string tail = null)
     {
-        sb.Append(' ').Append(label.PadRight(LabelWidth));
-        sb.Append((value ?? "").PadLeft(ValueWidth));
+        label ??= "";
+        value ??= "";
+        sb.Append(' ').Append(label).Append(' ', Math.Max(0, labelWidth - label.Length));
+        sb.Append(' ', Math.Max(0, valueWidth - value.Length)).Append(value);
         if (ms != null) sb.Append("  ").Append(ms);
         if (tail != null) sb.Append("  ").Append(tail);
         sb.Append('\n');
@@ -616,8 +803,9 @@ public class DebugHud : IRenderer
 
     public static void Section(StringBuilder sb, string heading)
     {
-        var head = "── " + heading + " ";
-        sb.Append(head).Append('─', Math.Max(0, Rule.Length - head.Length)).Append('\n');
+        heading ??= "";
+        sb.Append("── ").Append(heading).Append(' ');
+        sb.Append('─', Math.Max(0, ruleCells - heading.Length - 4)).Append('\n');
     }
 
     public static string Pct(double ms, double frameMs)
@@ -680,21 +868,19 @@ public class DebugHud : IRenderer
             : Compose(title, drawCallsPerFrame, ClientSettings.ViewDistance, vramBytes, poolCount,
                       fragmentation, loadedChunks, ExtraSection, renderedTris, allocatedTris);
 
+    /// <summary>What both views show before the first samples are in.</summary>
+    private static string Collecting(string title)
+        => title + "\n" + Loc.T("komet:hud-collecting", "collecting data ... ({0} frames)", FrameStats.TotalFrames);
+
     /// <summary>
     /// The compact view: six-ish rows a player can absorb mid-game. Everything here also
     /// exists in the full view - this is a selection, never a different measurement.
     /// </summary>
     public static string ComposeCompact(string title, SectionWriter warnings)
     {
+        if (!FrameStats.HasData) return Collecting(title);
+
         var sb = new StringBuilder(400);
-
-        if (!FrameStats.HasData)
-        {
-            sb.Append(title).Append('\n');
-            sb.Append(Loc.T("komet:hud-collecting", "collecting data ... ({0} frames)", FrameStats.TotalFrames));
-            return sb.ToString();
-        }
-
         var frame = FrameStats.AvgFrameMs;
         var fps = frame > 0 ? 1000.0 / frame : 0;
         var ci = CultureInfo.CurrentCulture;
@@ -736,21 +922,43 @@ public class DebugHud : IRenderer
                                  long vramBytes, int poolCount, float fragmentation, int loadedChunks,
                                  SectionWriter extra, long renderedTris = 0, long allocatedTris = 0)
     {
+        if (!FrameStats.HasData) return Collecting(title);
+
         var sb = new StringBuilder(1400);
-
-        if (!FrameStats.HasData)
-        {
-            sb.Append(title).Append('\n');
-            sb.Append(Loc.T("komet:hud-collecting", "collecting data ... ({0} frames)", FrameStats.TotalFrames));
-            return sb.ToString();
-        }
-
         var frame = FrameStats.AvgFrameMs;
         var fps = frame > 0 ? 1000.0 / frame : 0;
         var ci = CultureInfo.CurrentCulture;
 
         sb.Append(title).Append(" · ").Append(Loc.T("komet:hud-averages", "averages")).Append('\n');
         sb.Append(Rule).Append('\n');
+
+        WriteGlance(sb, frame);
+        WriteFrameBreakdown(sb, frame);
+        WriteGc(sb);
+        WriteWorld(sb, drawCallsPerFrame, viewDistance, vramBytes, poolCount, fragmentation,
+                   loadedChunks, renderedTris, allocatedTris);
+
+        extra?.Invoke(sb, frame);
+
+        return sb.ToString().TrimEnd('\n');
+    }
+
+    // ---- the blocks of the full view ------------------------------------------------
+    // Compose() used to be one long method, which was fine while the overlay was the only
+    // reader. The window reads them too, and it arranges them differently - an overview that
+    // shows the glance rows, a frametime view that shows the breakdown, a memory view that
+    // shows the gc block. Splitting beats copying by the usual argument: a copy is a second
+    // place a row can be added to, and the added row is always the one being asked about.
+    //
+    // The order Compose() calls them in is the order they were written in, so the overlay's
+    // text is unchanged to the byte and old screenshots stay comparable.
+
+    /// <summary>How it runs, at a glance: frame rate, the GPU next to it, the worst frame and
+    /// the hitch count. The rows that answer "is it fast, and if not, is it the GPU".</summary>
+    public static void WriteGlance(StringBuilder sb, double frame)
+    {
+        var ci = CultureInfo.CurrentCulture;
+        var fps = frame > 0 ? 1000.0 / frame : 0;
 
         // ---- how it runs, at a glance ----
         Row(sb, Loc.Hud("fps"), fps.ToString("F0", ci), Ms(frame));
@@ -794,6 +1002,14 @@ public class DebugHud : IRenderer
             if (lastHitch != null) Row(sb, "  " + Loc.Hud("last"), null, null, lastHitch);
         }
 
+    }
+
+    /// <summary>Where the frame goes: every bucket with its share drawn as a bar. Including the
+    /// game tick and the outside-the-stages remainder, the block accounts for 100 %.</summary>
+    public static void WriteFrameBreakdown(StringBuilder sb, double frame)
+    {
+        var ci = CultureInfo.CurrentCulture;
+
         // ---- where the frame goes ----
         // Every bucket of the frame, in the hitch log's order and vocabulary, each with its
         // share of the frame drawn as a bar (ten cells = the whole frame). Including the game
@@ -820,6 +1036,13 @@ public class DebugHud : IRenderer
             FrameStats.AvgSwapMs > 0.005
                 ? Loc.T("komet:hud-of-which-swap", "of which swap {0}", FrameStats.AvgSwapMs.ToString("F2", ci))
                 : Loc.T("komet:hud-swap-driver", "swap/driver"));
+
+    }
+
+    /// <summary>The collector: pauses, where the bytes come from, which mode is running.</summary>
+    public static void WriteGc(StringBuilder sb)
+    {
+        var ci = CultureInfo.CurrentCulture;
 
         // ---- gc ----
         // GC pauses stop every thread at once - the only mechanism that slows the render
@@ -869,6 +1092,15 @@ public class DebugHud : IRenderer
                 ? Loc.T("komet:hud-longest-ephemeral", "longest gen0/1 pause {0} ms", HitchLog.WorstEphemeralPauseMs.ToString("F0", ci))
                 : null);
 
+    }
+
+    /// <summary>The world and the loading pipeline, plus the overlay's own price.</summary>
+    public static void WriteWorld(StringBuilder sb, int drawCallsPerFrame, int viewDistance,
+                                  long vramBytes, int poolCount, float fragmentation, int loadedChunks,
+                                  long renderedTris, long allocatedTris)
+    {
+        var ci = CultureInfo.CurrentCulture;
+
         // ---- the world and the loading pipeline ----
         Section(sb, Loc.Hud("world & loading"));
         // Not RuntimeStats.renderedTriangles: SystemRenderTerrain only fills those while the
@@ -914,9 +1146,6 @@ public class DebugHud : IRenderer
                     lastInterval.ToString("0.##", ci), AvgUploadMs.ToString("F1", ci))
                 + (BackgroundRaster && !rasterBroken ? Loc.T("komet:hud-raster-worker", " · raster in worker") : ""));
 
-        extra?.Invoke(sb, frame);
-
-        return sb.ToString().TrimEnd('\n');
     }
 
     public void Dispose()
@@ -924,13 +1153,13 @@ public class DebugHud : IRenderer
         // A raster still painting owns surface and ctx. Waiting a moment is fine here (world
         // leave, not a frame); if it is genuinely hung, leak both to the finaliser rather
         // than dispose them under the worker's brush.
-        var rasterDone = true;
-        try { rasterDone = rasterTask?.Wait(500) ?? true; } catch { /* faulted counts as done */ }
-        rasterTask = null;
+        var finished = !rasterInFlight || rasterDone.Wait(500);
+        rasterInFlight = false;
 
-        texture?.Dispose();
-        texture = null;
-        if (rasterDone)
+        textures[0]?.Dispose();
+        textures[1]?.Dispose();
+        textures[0] = textures[1] = null;
+        if (finished)
         {
             ctx?.Dispose();
             surface?.Dispose();

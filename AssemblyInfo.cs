@@ -3,7 +3,7 @@ using Vintagestory.API.Common;
 [assembly: ModInfo(
     "Komet",
     "komet",
-    Version = "1.2.0-pre.4",
+    Version = "1.2.0",
     Side = "Universal",
     RequiredOnClient = false,
     RequiredOnServer = false,

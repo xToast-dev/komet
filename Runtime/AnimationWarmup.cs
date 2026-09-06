@@ -49,6 +49,12 @@ public static class AnimationWarmup
 
     /// <summary>Shapes warmed, animations generated, worker milliseconds, since start.</summary>
     public static long StatShapes, StatAnimations, StatSkippedInUse, StatWaits;
+
+    /// <summary>Animations whose frames could not be generated - malformed shape data the
+    /// engine's lazy path would only ever have found if that animation was played. Reported
+    /// rather than swallowed: a warm-up that quietly skips half a creature is a warm-up nobody
+    /// can tell from a working one.</summary>
+    public static long StatBroken;
     public static double StatWorkerMs, StatWorstMs, StatWaitMs;
     public static string StatWorstShape;
 
@@ -104,12 +110,34 @@ public static class AnimationWarmup
         var name = type.Client.ShapeForEntity?.Base?.ToString() ?? type.Code?.ToString() ?? "?";
         var disable = DisableElements(type);
         var require = RequireJoints(type);
-        ThreadPool.QueueUserWorkItem(_ => Run(shape, name, disable, require, logger, ev));
+        // Komet's own pool rather than the shared ThreadPool: the game queues chunk work on
+        // that one, and a prewarm holds a thread for hundreds of milliseconds per shape. Here
+        // it sits in the Idle queue, so it only ever runs on a worker with nothing else to do.
+        JobScheduler.Submit(JobKind.Warmup, long.MinValue,
+            () => Run(shape, name, disable, require, logger, ev));
         return true;
     }
 
     /// <summary>The worker body, also the harness's entry: the engine's cache-miss sequence.</summary>
     internal static int Warm(Shape shape, string name, string[] disableElements, string[] requireJoints, ILogger logger)
+        => Warm(shape, name, disableElements, requireJoints, logger, out _, out _);
+
+    /// <summary>
+    /// The engine's cache-miss sequence, with the count of animations it could not generate.
+    ///
+    /// One animation failing must not cost the shape its warm-up, and that is not a hypothetical:
+    /// a field log from 1.22.5 shows game:locust-corrupt-sawblade throwing on 'idlesaw'
+    /// ("QuantityFrames set to 7 but a key frame at frame 7"), which used to abandon the loop and
+    /// leave every LATER animation of that creature to the lazy main-thread path - exactly the
+    /// hitch this feature exists to remove, now paid in full because of one bad entry.
+    ///
+    /// It matters that this warm-up does MORE than the engine does: the engine generates an
+    /// animation's frames when that animation first plays, so malformed data on an animation
+    /// nothing ever starts is data the engine never touches. Generating everything up front
+    /// finds it. That is a reason to skip the entry and carry on, not to stop.
+    /// </summary>
+    internal static int Warm(Shape shape, string name, string[] disableElements, string[] requireJoints,
+                             ILogger logger, out int broken, out string firstFailure)
     {
         // AnimationCache.InitManager runs the three-argument InitForAnimations, then a cache
         // miss runs AnimationManager.LoadAnimator's four-argument one - in that order, and
@@ -117,12 +145,25 @@ public static class AnimationWarmup
         shape.InitForAnimations(logger, name, requireJoints);
         shape.InitForAnimations(logger, name, disableElements, requireJoints);
         var generated = 0;
+        broken = 0;
+        firstFailure = null;
         foreach (var animation in shape.Animations)
         {
             if (animation == null || animation.PrevNextKeyFrameByFrame != null) continue;
             if (animation.KeyFrames == null || animation.KeyFrames.Length == 0) continue;
-            animation.GenerateAllFrames(shape.Elements, shape.JointsById);
-            generated++;
+            try
+            {
+                animation.GenerateAllFrames(shape.Elements, shape.JointsById);
+                generated++;
+            }
+            catch (Exception e)
+            {
+                // Left exactly as the engine would find it, so its own lazy path still throws
+                // its own exception in its own place if this animation is ever played.
+                animation.PrevNextKeyFrameByFrame = null;
+                broken++;
+                firstFailure ??= (animation.Code ?? "?") + ": " + e.GetType().Name + ": " + e.Message;
+            }
         }
         return generated;
     }
@@ -132,19 +173,28 @@ public static class AnimationWarmup
         var t0 = Stopwatch.GetTimestamp();
         try
         {
-            var generated = Warm(shape, name, disable, require, logger);
+            var generated = Warm(shape, name, disable, require, logger, out var broken, out var firstFailure);
             var ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
             lock (gate)
             {
                 StatShapes++;
                 StatAnimations += generated;
+                StatBroken += broken;
                 StatWorkerMs += ms;
                 if (ms > StatWorstMs) { StatWorstMs = ms; StatWorstShape = name; }
             }
+
+            // Once per shape, not once per animation: a creature with three malformed entries
+            // is one line, and the count says how much of the shape did warm up.
+            if (broken > 0)
+                Log?.Invoke("animation warm-up for " + name + ": " + generated + " animations generated, "
+                          + broken + " could not be (first " + firstFailure
+                          + ") - the engine hits the same data lazily if one of them ever plays");
         }
         catch (Exception e)
         {
-            // the engine's lazy path will do it on the main thread, as before
+            // InitForAnimations itself failed, so there is no per-animation loop to salvage:
+            // the engine's lazy path will do the whole shape on the main thread, as before.
             Log?.Invoke("animation warm-up for " + name + " failed (" + e.GetType().Name + ": " + e.Message + ") - the engine generates the frames lazily");
         }
         finally
@@ -231,7 +281,7 @@ public static class AnimationWarmup
     {
         lock (gate)
         {
-            StatShapes = StatAnimations = StatSkippedInUse = StatWaits = 0;
+            StatShapes = StatAnimations = StatSkippedInUse = StatWaits = StatBroken = 0;
             StatWorkerMs = StatWorstMs = StatWaitMs = 0;
             StatWorstShape = null;
         }

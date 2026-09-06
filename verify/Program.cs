@@ -12,6 +12,7 @@ using Komet.Patches;
 using Komet.Runtime;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
+using Vintagestory.API.Config;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 
@@ -25,6 +26,57 @@ internal static class Program
 
     /// <summary>Stands in for the Optimum fork's marker type: a constant named Version is all the detector reads.</summary>
     private static class FakeOptimumInfo { public const string Version = "9.9.9"; }
+
+    /// <summary>A Mod the loader never made: the window's report page reads Mod.Info.Version,
+    /// and Mod is abstract with everything on it settable only from inside the engine.</summary>
+    private sealed class TestMod : Mod { }
+
+    /// <summary>The six planes CalcFrustumEquations extracts from ortho(w, h, l) x lightView.</summary>
+    static Plane[] OrthoPlanes(double[] lightView, double w, double h, double l)
+    {
+        var p = Mat4d.Create();
+        Mat4d.Identity(p);
+        p[0] = 2.0 / w; p[5] = 2.0 / h; p[10] = -2.0 / l; p[15] = 1.0;
+        var m = Mat4d.Create();
+        Mat4d.Multiply(m, p, lightView);
+        var planes = new Plane[6];
+        planes[2] = new Plane(m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]);
+        planes[1] = new Plane(m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]);
+        planes[4] = new Plane(m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]);
+        planes[3] = new Plane(m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]);
+        planes[5] = new Plane(m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]);
+        planes[0] = new Plane(m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]);
+        return planes;
+    }
+
+    static bool Inside(Plane[] planes, double x, double y, double z)
+    {
+        for (var i = 0; i < 6; i++)
+            if (planes[i].distanceOfPoint(x, y, z) < 0) return false;
+        return true;
+    }
+
+
+    /// <summary>
+    /// A screen of a stated size, standing in for the engine's ElementWindowBounds - which reads
+    /// the real window straight off ScreenManager.Platform. Dialog bounds are laid out against
+    /// it in window PIXELS (the fixed values inside are scaled by the GUI scale), so this is all
+    /// a dialog needs to be laid out on a machine with no window at all.
+    /// </summary>
+    private sealed class FakeScreen : ElementBounds
+    {
+        private readonly int w, h;
+        public FakeScreen(int w, int h) { this.w = w; this.h = h; IsWindowBounds = true; Initialized = true; }
+        public override double relX => 0; public override double relY => 0;
+        public override double absX => 0; public override double absY => 0;
+        public override double renderX => 0; public override double renderY => 0;
+        public override double drawX => 0; public override double drawY => 0;
+        public override double OuterWidth => w; public override double OuterHeight => h;
+        public override double InnerWidth => w; public override double InnerHeight => h;
+        public override int OuterWidthInt => w; public override int OuterHeightInt => h;
+        public override bool RequiresRecalculation => false;
+        public override void CalcWorldBounds() { }
+    }
 
     /// <summary>An ILogger that swallows everything, for engine code that insists on one.</summary>
     public class NoopLogger : System.Reflection.DispatchProxy
@@ -1386,7 +1438,7 @@ internal static class Program
             ServerAllocPatches.AllocPrefix(out long s0);
             var junk = new byte[256 * 1024];
             ServerAllocPatches.AllocPostfix(s0, tick);
-            ServerAllocPatches.Entry tickEntry = null, db = null, helper = null;
+            Komet.Measure.AllocLedger.Entry tickEntry = null, db = null, helper = null;
             foreach (var e in ServerAllocPatches.Entries) if (e.Name == "tick") tickEntry = e;
             if (tickEntry == null || !tickEntry.IsThread) throw new Exception("no thread-level 'tick' entry");
             if (tickEntry.Bytes < junk.Length || tickEntry.Calls != 1) throw new Exception($"tick booked {tickEntry.Bytes} bytes / {tickEntry.Calls} calls");
@@ -1704,92 +1756,168 @@ internal static class Program
                 throw new Exception("workstation gc was told to leave server gc");
         });
 
-        Check("the cull threads run every slice exactly once, batch after batch", () =>
+        Check("the worker pool runs every slice exactly once, batch after batch", () =>
         {
             // The primitive underneath the parallel sweep. A dropped slice is invisible
             // geometry, a doubled one is a doubled draw range - neither shows up as a crash,
             // and both would be blamed on the culling maths for weeks.
-            var set = new WorkerSet("verify-workers");
-            set.Start(4);
+            JobScheduler.StopForTest();
+            JobScheduler.Start(4, 0);
             try
             {
-                if (set.ThreadCount != 4) throw new Exception($"{set.ThreadCount} threads, wanted 4");
+                if (JobScheduler.WorkerCount != 4)
+                    throw new Exception($"{JobScheduler.WorkerCount} workers, wanted 4");
 
                 foreach (int n in new[] { 1, 7, 64, 1000, 4097 })
                     foreach (int chunk in new[] { 1, 3, 64 })
                     {
                         var hits = new int[n];
                         var body = new CountingBody { Hits = hits };
-                        set.Run(body, n, chunk);
+                        JobScheduler.RunBatch(body, n, chunk, JobKind.Cull);
                         for (int i = 0; i < n; i++)
                             if (hits[i] != 1)
                                 throw new Exception($"n={n} chunk={chunk}: index {i} ran {hits[i]} times");
                     }
 
-                // Repeated batches must not leak state from the previous one: the gate/pending
+                // Repeated batches must not leak state from the previous one: the ticket
                 // handshake is the part that would deadlock or fire early if it did.
                 for (int round = 0; round < 200; round++)
                 {
                     var hits = new int[257];
-                    set.Run(new CountingBody { Hits = hits }, 257, 8);
+                    JobScheduler.RunBatch(new CountingBody { Hits = hits }, 257, 8, JobKind.Cull);
                     for (int i = 0; i < 257; i++)
                         if (hits[i] != 1) throw new Exception($"round {round}: index {i} ran {hits[i]} times");
+                }
+
+                // Two kinds interleaved: the pool is shared, so a Background batch must not
+                // corrupt or delay a Critical one, and both must still run every slice once.
+                for (int round = 0; round < 50; round++)
+                {
+                    var a = new int[300];
+                    var b = new int[300];
+                    JobScheduler.RunBatch(new CountingBody { Hits = a }, 300, 8, JobKind.Occlusion);
+                    JobScheduler.RunBatch(new CountingBody { Hits = b }, 300, 8, JobKind.Cull);
+                    for (int i = 0; i < 300; i++)
+                        if (a[i] != 1 || b[i] != 1)
+                            throw new Exception($"mixed round {round}: {a[i]}/{b[i]} at {i}");
                 }
 
                 // A throwing work item has to surface on the caller and, above all, must not
                 // leave the caller waiting on a countdown that never reaches zero.
                 bool threw = false;
-                try { set.Run(new ThrowingBody(), 400, 8); }
+                try { JobScheduler.RunBatch(new ThrowingBody(), 400, 8, JobKind.Cull); }
                 catch (InvalidOperationException) { threw = true; }
                 if (!threw) throw new Exception("a failing work item was swallowed");
 
-                // ...and the set still works afterwards
+                // ...and the pool still works afterwards
                 var after = new int[100];
-                set.Run(new CountingBody { Hits = after }, 100, 8);
+                JobScheduler.RunBatch(new CountingBody { Hits = after }, 100, 8, JobKind.Cull);
                 for (int i = 0; i < 100; i++)
-                    if (after[i] != 1) throw new Exception("the set did not recover from a failed batch");
+                    if (after[i] != 1) throw new Exception("the pool did not recover from a failed batch");
             }
-            finally { set.Stop(); }
+            finally { JobScheduler.StopForTest(); }
         });
 
-        Check("a helper that has not woken up cannot stall the caller - the batch runs inline", () =>
+        Check("standalone jobs run once, dedup by key, and cancel by kind", () =>
+        {
+            JobScheduler.StopForTest();
+            JobScheduler.Start(3, 0);
+            try
+            {
+                // Every job runs exactly once and the pool reports it.
+                int ran = 0;
+                var done = new System.Threading.CountdownEvent(200);
+                for (int i = 0; i < 200; i++)
+                    if (!JobScheduler.Submit(JobKind.ChunkPrep, i, _ => { System.Threading.Interlocked.Increment(ref ran); done.Signal(); }))
+                        throw new Exception("a fresh key was refused");
+                if (!done.Wait(10000)) throw new Exception($"only {ran} of 200 jobs ran");
+                if (ran != 200) throw new Exception($"{ran} of 200 jobs ran");
+
+                // A key already queued or running is refused rather than doubling the work -
+                // the property that replaced the prefetcher's hand-written "already seen" set.
+                var block = new System.Threading.ManualResetEventSlim(false);
+                var entered = new System.Threading.ManualResetEventSlim(false);
+                if (!JobScheduler.Submit(JobKind.ChunkPrep, 999L, _ => { entered.Set(); block.Wait(5000); }))
+                    throw new Exception("the blocking job was refused");
+                if (!entered.Wait(5000)) throw new Exception("the blocking job never started");
+                long dupBefore = JobScheduler.StatDuplicates;
+                if (JobScheduler.Submit(JobKind.ChunkPrep, 999L, _ => { }))
+                    throw new Exception("a duplicate key was accepted while its job was running");
+                if (JobScheduler.StatDuplicates != dupBefore + 1)
+                    throw new Exception("the duplicate was not counted");
+                if (!JobScheduler.IsQueued(JobKind.ChunkPrep, 999L))
+                    throw new Exception("a running key does not report as in flight");
+                block.Set();
+                // ...and once it has finished, the same key is accepted again
+                var again = new System.Threading.ManualResetEventSlim(false);
+                var deadline = System.Diagnostics.Stopwatch.StartNew();
+                while (!JobScheduler.Submit(JobKind.ChunkPrep, 999L, _ => again.Set())
+                       && deadline.ElapsedMilliseconds < 5000)
+                    System.Threading.Thread.Sleep(1);
+                if (!again.Wait(5000)) throw new Exception("the key was never released");
+
+                // Cancellation: queued work of that kind is dropped, not run. The job is held
+                // behind a blocker so the queue is guaranteed to still hold the rest.
+                var hold = new System.Threading.ManualResetEventSlim(false);
+                int cancelled = 0;
+                for (int i = 0; i < 3; i++) JobScheduler.Submit(JobKind.Warmup, 5000 + i, _ => hold.Wait(5000));
+                for (int i = 0; i < 50; i++)
+                    JobScheduler.Submit(JobKind.Warmup, 6000 + i, _ => System.Threading.Interlocked.Increment(ref cancelled));
+                JobScheduler.CancelKind(JobKind.Warmup);
+                hold.Set();
+                System.Threading.Thread.Sleep(200);
+                if (cancelled > 3)
+                    throw new Exception($"{cancelled} cancelled jobs ran anyway");
+            }
+            finally { JobScheduler.StopForTest(); }
+        });
+
+        Check("a ticket holder that has not woken up cannot stall the caller - the batch runs inline", () =>
         {
             // The 01.09. report's smoking gun: sweep hitches whose 9,7-11 ms were pure
             // "warten auf threads" with no GC pause. The old design waited for every helper
             // to wake and check in, even when no work was left for it; on a machine where
             // occlusion, worldgen and GC threads fight over six cores, the last helper's
             // wake-up can take that long. Completion is now counted in work, and a batch that
-            // finds a helper still unaccounted for runs inline instead of waiting.
-            var set = new WorkerSet("verify-contended");
-            set.Start(2);
+            // finds a ticket holder still unaccounted for runs inline instead of waiting.
+            JobScheduler.StopForTest();
+            JobScheduler.Start(2, 0);
             try
             {
                 var first = new int[64];
-                set.Run(new CountingBody { Hits = first }, 64, 4);
+                JobScheduler.RunBatch(new CountingBody { Hits = first }, 64, 4, JobKind.Cull);
                 for (int i = 0; i < 64; i++)
                     if (first[i] != 1) throw new Exception("warm-up batch broken");
 
-                // simulate the sleeper: one helper allegedly still inside the previous batch
-                var pendingRef = AccessTools.FieldRefAccess<WorkerSet, int>("pending");
-                pendingRef(set) = 1;
-                long contendedBefore = set.StatContendedInline;
+                // simulate the sleeper: one ticket holder allegedly still inside the previous
+                // batch. The batch object is this thread's, so its field is reachable here.
+                var batchField = typeof(JobScheduler).GetField("localBatch",
+                    BindingFlags.NonPublic | BindingFlags.Static);
+                var batch = batchField?.GetValue(null)
+                            ?? throw new Exception("the per-caller batch is no longer where the test looks");
+                var outstanding = batch.GetType().GetField("Outstanding",
+                    BindingFlags.Public | BindingFlags.Instance)
+                    ?? throw new Exception("Batch.Outstanding is gone");
+                outstanding.SetValue(batch, 1);
+
+                long contendedBefore = JobScheduler.StatContendedInline;
                 var second = new int[64];
-                set.Run(new CountingBody { Hits = second }, 64, 4);
-                if (set.StatContendedInline != contendedBefore + 1)
+                JobScheduler.RunBatch(new CountingBody { Hits = second }, 64, 4, JobKind.Cull);
+                if (JobScheduler.StatContendedInline != contendedBefore + 1)
                     throw new Exception("the contended batch did not take the inline path");
                 for (int i = 0; i < 64; i++)
                     if (second[i] != 1) throw new Exception($"inline fallback dropped index {i}");
 
                 // sleeper woke up (checked in) - the parallel path resumes
-                pendingRef(set) = 0;
+                outstanding.SetValue(batch, 0);
                 var third = new int[64];
-                set.Run(new CountingBody { Hits = third }, 64, 4);
-                if (set.StatContendedInline != contendedBefore + 1)
+                JobScheduler.RunBatch(new CountingBody { Hits = third }, 64, 4, JobKind.Cull);
+                if (JobScheduler.StatContendedInline != contendedBefore + 1)
                     throw new Exception("a clean batch was treated as contended");
                 for (int i = 0; i < 64; i++)
-                    if (third[i] != 1) throw new Exception("the set did not recover after the sleeper checked in");
+                    if (third[i] != 1) throw new Exception("the pool did not recover after the sleeper checked in");
             }
-            finally { set.Stop(); }
+            finally { JobScheduler.StopForTest(); }
         });
 
         Check("deprioritised workers really are deprioritised by the OS, not just asked to be", () =>
@@ -1800,27 +1928,26 @@ internal static class Program
             // against /proc, which is the only place that knows.
             if (!OperatingSystem.IsLinux()) return;
 
-            var set = new WorkerSet("verify-nice", niceness: 5);
-            set.Start(2);
+            JobScheduler.StopForTest();
+            JobScheduler.Start(2, niceness: 5);
             try
             {
                 var seen = new int[64];
-                set.Run(new CountingBody { Hits = seen }, 64, 4);
-                // A Run no longer guarantees the workers have even woken up - completion is
+                JobScheduler.RunBatch(new CountingBody { Hits = seen }, 64, 4, JobKind.Occlusion);
+                // A batch no longer guarantees the workers have even woken up - completion is
                 // counted in work, and the caller can finish a batch alone before the OS
-                // schedules the helpers. Their start-up (which is where setpriority runs) is
-                // waited for explicitly instead.
+                // schedules them. Their start-up (which is where setpriority runs) is waited
+                // for explicitly instead.
                 var startup = System.Diagnostics.Stopwatch.StartNew();
-                while (!set.PriorityLowered && startup.ElapsedMilliseconds < 2000)
+                while (!JobScheduler.PriorityLowered && startup.ElapsedMilliseconds < 2000)
                     System.Threading.Thread.Sleep(5);
-                if (!set.PriorityLowered)
+                if (!JobScheduler.PriorityLowered)
                     throw new Exception("setpriority did not report success");
 
                 // /proc/self/stat is the thread group leader - the main thread - which is the
-                // baseline the workers have to be below. CurrentManagedThreadId is a managed id
-                // and has nothing to do with the OS tid the task directories are named after.
-                // Polled like PriorityLowered above: the second worker may still be on its way
-                // to its own setpriority call when the first one already reported success.
+                // baseline the nice workers have to be below. Only the tail of the pool carries
+                // niceness: nice is a one-way door, so a worker that has it can no longer be
+                // trusted with the frame's deadline and declines those queues.
                 int mainNice = NiceOf("/proc/self");
                 int lowered = 0, total = 0;
                 while (startup.ElapsedMilliseconds < 2000)
@@ -1828,28 +1955,246 @@ internal static class Program
                     lowered = 0; total = 0;
                     foreach (string dir in System.IO.Directory.GetDirectories("/proc/self/task"))
                     {
-                        if (System.IO.File.ReadAllText(dir + "/comm").Trim() is not "verify-nice-0" and not "verify-nice-1")
+                        if (!System.IO.File.ReadAllText(dir + "/comm").Trim().StartsWith("komet-worker-", StringComparison.Ordinal))
                             continue;
                         total++;
                         if (NiceOf(dir) > mainNice) lowered++;
                     }
-                    if (total == 2 && lowered == total) break;
+                    if (total == 2 && lowered == 1) break;
                     System.Threading.Thread.Sleep(5);
                 }
                 if (total == 0) throw new Exception("the worker threads were not found in /proc");
-                if (lowered != total)
-                    throw new Exception($"{total - lowered} of {total} workers kept the main thread's priority");
+                if (lowered < 1)
+                    throw new Exception($"none of {total} workers was deprioritised by the OS");
+                if (lowered == total)
+                    throw new Exception("every worker went nice - nothing is left to answer a Critical job");
             }
-            finally { set.Stop(); }
+            finally { JobScheduler.StopForTest(); }
         });
 
-        Check("with no threads started the work still runs, inline", () =>
+        Check("with no pool the batch still runs, inline", () =>
         {
-            var set = new WorkerSet("verify-empty");
+            JobScheduler.StopForTest();
             var hits = new int[500];
-            set.Run(new CountingBody { Hits = hits }, 500, 8);
+            JobScheduler.RunBatch(new CountingBody { Hits = hits }, 500, 8, JobKind.Cull);
             for (int i = 0; i < 500; i++)
                 if (hits[i] != 1) throw new Exception($"index {i} ran {hits[i]} times inline");
+            // ...and a standalone job is refused rather than silently dropped, so a caller that
+            // needs the work done knows to do it itself (the HUD raster's fallback path).
+            if (JobScheduler.Submit(JobKind.Hud, long.MinValue, () => { }))
+                throw new Exception("a job was accepted with no pool to run it");
+        });
+
+        Check("the pool's scheduling rules: priority order, anti-starvation, adaptive size", () =>
+        {
+            // Strict priority alone lets the bottom of the pool wait behind a sweep that fires
+            // three times a frame, so every Nth take starts at the bottom instead. The bound
+            // this gives is the whole reason the animation prewarm can share a pool with the
+            // frame's own work.
+            int bottomStarts = 0;
+            for (int i = 1; i <= 320; i++) if (JobScheduler.StartsAtBottom(i)) bottomStarts++;
+            if (bottomStarts != 320 / JobScheduler.AntiStarvationEvery)
+                throw new Exception($"{bottomStarts} bottom-first takes in 320");
+            if (JobScheduler.StartsAtBottom(1) || JobScheduler.StartsAtBottom(JobScheduler.AntiStarvationEvery - 1))
+                throw new Exception("the common take no longer starts at the top");
+
+            // The queue a workload lands in is fixed, so a workload cannot promote itself past
+            // the frame's own work. The sweep is the only Critical one; the prewarm the only Idle.
+            if (JobScheduler.PriorityOf(JobKind.Cull) != JobPriority.Critical)
+                throw new Exception("the sweep is no longer critical");
+            if (JobScheduler.PriorityOf(JobKind.MeshPrep) >= JobScheduler.PriorityOf(JobKind.ChunkPrep))
+                throw new Exception("the window prebuild must outrank the neighbour unpack");
+            if (JobScheduler.PriorityOf(JobKind.Occlusion) <= JobScheduler.PriorityOf(JobKind.ChunkPrep))
+                throw new Exception("the occlusion walk must run behind the loading work");
+            if (JobScheduler.PriorityOf(JobKind.Warmup) != JobPriority.Idle)
+                throw new Exception("the prewarm must be idle-only");
+
+            // Pool sizing: physical cores minus the render and tesselation threads, floor 1,
+            // cap 8. A laptop keeps a worker; a 32-core machine does not get 30.
+            if (JobScheduler.AutoWorkers(1) != 1 || JobScheduler.AutoWorkers(2) != 1)
+                throw new Exception("the smallest machines must still keep one worker");
+            if (JobScheduler.AutoWorkers(6) != 4) throw new Exception("six-core budget");
+            if (JobScheduler.AutoWorkers(32) != 8) throw new Exception("cap");
+
+            // The adaptive rule. A frame well past the average while the pool is busy gives a
+            // core back; a deep tesselation backlog takes it again, because then the pool's
+            // jobs are on the critical path of what the player is waiting for.
+            if (JobScheduler.TargetWorkers(4, 10, 0.9, 8.0, 8.0, 0) != 4)
+                throw new Exception("a healthy frame must keep the pool");
+            if (JobScheduler.TargetWorkers(4, 10, 0.9, 20.0, 8.0, 0) != 3)
+                throw new Exception("a frame at 2,5x the average must give a core back");
+            if (JobScheduler.TargetWorkers(4, 10, 0.9, 20.0, 8.0, 4000) != 4)
+                throw new Exception("a deep loading backlog outranks frame pressure");
+            if (JobScheduler.TargetWorkers(4, 0, 0.0, 8.0, 8.0, 0) != 3)
+                throw new Exception("an idle pool must not hold every worker awake");
+            if (JobScheduler.TargetWorkers(1, 99, 1.0, 99.0, 8.0, 0) != 1)
+                throw new Exception("a one-worker pool must never go to zero");
+            for (int pending = 0; pending < 40; pending += 7)
+                foreach (var f in new[] { 4.0, 9.0, 40.0 })
+                {
+                    int t = JobScheduler.TargetWorkers(6, pending, 0.7, f, 9.0, pending * 100);
+                    if (t < 1 || t > 6) throw new Exception($"target {t} out of range");
+                }
+        });
+
+        Check("work handed back to the main thread runs there, under a budget, in order", () =>
+        {
+            // Anything that needs the GL context or a non-thread-safe engine API goes through
+            // the handoff instead of being done on the worker. The budget is what keeps a burst
+            // of them from turning into the frame spike the pool exists to avoid.
+            JobScheduler.StopForTest();
+            var order = new List<int>();
+            for (int i = 0; i < 5; i++) { int n = i; JobScheduler.PostToMain(() => order.Add(n)); }
+            if (JobScheduler.HandoffDepth != 5) throw new Exception("the queue did not take them");
+            int ran = JobScheduler.DrainMain(50);
+            if (ran != 5 || order.Count != 5) throw new Exception($"{ran} of 5 handoffs ran");
+            for (int i = 0; i < 5; i++)
+                if (order[i] != i) throw new Exception("handoffs ran out of order");
+
+            // A zero budget still makes progress - one per frame beats a queue that never
+            // drains - and the remainder stays queued rather than being dropped.
+            for (int i = 0; i < 4; i++) JobScheduler.PostToMain(() => { });
+            int first = JobScheduler.DrainMain(0);
+            if (first != 1) throw new Exception($"a zero budget ran {first} handoffs, wanted exactly 1");
+            if (JobScheduler.HandoffDepth != 3) throw new Exception("the remainder was lost");
+            JobScheduler.DrainMain(50);
+            if (JobScheduler.HandoffDepth != 0) throw new Exception("the queue did not drain");
+
+            // A throwing handoff must not take the drain with it, or one bad continuation
+            // freezes every later one behind it forever.
+            JobScheduler.PostToMain(() => throw new InvalidOperationException("boom"));
+            bool after = false;
+            JobScheduler.PostToMain(() => after = true);
+            JobScheduler.DrainMain(50);
+            if (!after) throw new Exception("a throwing handoff stopped the drain");
+        });
+
+        Check("the pool under load: concurrent batches, submits, cancellation and resizing", () =>
+        {
+            // The shapes the game actually produces at once, which is where a scheduler breaks:
+            // the render thread firing a Critical batch three times a frame, the occlusion
+            // caller firing a Background one, the tesselation thread submitting window and
+            // unpack jobs, a world leaving underneath them, and the adaptive sizing moving the
+            // worker count while all of it is in flight. Every batch still has to run every
+            // slice exactly once - a dropped slice is invisible geometry, a doubled one a
+            // doubled draw range, and neither shows up as a crash.
+            JobScheduler.StopForTest();
+            JobScheduler.Start(4, 0);
+            var stop = false;
+            var errors = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            long batchesRun = 0, jobsRun = 0;
+
+            void BatchLoop(JobKind kind, int n, int chunk)
+            {
+                var rnd = new Random(kind.GetHashCode());
+                while (!System.Threading.Volatile.Read(ref stop))
+                {
+                    var count = 1 + rnd.Next(n);
+                    var hits = new int[count];
+                    try { JobScheduler.RunBatch(new CountingBody { Hits = hits }, count, chunk, kind); }
+                    catch (Exception e) { errors.Enqueue(kind + " batch threw: " + e.Message); return; }
+                    for (int i = 0; i < count; i++)
+                        if (hits[i] != 1)
+                        {
+                            errors.Enqueue($"{kind}: index {i} of {count} ran {hits[i]} times");
+                            return;
+                        }
+                    System.Threading.Interlocked.Increment(ref batchesRun);
+                }
+            }
+
+            var threads = new List<System.Threading.Thread>
+            {
+                new(() => BatchLoop(JobKind.Cull, 4000, 64)) { IsBackground = true, Name = "verify-render" },
+                new(() => BatchLoop(JobKind.Occlusion, 9000, 64)) { IsBackground = true, Name = "verify-occl" },
+                // the tesselation thread's two workloads, keyed like the real ones
+                new(() =>
+                {
+                    long key = 0;
+                    while (!System.Threading.Volatile.Read(ref stop))
+                    {
+                        JobScheduler.Submit(JobKind.MeshPrep, key % 64,
+                            _ => System.Threading.Interlocked.Increment(ref jobsRun));
+                        JobScheduler.Submit(JobKind.ChunkPrep, key % 512,
+                            _ => System.Threading.Interlocked.Increment(ref jobsRun));
+                        key++;
+                        if ((key & 1023) == 0) System.Threading.Thread.Sleep(1);
+                    }
+                }) { IsBackground = true, Name = "verify-tess" },
+                // worlds coming and going under all of it, plus the adaptive resize
+                new(() =>
+                {
+                    var rnd = new Random(7);
+                    while (!System.Threading.Volatile.Read(ref stop))
+                    {
+                        JobScheduler.CancelKind(JobKind.MeshPrep);
+                        JobScheduler.CancelKind(JobKind.ChunkPrep);
+                        // The batch kinds too: a fork/join caller is blocked on its slices and
+                        // must get every one of them run even while its kind is being cancelled
+                        // out from under it. Counter-checked by making a ticket honour the
+                        // cancellation - the batch loops then report slices that never ran.
+                        JobScheduler.CancelKind(JobKind.Cull);
+                        JobScheduler.CancelKind(JobKind.Occlusion);
+                        JobScheduler.Sample(rnd.Next(2) == 0 ? 40.0 : 8.0, 9.0, rnd.Next(0, 4000));
+                        JobScheduler.DrainMain(1);
+                        System.Threading.Thread.Sleep(2);
+                    }
+                }) { IsBackground = true, Name = "verify-world" },
+            };
+
+            try
+            {
+                foreach (var t in threads) t.Start();
+                System.Threading.Thread.Sleep(3000);
+                System.Threading.Volatile.Write(ref stop, true);
+                foreach (var t in threads)
+                    if (!t.Join(10000))
+                        throw new Exception(t.Name + " did not finish - the pool deadlocked");
+
+                while (errors.TryDequeue(out var e)) throw new Exception(e);
+                if (batchesRun < 50) throw new Exception($"only {batchesRun} batches in three seconds");
+                if (jobsRun < 50) throw new Exception($"only {jobsRun} standalone jobs ran");
+                // A cancel storm must not leave keys stranded in flight, or the workloads they
+                // belong to would be refused for the rest of the session.
+                System.Threading.Thread.Sleep(200);
+                for (long k = 0; k < 64; k++)
+                    if (JobScheduler.IsQueued(JobKind.MeshPrep, k))
+                        throw new Exception($"key {k} is still in flight after everything drained");
+            }
+            finally
+            {
+                System.Threading.Volatile.Write(ref stop, true);
+                JobScheduler.StopForTest();
+            }
+        });
+
+        Check("the pool survives being stopped and restarted, and drops its work when it is", () =>
+        {
+            // Mod reload and the stress test both take the pool down and bring it back. A
+            // worker left running against the old arrays, or a Start that silently did nothing
+            // because a stale shutdown flag was still set, would be a pool that quietly stops
+            // doing anything at all.
+            for (int round = 0; round < 5; round++)
+            {
+                JobScheduler.StopForTest();
+                JobScheduler.Start(2 + round % 3, 0);
+                if (JobScheduler.WorkerCount != 2 + round % 3)
+                    throw new Exception($"round {round}: {JobScheduler.WorkerCount} workers after restart");
+
+                var hits = new int[512];
+                JobScheduler.RunBatch(new CountingBody { Hits = hits }, 512, 16, JobKind.Cull);
+                for (int i = 0; i < 512; i++)
+                    if (hits[i] != 1) throw new Exception($"round {round}: index {i} ran {hits[i]} times");
+
+                var done = new System.Threading.CountdownEvent(32);
+                for (int i = 0; i < 32; i++) JobScheduler.Submit(JobKind.ChunkPrep, i, _ => done.Signal());
+                if (!done.Wait(5000)) throw new Exception($"round {round}: jobs did not run after a restart");
+            }
+            JobScheduler.StopForTest();
+            // Stopped means stopped: nothing queued, nothing accepted, no counters left standing.
+            if (JobScheduler.PendingJobs != 0) throw new Exception("a stopped pool still reports queued jobs");
+            if (JobScheduler.QueuedOf(JobKind.Cull) != 0) throw new Exception("a per-kind queue count survived the stop");
+            if (JobScheduler.WorkerCount != 0) throw new Exception("workers survived the stop");
         });
 
         Check("patched MeshDataPool.FrustumCull routes through FastCuller", () =>
@@ -2480,6 +2825,65 @@ internal static class Program
             FastCuller.ForgetAllPools();
         });
 
+        Check("a pool spread over many grid cells culls exactly like vanilla", () =>
+        {
+            // The kernel check below uses pools of at most 200 parts, which build a handful of
+            // grid cells; the equivalence bench uses 1200 over a 20-chunk radius and builds
+            // dozens. That gap shipped a real one: when the bucket stride widened from the
+            // engine's four LOD levels to eight (the far mesh brought its own), the cell-box
+            // finaliser kept indexing with the old stride, decided most cells were empty, and
+            // left them holding their sentinel box - whole cells of terrain stopped drawing.
+            // Every gating check passed; only the bench, which CI skips, noticed.
+            //
+            // So the grid gets its own check here, and it asserts the grid is actually there:
+            // a pool that degenerates to one cell would pass this while testing nothing.
+            bool savedParallel = FastCuller.Parallel;
+            bool savedPoolBox = FastCuller.PoolLevelCulling;
+            FastCuller.Parallel = false;
+            try
+            {
+                foreach (bool poolBox in new[] { false, true })
+                {
+                    FastCuller.PoolLevelCulling = poolBox;
+                    foreach (double yaw in new[] { 0.0, 1.1, 2.6, 4.4 })
+                    {
+                        FrustumCulling culler = WideCuller(yaw);
+                        foreach (EnumFrustumCullMode mode in new[]
+                                 {
+                                     EnumFrustumCullMode.CullNormal, EnumFrustumCullMode.CullInstant,
+                                     EnumFrustumCullMode.CullInstantShadowPassNear,
+                                     EnumFrustumCullMode.CullInstantShadowPassFar,
+                                 })
+                        {
+                            FastCuller.ForgetAllPools();
+                            MeshDataPool vanilla = WidePool(1200);
+                            MeshDataPool fast = WidePool(1200);
+
+                            FastCuller.Enabled = false;   // hands the sweep back, like safemode
+                            vanilla.FrustumCull(culler, mode);
+                            FastCuller.Enabled = true;
+                            FastCuller.Cull(fast, culler, mode);
+
+                            int cells = FastCuller.CellCountOf(fast);
+                            if (cells < 4)
+                                throw new Exception($"the pool built {cells} grid cell(s) - this check needs a real grid");
+                            string want = Runs(vanilla), got = Runs(fast);
+                            if (got != want)
+                                throw new Exception($"grid sweep differs from vanilla ({mode}, yaw={yaw}, "
+                                                  + $"poolbox={poolBox}, {cells} cells): {FirstRunDifference(want, got)}");
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                FastCuller.Enabled = true;
+                FastCuller.Parallel = savedParallel;
+                FastCuller.PoolLevelCulling = savedPoolBox;
+                FastCuller.ForgetAllPools();
+            }
+        });
+
         Check("the vector sweep kernel decides exactly like the scalar one", () =>
         {
             // The sweep has two implementations of one decision - four parts per instruction on
@@ -2756,6 +3160,10 @@ internal static class Program
             FrustumCulling culler = NewCuller();
             long incInsertsBefore = FastCuller.StatIncInserts;
             long incRemovalsBefore = FastCuller.StatIncRemovals;
+            // the far mesh's levels 4 and 5 ride along: drawn (with a distance inside the
+            // pools' spread) for the first half of the steps, not drawn for the second
+            FarMesh.Active = true;
+            FarMesh.DistanceSq = 96.0 * 96.0;
 
             var modes = new[]
             {
@@ -2777,6 +3185,7 @@ internal static class Program
             int nextIndices = 500000;
             for (int step = 0; step < 3000; step++)
             {
+                if (step == 1500) FarMesh.Active = false;
                 int action = rnd.Next(100);
                 if (action < 70 && liveLocs.Count < 480)
                 {
@@ -2788,7 +3197,7 @@ internal static class Program
                         {
                             IndicesStart = nextIndices,
                             IndicesEnd = nextIndices + 300,
-                            LodLevel = rnd.Next(0, 5),
+                            LodLevel = rnd.Next(0, 8),
                             Hide = rnd.Next(20) == 0,
                             FrustumCullSphere = Sphere.BoundingSphereForCube(
                                 rnd.Next(-8, 9) * 32, rnd.Next(3, 6) * 32, rnd.Next(-8, 9) * 32, 32)
@@ -2810,7 +3219,7 @@ internal static class Program
                     {
                         IndicesStart = nextIndices,
                         IndicesEnd = nextIndices + 300,
-                        LodLevel = rnd.Next(0, 5),
+                        LodLevel = rnd.Next(0, 8),
                         FrustumCullSphere = Sphere.BoundingSphereForCube(
                             rnd.Next(-8, 9) * 32, 128, rnd.Next(-8, 9) * 32, 32)
                     };
@@ -2861,6 +3270,8 @@ internal static class Program
             if (incRemovals < 100)
                 throw new Exception($"only {incRemovals} incremental removals in 3000 steps - the fast path is not being taken");
 
+            FarMesh.Active = false;
+            FarMesh.DistanceSq = 0;
             FastCuller.Parallel = true;
             FastCuller.ForgetAllPools();
         });
@@ -2979,7 +3390,14 @@ internal static class Program
             int savedBudget = TightClonePatches.ExtrasPoolBudgetMb;
             try
             {
+                // The budget belongs to the pool since the far LOD got pools of its own; the
+                // config knob is the one that has to reach the tight clone's four.
+                TightClonePatches.ExtrasPoolBudgetMb = 17;
+                if (TightClonePatches.Ints.BudgetMb != 17 || TightClonePatches.Shorts.BudgetMb != 17
+                    || TightClonePatches.Bytes.BudgetMb != 17 || TightClonePatches.Floats.BudgetMb != 17)
+                    throw new Exception("the config's budget does not reach the extras pools");
                 TightClonePatches.ExtrasPoolBudgetMb = 64;
+                pool.BudgetMb = 64;
                 var src = new byte[100];
                 for (int i = 0; i < src.Length; i++) src[i] = (byte)i;
 
@@ -3002,10 +3420,10 @@ internal static class Program
                 if (pool.HeldBytes != 0) throw new Exception("a tiny array was pooled");
 
                 // the budget refuses, and says so
-                TightClonePatches.ExtrasPoolBudgetMb = 0;
+                pool.BudgetMb = 0;
                 pool.Return(b);
                 if (pool.StatDropped != 1 || pool.HeldBytes != 0) throw new Exception("budget not enforced");
-                TightClonePatches.ExtrasPoolBudgetMb = 64;
+                pool.BudgetMb = 64;
 
                 // zero-count requests never touch the pool, and the empty array is never held
                 if (pool.Rent(0, src).Length != 0) throw new Exception("zero-count rent allocated");
@@ -3249,6 +3667,33 @@ internal static class Program
             Console.WriteLine("\n--- mod HUD preview (voll) ---");
             Console.WriteLine(ModHud.ComposeMods("komet · mods", false, previewFrame, true));
             ModProfiler.Clear();
+
+            // Every page of the window, as text. The window rasters exactly these lines, so
+            // this is what a layout review looks at - and it is the only way to see all
+            // nineteen of them without a world, a GPU and forty mods.
+            var previewSys = KometModSystem.ForTest(new KometConfig());
+            var previewMod = new TestMod();
+            typeof(Mod).GetProperty("Info").SetValue(previewMod, new ModInfo { Version = "1.1.0" });
+            typeof(ModSystem).GetProperty("Mod").SetValue(previewSys, previewMod);
+            var pageBuf = new System.Text.StringBuilder(8192);
+            var pageLines = new List<string>(256);
+            foreach (Komet.Gui.KometView pv in Enum.GetValues<Komet.Gui.KometView>())
+            {
+                pageBuf.Clear();
+                // As the panel lays it out, not as a terminal would: the window's width in
+                // monospace cells, and the panel's own line break over the result. A review
+                // that reads the unwrapped text reviews a page nobody sees.
+                using (DebugHud.WideText(Komet.Gui.KometDialog.NominalColumns))
+                    previewSys.ComposeView(pv, pageBuf, null);
+                pageLines.Clear();
+                foreach (var line in pageBuf.ToString().Split('\n'))
+                    Komet.Gui.TextPanel.WrapInto(pageLines, line.TrimEnd(), Komet.Gui.KometDialog.NominalColumns);
+
+                Console.WriteLine($"\n--- window: {Komet.Gui.KometDialog.TabName(pv)} "
+                                  + $"({Komet.Gui.KometDialog.NominalColumns} cells) ---");
+                foreach (var line in pageLines) Console.WriteLine(line);
+            }
+
             Console.WriteLine("--- end ---\n");
         }
 
@@ -3967,6 +4412,35 @@ internal static class Program
             int second = AnimationWarmup.Warm(shape, "chicken-rooster", null, new[] { "head" }, logger);
             if (second != 0) throw new Exception($"a second pass generated {second} animations again");
 
+            // One malformed animation costs that animation and nothing else. Reproduced the way
+            // a field log from 1.22.5 produced it - game:locust-corrupt-sawblade's 'idlesaw' has
+            // a key frame at frame QuantityFrames, which the engine rejects - because the version
+            // before this abandoned the whole loop there and left every LATER animation of that
+            // creature to the lazy main-thread path, which is the hitch this feature removes.
+            var broke = Newtonsoft.Json.JsonConvert.DeserializeObject<Vintagestory.API.Common.Shape>(
+                System.IO.File.ReadAllText(shapePath));
+            var victim = broke.Animations[0];
+            var highestFrame = 0;
+            foreach (var kf in victim.KeyFrames) highestFrame = Math.Max(highestFrame, kf.Frame);
+            victim.QuantityFrames = highestFrame;          // a key frame AT QuantityFrames: invalid
+            int ok = AnimationWarmup.Warm(broke, "chicken-rooster", null, new[] { "head" }, logger,
+                                          out int brokenCount, out string firstFailure);
+            if (brokenCount != 1) throw new Exception($"expected exactly one broken animation, got {brokenCount}");
+            if (firstFailure == null || !firstFailure.Contains(victim.Code ?? "")) throw new Exception("the failure does not name the animation: " + firstFailure);
+            if (ok != broke.Animations.Length - 1)
+                throw new Exception($"one bad animation cost {broke.Animations.Length - ok} of {broke.Animations.Length}");
+            foreach (var a in broke.Animations)
+            {
+                if (a == victim)
+                {
+                    // left exactly as the engine would find it, so its own lazy path still
+                    // throws its own exception in its own place
+                    if (a.PrevNextKeyFrameByFrame != null) throw new Exception("a failed animation must not be left half generated");
+                    continue;
+                }
+                if (a.PrevNextKeyFrameByFrame == null) throw new Exception($"animation {a.Code} was skipped along with the broken one");
+            }
+
             // the rules around it, without a worker: a shape already in use is never started,
             // the requirement arguments mirror the engine's (head, plus the attribute)
             AnimationWarmup.Reset();
@@ -4267,6 +4741,18 @@ internal static class Program
                 AccessTools.TypeByName("Vintagestory.Client.NoObf.ChunkTesselatorManager"),
                 "OnSeperateThreadGameTick"));
 
+            // Both rotations, through the same assertions. The sweep normally rotates
+            // UniqueQueue's inner Queue and takes the promoted keys out of its HashSet by
+            // hand - five to eleven times cheaper than going round through Dequeue/Enqueue,
+            // which rehashes every key that never leaves - and falls back to the public API
+            // when a game update moves those fields. Two paths mean two chances to get the
+            // set and the queue out of step, so neither ships unproven.
+            if (!EdgeRetessPriorityPatches.InnerRotationBound)
+                throw new Exception("UniqueQueue's inner queue/set are no longer where the sweep expects them");
+            foreach (var inner in new[] { true, false })
+            {
+            EdgeRetessPriorityPatches.RotateInner = inner;
+
             // the real key encoding: sign bit = edge-only, exactly as the producers set it
             static long Neg(long k) => k | long.MinValue;
             static string Render(UniqueQueue<long> q)
@@ -4358,7 +4844,23 @@ internal static class Program
                 * (1000 / EdgeRetessPriorityPatches.SweepIntervalMs) < 1200)
                 throw new Exception("promotion capacity below flood inflow");
 
+            // The set and the queue must still agree: Count reads the set, the enumerator
+            // reads the queue, and a rotation that removed from one and not the other leaves
+            // a queue that says it holds keys it cannot hand out. (Counter-checked once by
+            // dropping the set.Remove from the inner rotation: this fails, and so does the
+            // conservation fuzz above.)
+            var counted = 0;
+            foreach (var unused in dirty) counted++;
+            if (counted != dirty.Count)
+                throw new Exception($"inner={inner}: the queue holds {counted} keys but reports {dirty.Count}");
+            counted = 0;
+            foreach (var unused in prio) counted++;
+            if (counted != prio.Count)
+                throw new Exception($"inner={inner}: the priority queue holds {counted} keys but reports {prio.Count}");
+
             EdgeRetessPriorityPatches.Reset();
+            }
+            EdgeRetessPriorityPatches.RotateInner = true;
             EdgeRetessPriorityPatches.Enabled = false; // no game in this process
         });
 
@@ -5195,11 +5697,11 @@ internal static class Program
             if (System.IO.File.Exists("/sys/devices/system/cpu/cpu0/topology/core_id") && CpuTopology.Source != "sysfs")
                 throw new Exception($"sysfs is there but the probe used '{CpuTopology.Source}'");
 
-            // cull / occlusion helpers: laptop 1/0, six-core desktop 5/4, cap 8, single core 0
-            if (WorkerSet.AutoThreads(1, 2) != 1 || WorkerSet.AutoThreads(2, 2) != 0) throw new Exception("dual core budget");
-            if (WorkerSet.AutoThreads(1, 6) != 5 || WorkerSet.AutoThreads(2, 6) != 4) throw new Exception("six core budget");
-            if (WorkerSet.AutoThreads(1, 32) != 8) throw new Exception("cap");
-            if (WorkerSet.AutoThreads(1, 1) != 0) throw new Exception("single core must get no helpers");
+            // worker pool: physical cores minus the render and tesselation threads, floor 1, cap 8
+            if (JobScheduler.AutoWorkers(2) != 1) throw new Exception("dual core budget");
+            if (JobScheduler.AutoWorkers(6) != 4) throw new Exception("six core budget");
+            if (JobScheduler.AutoWorkers(32) != 8) throw new Exception("cap");
+            if (JobScheduler.AutoWorkers(1) != 1) throw new Exception("a single core still keeps one worker");
 
             // worldgen threads: the configured 6 is an upper bound, hardware threads minus two the cap
             if (KometServerModSystem.EffectiveWorldgenThreads(6, 4) != 2) throw new Exception("4-thread laptop must get 2");
@@ -5303,7 +5805,7 @@ internal static class Program
             ClientAllocPatches.ThreadPrefix(instance, out var state);
             AllocSink = new byte[256 * 1024];
             ClientAllocPatches.ThreadPostfix(state);
-            ClientAllocPatches.Entry relight = null;
+            Komet.Measure.AllocLedger.Entry relight = null;
             foreach (var e in ClientAllocPatches.Entries) if (e.Name == "relight" && e.IsThread) relight = e;
             if (relight == null || relight.Bytes < 250_000 || relight.Calls != 1)
                 throw new Exception($"relight thread booked {relight?.Bytes} bytes / {relight?.Calls} calls");
@@ -5769,7 +6271,7 @@ internal static class Program
             var stage = AccessTools.Method(typeof(Vintagestory.Client.NoObf.TerrainIlluminator), "SunRelightChunk",
                 [typeof(Vintagestory.Client.NoObf.ClientChunk), typeof(Vintagestory.Common.Database.ChunkPos)]);
             var renderFrame = AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientPlatformWindows), "window_RenderFrame");
-            var ownCode = AccessTools.Method(typeof(WorkerSet), nameof(WorkerSet.AutoThreads), [typeof(int)]);
+            var ownCode = AccessTools.Method(typeof(JobScheduler), nameof(JobScheduler.AutoWorkers));
             try
             {
                 other.Patch(stage, prefix: new HarmonyMethod(AccessTools.Method(typeof(Program), nameof(ForeignCancellingPrefix))) { priority = HarmonyLib.Priority.High });
@@ -5798,12 +6300,31 @@ internal static class Program
                 if (tr.Kind != "transpiler" || tr.Severity != PatchGuard.Severity.High || !tr.Ours.Contains("transpiler"))
                     throw new Exception("transpiler collision misdescribed: " + PatchGuard.Format(tr));
 
-                var own = Of("WorkerSet.AutoThreads");
+                var own = Of("JobScheduler.AutoWorkers");
                 if (!own.OnKometCode || own.Severity != PatchGuard.Severity.High || own.Kind != "postfix")
                     throw new Exception("patch on komet code misdescribed: " + PatchGuard.Format(own));
 
                 if (PatchGuard.Scan() != 0) throw new Exception("an unchanged registry reported new findings");
                 if (warnings.Count != 3) throw new Exception("a rescan logged again");
+
+                // The periodic path walks the same registry a couple of milliseconds at a time,
+                // because the whole scan measured 12,6 ms on the render thread. Sliced or not,
+                // it has to reach the same answer - and it must not publish a half-walked one.
+                var whole = new List<string>();
+                foreach (var f in PatchGuard.Findings) whole.Add(f.Key);
+
+                var slices = 0;
+                // a budget below the cost of a single method, so every slice stops after one
+                while (!PatchGuard.ScanSlice(0.0) && ++slices < 10000) { }
+                if (slices < 2) throw new Exception("the sliced scan finished in one go - it is not slicing");
+
+                var sliced = new List<string>();
+                foreach (var f in PatchGuard.Findings) sliced.Add(f.Key);
+                whole.Sort(StringComparer.Ordinal);
+                sliced.Sort(StringComparer.Ordinal);
+                if (whole.Count != sliced.Count || string.Join("|", whole) != string.Join("|", sliced))
+                    throw new Exception($"the sliced scan found {sliced.Count} of {whole.Count} collisions");
+                if (warnings.Count != 3) throw new Exception("the sliced scan logged the same findings again");
                 var report = PatchGuard.ReportLines();
                 if (!report.Contains("patch collisions: 3 (2 high, 1 medium, 0 info)"))
                     throw new Exception("report summary wrong:\n" + report);
@@ -5877,6 +6398,894 @@ internal static class Program
             PatchGuard.Reset();
         });
 
+        // ---- the '.komet' window and the toggle table it draws ------------------------
+
+        Check("every '.komet toggle' name resolves, is unique, and flips back", () =>
+        {
+            // Non-degenerate values on purpose: several toggles restore "whatever komet.json
+            // asked for", and a config whose value happens to equal the vanilla one turns the
+            // flip into a no-op that a round-trip test would happily call symmetric.
+            var cfg = new KometConfig
+            {
+                SunOcclusionQueryInterval = 4,
+                ShadowFarBoxMargin = 16,
+                ShadowFarUpdateInterval = 2,
+                ShadowFarMaxSkip = 4,
+                MainThreadTaskBudgetMs = 3,
+                PartsPerCellTarget = 32,
+            };
+            var sys = KometModSystem.ForTest(cfg);
+            var reg = sys.Toggles;
+
+            // Every name the switch statement accepted before the table existed. Spelled out
+            // rather than read from the table: the point is that no rename or drop can quietly
+            // take a name out of a player's muscle memory or out of somebody's bug report.
+            string[] historical =
+            {
+                "cull", "occlusion", "reclaim", "sunquery", "firepit", "prebuild", "glerror",
+                "enttess", "shadowmargin", "shadowbox", "simd", "profiler", "prioupload",
+                "beforeattr", "uploaddruck", "hudraster", "retess", "cullcheck", "cellsize",
+                "gapmerge", "recycler", "tightclone", "extrapool", "animcull", "shadowlod",
+                "shadowcull", "shadowdepth", "animwarm", "shadowstab", "shadowthrottle",
+                "shadowfade", "shadowdist", "edgecoal", "entload", "minimap", "minimapdirect",
+                "taskbudget", "animlod", "entbefore", "clientalloc", "allocsample", "packetsrc",
+                "serveralloc", "mtt", "tickprofiler", "entsync", "attrskip", "edgeprio",
+            };
+            foreach (var key in historical)
+                if (reg.Find(key) == null) throw new Exception("'.komet toggle " + key + "' no longer resolves");
+
+            // Toggles added after the table replaced the switch. Listed rather than folded into
+            // the count, so a name that disappears still fails the check above.
+            string[] added = { "shadowclip", "particles", "shadownearfit", "shadowfootprint", "shadowfoliage", "passprobe", "flatfrag", "spatialpools", "fronttoback", "farmesh", "particleorphan", "farlod2" };
+            foreach (var key in added)
+                if (reg.Find(key) == null) throw new Exception("'.komet toggle " + key + "' does not resolve");
+
+            if (reg.Entries.Count != historical.Length + added.Length)
+                throw new Exception($"the table has {reg.Entries.Count} entries, the switch had {historical.Length}"
+                                    + $" and {added.Length} have been added since");
+
+            // The help line is built from the table, so a system added to it cannot be missing
+            // from the list the command prints - which is exactly how tightclone, extrapool and
+            // animcull came to be undocumented under the old hand-written string.
+            var list = reg.KeyList();
+            foreach (var key in historical)
+                if (!list.Contains(key)) throw new Exception("the key list does not name " + key);
+
+            // Case does not matter: '.komet toggle CULL' worked under ToLowerInvariant.
+            if (reg.Find("CULL") == null) throw new Exception("toggle names are case sensitive now");
+            if (reg.Find("nonsense") != null) throw new Exception("an unknown name resolved");
+
+            // A state where every flip is a real flip: two of them read a value that is only
+            // in effect while the symmetric box is on, and one needs the entity hold.
+            ShadowPatches.SymmetricBox = true;
+            ShadowPatches.FarBoxMargin = cfg.ShadowFarBoxMargin;
+            EntityLoadPatches.Enabled = true;
+
+            foreach (var e in reg.Entries)
+            {
+                if (e.Unavailable?.Invoke() != null) continue;   // no AVX on this machine
+
+                var before = e.IsOn();
+                var said = e.Flip();
+                if (string.IsNullOrWhiteSpace(said))
+                    throw new Exception(e.Key + " flipped without saying what it did");
+                if (e.IsOn() == before)
+                    throw new Exception(e.Key + " reported the same state after a flip: " + said);
+                e.Flip();
+                if (e.IsOn() != before)
+                    throw new Exception(e.Key + " did not come back to where it started");
+            }
+
+            // Safemode's set and the [draws] marks in the window must be the same set, or the
+            // window would send somebody bisecting a visual artefact among the wrong rows.
+            var visual = new List<string>();
+            foreach (var e in reg.Entries) if (e.Visual) visual.Add(e.Key);
+            string[] drawing =
+            {
+                "cull", "animcull", "sunquery", "glerror", "firepit", "enttess", "occlusion",
+                "reclaim", "edgecoal", "edgeprio", "shadowbox", "shadowmargin", "shadowfade",
+                "shadowdist", "shadowlod", "shadowstab", "shadowthrottle", "shadowcull",
+                "shadowdepth", "shadowclip", "shadownearfit", "shadowfootprint", "shadowfoliage", "flatfrag",
+                "fronttoback", "farmesh", "farlod2",
+            };
+            foreach (var key in drawing)
+                if (!visual.Contains(key)) throw new Exception(key + " changes what is drawn but is not marked");
+            if (visual.Count != drawing.Length)
+                throw new Exception($"{visual.Count} toggles are marked as drawing, safemode switches {drawing.Length}");
+        });
+
+        Check("the frame time distribution: tail means, the ring's order, the graph's columns", () =>
+        {
+            // The tail mean IS the 1 % low: the mean of the worst slice, not the sample where
+            // the slice begins. A thousand frames of 10 ms with ten of 100 must read 100.
+            var data = new float[1000];
+            for (var i = 0; i < 990; i++) data[i] = 10f;
+            for (var i = 990; i < 1000; i++) data[i] = 100f;
+            var low1 = FrameStats.TailMean(data, 1000, 100);
+            if (Math.Abs(low1 - 100.0) > 0.001) throw new Exception("1 % low of ten 100 ms frames in a thousand: " + low1);
+            var low01 = FrameStats.TailMean(data, 1000, 1000);
+            if (Math.Abs(low01 - 100.0) > 0.001) throw new Exception("0,1 % low: " + low01);
+            // A short window still answers - with its worst frame, never with nothing.
+            var tiny = new[] { 5f, 9f };
+            if (Math.Abs(FrameStats.TailMean(tiny, 2, 100) - 9.0) > 0.001)
+                throw new Exception("a two frame window must answer with its worst frame");
+
+            // The ring hands back chronological order, oldest first, however far it has wrapped.
+            FrameStats.Reset();
+            for (var i = 1; i <= 40; i++) FrameStats.Advance(System.Diagnostics.Stopwatch.GetTimestamp(), 0);
+            var got = new float[FrameStats.HistoryFrames];
+            var n = FrameStats.CopyHistory(got, 8);
+            if (n <= 0) throw new Exception("the ring stayed empty across forty frames");
+            for (var i = 1; i < n; i++)
+                if (got[i] <= 0) throw new Exception("the ring handed back a hole at " + i);
+
+            // A column shows the WORST frame in its bucket. A graph of spikes that averaged
+            // them away would be decoration, so this is the property, not an implementation
+            // detail: put one spike anywhere and it must survive into some column.
+            var bucketed = new float[100];
+            for (var i = 0; i < 100; i++) bucketed[i] = 8f;
+            bucketed[57] = 250f;
+            var found = false;
+            for (var c = 0; c < 10; c++)
+                if (Math.Abs(Komet.Gui.FrameGraph.ColumnWorst(bucketed, 100, c, 10) - 250f) < 0.001) found = true;
+            if (!found) throw new Exception("a spike was averaged out of the graph");
+            // and every sample lands in exactly one column: ten columns over a hundred samples
+            // covers all hundred without gaps
+            for (var c = 0; c < 10; c++)
+                if (Komet.Gui.FrameGraph.ColumnWorst(bucketed, 100, c, 10) <= 0) throw new Exception("column " + c + " is empty");
+
+            // The ceiling must not be the worst frame: one join spike would flatten the picture
+            // for the next twenty seconds.
+            var ceiling = Komet.Gui.FrameGraph.Ceiling(low1Ms: 12.0, medianMs: 9.0);
+            if (ceiling < 24.0 || ceiling > 30.0) throw new Exception("ceiling off the 2x-low rule: " + ceiling);
+            if (Komet.Gui.FrameGraph.Ceiling(0.5, 0.4) < 8.0) throw new Exception("an idle menu draws a noise field at full height");
+        });
+
+        Check("the frame verdict answers CPU, GPU or neither, and says when it cannot", () =>
+        {
+            if (FrameVerdict.Of(10, 9.8, -1) != Bound.Gpu) throw new Exception("a GPU at 98 % of the frame is the wall");
+            if (FrameVerdict.Of(10, 2.0, -1) != Bound.Cpu) throw new Exception("a GPU at 20 % of the frame is not");
+            if (FrameVerdict.Of(10, 7.5, -1) != Bound.Balanced) throw new Exception("75 % is neither answer");
+            // The driver's own figure wins over the span, because the span counts idle gaps.
+            if (FrameVerdict.Of(10, 2.0, 95) != Bound.Gpu) throw new Exception("the driver's utilisation must win");
+            if (FrameVerdict.Of(10, 9.9, 20) != Bound.Cpu) throw new Exception("the driver's utilisation must win");
+            if (FrameVerdict.Of(10, 0, -1) != Bound.Unknown) throw new Exception("nothing measured must say so");
+            if (FrameVerdict.Of(0, 5, 50) != Bound.Unknown) throw new Exception("no frame, no verdict");
+            foreach (Bound b in Enum.GetValues<Bound>())
+                if (string.IsNullOrEmpty(FrameVerdict.Text(b))) throw new Exception("verdict " + b + " has no words");
+        });
+
+        Check("every page of the '.komet' window composes without a world", () =>
+        {
+            var sys = KometModSystem.ForTest(new KometConfig());
+
+            // The report page reads the mod's own version, which the loader normally sets.
+            var mod = new TestMod();
+            typeof(Mod).GetProperty("Info").SetValue(mod, new ModInfo { Version = "1.2.0-verify" });
+            typeof(ModSystem).GetProperty("Mod").SetValue(sys, mod);
+
+            var sb = new System.Text.StringBuilder(8192);
+            foreach (Komet.Gui.KometView view in Enum.GetValues<Komet.Gui.KometView>())
+            {
+                sb.Clear();
+                // No dialog: the window passes itself in only so the overview can print its own
+                // price, and a page that needs the window to exist would be a page that cannot
+                // be tested. Null here is the harness, and it is also what a first frame sees.
+                sys.ComposeView(view, sb, null);
+                if (sb.Length == 0) throw new Exception("the " + view + " page composed nothing");
+                if (Komet.Gui.KometDialog.TabName(view) is not { Length: > 0 })
+                    throw new Exception("the " + view + " page has no tab name");
+            }
+
+            // Composed twice, because half of them cache: a page that is right once and wrong
+            // on the refresh after it would look fine in every screenshot.
+            foreach (Komet.Gui.KometView view in Enum.GetValues<Komet.Gui.KometView>())
+            {
+                sb.Clear();
+                sys.ComposeView(view, sb, null);
+                if (sb.Length == 0) throw new Exception("the " + view + " page composed nothing on the second pass");
+            }
+        });
+
+        Check("the tightened shadow cull range contains everything the projection keeps", () =>
+        {
+            // The property the whole optimisation rests on: a part the tightened range drops
+            // cannot contribute a fragment, because the projection would have clipped it. Put
+            // the other way round, which is what is checked here: every world point the shadow
+            // projection KEEPS lies inside the range. A hole in this is a missing shadow, so it
+            // is checked against the engine's own transform rather than against the formula.
+            var rnd = new Random(20260905);
+            double[] sun = new double[3];
+
+            foreach (var elevation in new[] { 3.0, 15.0, 45.0, 70.0, 89.0 })
+                foreach (var azimuth in new[] { 0.0, 30.0, 90.0, 143.0, 250.0 })
+                    foreach ((var w, var h, var l) in new[] { (49.0, 30.0, 225.0), (488.0, 488.0, 700.0), (60.0, 34.0, 190.0) })
+                    {
+                        var e = elevation * Math.PI / 180.0;
+                        var a = azimuth * Math.PI / 180.0;
+                        sun[0] = Math.Cos(e) * Math.Cos(a);
+                        sun[1] = Math.Sin(e);
+                        sun[2] = Math.Cos(e) * Math.Sin(a);
+
+                        // The eye is where the game puts it: CameraPos + SunPosition, and
+                        // SunPosition is the direction times 50. The clip volume is centred
+                        // THERE, fifty blocks up-sun of the camera - the first version of this
+                        // check used a unit eye and let a 41-block offset hide in the pad.
+                        var eye = new[] { sun[0] * ShadowPatches.LightEyeOffset, sun[1] * ShadowPatches.LightEyeOffset, sun[2] * ShadowPatches.LightEyeOffset };
+                        var lightView = Mat4d.Create();
+                        Mat4d.LookAt(lightView, eye, new double[3], new double[3] { 0, 1, 0 });
+
+                        ShadowPatches.TightCullExtents(lightView, w, h, l, out var halfX, out var halfZ);
+                        if (!(halfX > 0) || !(halfZ > 0))
+                            throw new Exception($"no extents for a {w}x{h}x{l} box at {elevation}/{azimuth} deg");
+
+                        // A box that big can never need more than its own longest diagonal.
+                        var diagonal = Math.Sqrt(w * w + h * h + l * l) / 2.0;
+                        if (halfX > diagonal + 0.001 || halfZ > diagonal + 0.001)
+                            throw new Exception($"extents {halfX:F1}/{halfZ:F1} exceed the box diagonal {diagonal:F1}");
+
+                        // ... measured from the volume's centre. The range is measured from the
+                        // player, fifty blocks down-sun of it, so the offset goes on top.
+                        ShadowPatches.EyeOffsets(lightView, out var offX, out var offZ);
+                        halfX += offX;
+                        halfZ += offZ;
+
+                        var reach = Math.Max(w, Math.Max(h, l));
+                        var point = new double[4] { 0, 0, 0, 1 };
+                        var inLight = new Vec4d();
+                        for (var i = 0; i < 4000; i++)
+                        {
+                            point[0] = (rnd.NextDouble() * 2 - 1) * reach;
+                            point[1] = (rnd.NextDouble() * 2 - 1) * reach;
+                            point[2] = (rnd.NextDouble() * 2 - 1) * reach;
+                            Mat4d.MulWithVec4(lightView, point, inLight);
+
+                            // exactly the clip volume loadOrthoModeMatrix describes
+                            var kept = Math.Abs(inLight.X) <= w / 2 && Math.Abs(inLight.Y) <= h / 2
+                                                                    && Math.Abs(inLight.Z) <= l / 2;
+                            if (!kept) continue;
+
+                            // the range is measured from the player at the origin; the eye
+                            // offset is in halfX/halfZ now, not in a tolerance
+                            if (Math.Abs(point[0]) > halfX + 0.001
+                                || Math.Abs(point[2]) > halfZ + 0.001)
+                                throw new Exception(
+                                    $"the projection keeps ({point[0]:F1},{point[1]:F1},{point[2]:F1}) at "
+                                    + $"{elevation}/{azimuth} deg, outside the range {halfX:F1}/{halfZ:F1}");
+                        }
+
+                        // And it has to be worth doing: for a near-cascade shaped box the
+                        // vanilla range (39 + extend + 16) is what this replaces. Not at a
+                        // grazing sun, though: there the volume lies almost flat along the
+                        // ground, fifty blocks off the player, and the exact range comes out
+                        // ABOVE vanilla's - which is fine, because the code only ever narrows
+                        // and vanilla's then stands. The saving is claimed from 20 degrees up.
+                        if (elevation >= 20.0 && Math.Abs(w - 49.0) < 0.001 && halfX + ShadowPatches.TightCullPad >= 205.0)
+                            throw new Exception($"no saving for the near cascade at {elevation}/{azimuth} deg: "
+                                                + $"{halfX + ShadowPatches.TightCullPad:F0} against vanilla's 205+");
+                    }
+
+            // The near cascade's depth cap: never lengthens the box, and 0 means vanilla. It is
+            // the number the near pass's geometry follows, so a cap that could grow the volume
+            // would be a performance patch that costs performance.
+            foreach (var vanilla in new[] { 150.0, 175.0, 200.0 })
+            {
+                if (ShadowPatches.NearExtendFor(vanilla, 0) != vanilla)
+                    throw new Exception("a cap of 0 is not vanilla");
+                if (ShadowPatches.NearExtendFor(vanilla, -5) != vanilla)
+                    throw new Exception("a negative cap is not vanilla");
+                if (ShadowPatches.NearExtendFor(vanilla, vanilla + 50) != vanilla)
+                    throw new Exception("the cap lengthened the box");
+                if (ShadowPatches.NearExtendFor(vanilla, 80) != 80.0)
+                    throw new Exception("the cap did not apply");
+            }
+        });
+
+        Check("the near cascade's depth range keeps every caster and drops what cannot cast", () =>
+        {
+            // The patch has to bind and the patched method has to JIT against the real
+            // assembly: a renamed __instance or parameter would throw at Patch() time in the
+            // game and the fit would silently run vanilla.
+            ShadowDepthPatches.Apply(harmony, enabled: true);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.SystemRenderShadowMap),
+                "loadOrthoModeMatrix", new[] { typeof(double[]), typeof(double), typeof(double), typeof(double) }));
+
+            // The property this rests on, stated once: light space looks along the sun
+            // (LookAt(eye = sunPosition, center = 0)), so +z is TOWARDS the sun and only
+            // geometry at a HIGHER light-space z than a receiver can shade it. Vanilla's ortho
+            // carries no translation, so its volume is [-length/2, +length/2] about the camera:
+            // the up-sun half is casters, the down-sun half cannot reach any receiver.
+            //
+            // Two things have to hold for the fit to be free, and both are checked here rather
+            // than argued: the up-sun plane never moves, and every receiver the near map can
+            // still serve stays inside the volume and off shadowcoords.vsh's z > 0.98 knee.
+            const double reach = ShadowDepthPatches.FadeReach;
+
+            foreach (var distance in new[] { 30.0, 39.0, 48.0 })
+                foreach (var length in new[] { 120.0, 190.0, 237.0, 260.0 })
+                    foreach (var camZ in new[] { -1.5, -1.0, 0.0, 1.0 })
+                    {
+                        if (!ShadowDepthPatches.DepthRangeFor(length, camZ, distance, length,
+                                                              out var minZ, out var maxZ))
+                            throw new Exception($"no range for length {length} at distance {distance}");
+
+                        // 1. the up-sun plane is exactly vanilla's, so no caster vanilla drew
+                        //    stops being drawn - this is what makes the fit invisible
+                        if (Math.Abs(maxZ - length / 2.0) > 1e-9)
+                            throw new Exception($"the up-sun plane moved: {maxZ:F3} against {length / 2.0:F3}");
+
+                        // 2. it only ever removes volume
+                        if (minZ < -length / 2.0 - 1e-9)
+                            throw new Exception($"the volume grew down-sun: {minZ:F3} below {-length / 2.0:F3}");
+                        var fitted = maxZ - minZ;
+                        if (fitted > length + 1e-9)
+                            throw new Exception($"the fitted volume {fitted:F1} is longer than vanilla's {length:F1}");
+
+                        // 3. every receiver the near map can serve is inside, and off the knee.
+                        //    shadowcoords.vsh drops the near map at z > 0.98 with a x100 ramp,
+                        //    so a served receiver landing there would lose its near shadow in a
+                        //    step, not a fade.
+                        for (var d = 0.0; d <= reach * distance + 1e-9; d += 0.5)
+                        {
+                            var z = camZ - d;                       // the deepest a receiver can be
+                            if (z < minZ - 1e-9)
+                                throw new Exception($"a receiver {d:F1} blocks from the camera fell out "
+                                                    + $"of the volume ({z:F1} below {minZ:F1})");
+                            var depth = (maxZ - z) / fitted;        // what the ortho writes, in [0,1]
+                            if (depth > 0.98)
+                                throw new Exception($"a served receiver sits on the knee at depth {depth:F4}");
+                        }
+
+                        // 4. the matrix terms the patch writes really map the range onto [-1, 1]
+                        var m10 = -2.0 / fitted;
+                        var m14 = (minZ + maxZ) / fitted;
+                        if (Math.Abs(m10 * maxZ + m14 + 1.0) > 1e-9)
+                            throw new Exception("the up-sun plane does not land on the near clip plane");
+                        if (Math.Abs(m10 * minZ + m14 - 1.0) > 1e-9)
+                            throw new Exception("the down-sun plane does not land on the far clip plane");
+                    }
+
+            // A cap of nothing is not a fit: a volume already shorter than what its receivers
+            // need must come out untouched rather than widened.
+            if (ShadowDepthPatches.DepthRangeFor(40.0, 0.0, 39.0, 40.0, out var shortMin, out var shortMax))
+            {
+                if (Math.Abs(shortMax - shortMin - 40.0) > 1e-9)
+                    throw new Exception("a volume shorter than its receivers need was changed");
+            }
+
+            // The field numbers, with the camera where it really is. The light view is
+            // LookAt(eye = SunPosition, center = 0) and ClientGameCalendar sets SunPosition =
+            // SunPositionNormalized * 50, so the camera sits at light-space z = -50, not -1:
+            // vanilla's 236-block volume is 68 blocks down-sun of it and 168 up-sun. The
+            // receivers need 45 of those 68 - the fit takes the rest, about 6 %. The first
+            // version of this check assumed the camera at -1 and demanded 20 %; the game said 6.
+            ShadowDepthPatches.DepthRangeFor(236.0, -50.0, 39.0, 236.0, out var fieldMin, out var fieldMax);
+            var cut = 1.0 - (fieldMax - fieldMin) / 236.0;
+            if (cut < 0.04 || cut > 0.10)
+                throw new Exception($"the fit removes {cut:P0} of the near volume; the game's own number is 6 %");
+
+            // The cap ('.komet shadowneardepth') used to shorten the volume symmetrically, and
+            // at 80 blocks that put the down-sun plane 23 blocks below the camera - above
+            // receivers the near map serves out to 45. With the fit the down-sun plane is the
+            // receivers', whatever the cap did to the up-sun end.
+            ShadowDepthPatches.DepthRangeFor(147.0, -50.0, 39.0, 236.0, out var capMin, out var capMax);
+            if (capMin > -50.0 - 1.15 * 39.0)
+                throw new Exception($"a cap of 80 cut receivers: down-sun plane at {capMin:F1}, receivers to {-50.0 - 1.15 * 39.0:F1}");
+            if (Math.Abs(capMax - 147.0 / 2.0) > 1e-9)
+                throw new Exception("the cap no longer moves the up-sun end");
+            if (capMax - capMin > 236.0 + 1e-9)
+                throw new Exception("a capped volume came out longer than the uncapped one");
+        });
+
+        Check("the flat fragment shader keeps every declaration and replaces only main", () =>
+        {
+            // The engine's typed setters look uniform names up in a table Compile() rebuilds
+            // from the source: a uniform that vanished would make the next setter throw. So
+            // the swap must keep everything above main, whatever a shader mod put there.
+            var original = System.IO.File.ReadAllText("/opt/vintagestory/assets/game/shaders/chunkopaque.fsh");
+            var flat = ChunkShaderSwap.FlatSource(original);
+            if (flat == null) throw new Exception("no main found in the engine's shader");
+
+            var head = original.Substring(0, original.LastIndexOf("void main", StringComparison.Ordinal));
+            if (!flat.StartsWith(head, StringComparison.Ordinal)) throw new Exception("the part above main changed");
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(original, @"uniform\s+\w+\s+(\w+)"))
+                if (!flat.Contains(m.Value)) throw new Exception("uniform " + m.Groups[1].Value + " vanished");
+            if (System.Text.RegularExpressions.Regex.Matches(flat, @"void\s+main").Count != 1) throw new Exception("not exactly one main");
+            // the same fragments survive: the engine's alpha test, term for term
+            if (!flat.Contains("max(0.0, 1.0 - rgba.a) * min(1.0, texColor.a * 10.0) - lod0Fade"))
+                throw new Exception("the alpha test is not the engine's");
+            if (ChunkShaderSwap.FlatSource("no main here") != null) throw new Exception("a source without main must be refused");
+        });
+
+        Check("spatial pools route by region, the sweep emits nearest first, and the verifier still sees the set", () =>
+        {
+            // Regions: every block column of a 128-block square shares a key, neighbours do not,
+            // and negative coordinates floor like positive ones do (an arithmetic shift, not a
+            // division that rounds toward zero and would put -1 and +1 in the same region).
+            var k0 = SpatialPools.RegionKey(0, 0, 128);
+            if (SpatialPools.RegionKey(127, 127, 128) != k0) throw new Exception("127,127 left the region of 0,0");
+            if (SpatialPools.RegionKey(128, 0, 128) == k0) throw new Exception("128,0 shares the region of 0,0");
+            if (SpatialPools.RegionKey(0, 128, 128) == k0) throw new Exception("0,128 shares the region of 0,0");
+            if (SpatialPools.RegionKey(-1, 0, 128) == k0) throw new Exception("-1,0 shares the region of 0,0");
+            if (SpatialPools.RegionKey(-1, -1, 128) != SpatialPools.RegionKey(-128, -128, 128)) throw new Exception("-1 and -128 are not one region");
+            if (SpatialPools.RegionKey(5, 5, 128) == SpatialPools.RegionKey(5, 5, 64) && SpatialPools.RegionKey(70, 5, 128) == SpatialPools.RegionKey(70, 5, 64))
+            {
+                // both true would mean the region size is ignored: at 64, 70 is region 1
+                if (SpatialPools.RegionKey(70, 5, 64) == SpatialPools.RegionKey(5, 5, 64)) throw new Exception("region size ignored");
+            }
+            if (SpatialPools.ClampRegion(100) != 64 || SpatialPools.ClampRegion(128) != 128
+                || SpatialPools.ClampRegion(3) != 32 || SpatialPools.ClampRegion(9999) != 1024)
+                throw new Exception("region size is not clamped to a power of two in [32, 1024]");
+
+            // Cells nearest first: three cells at 10, 200 and 50 blocks, one empty
+            var cellBox = new float[4 * 6];
+            var lods = FastCuller.LodLevels;
+            var bucketStart = new int[4 * lods + 1];
+            void Cell(int c, float x, float y, float z, int parts)
+            {
+                cellBox[c * 6] = x; cellBox[c * 6 + 1] = y; cellBox[c * 6 + 2] = z;
+                for (var b = c * lods + 1; b <= 4 * lods; b++) bucketStart[b] += parts;
+            }
+            Cell(0, 200, 0, 0, 3); Cell(1, 10, 0, 0, 2); Cell(2, 0, 0, 0, 0); Cell(3, 50, 0, 0, 1);
+            var order = new int[4]; var keys = new float[4];
+            var n = FastCuller.SortCells(cellBox, 4, bucketStart, 0, 0, 0, order, keys);
+            if (n != 3) throw new Exception($"{n} cells sorted, expected 3 (one is empty)");
+            if (order[0] != 1 || order[1] != 3 || order[2] != 0) throw new Exception($"order {order[0]},{order[1]},{order[2]} is not nearest first");
+
+            // The verifier: the same ranges out of order must still pass once sorted, the way
+            // Maybe() sorts them - and Compare itself is order-sensitive, which is why.
+            var want = new List<int> { 0, 6, 24, 6, 48, 6 };            // three parts, in byte order
+            var starts = new[] { 48, 0, 0, 0, 24, 0 };                    // emitted far, near, middle
+            var sizes = new[] { 6, 6, 6 };
+            if (CullVerifier.Compare(starts, sizes, 3, want) == null) throw new Exception("Compare is not order-sensitive - the sort in Maybe would be pointless");
+            var k2 = new[] { 48, 0, 24 }; var s2 = new[] { 6, 6, 6 };
+            Array.Sort(k2, s2);
+            var sortedStarts = new[] { k2[0], 0, k2[1], 0, k2[2], 0 };
+            if (CullVerifier.Compare(sortedStarts, s2, 3, want) != null) throw new Exception("sorted ranges must compare equal to vanilla's set");
+
+            // and the routing prefix binds against the real assembly
+            SpatialPools.Apply(harmony, enabled: true, regionBlocks: 128);
+            ForceJit(AccessTools.Method(typeof(MeshDataPoolManager), "AddModel",
+                new[] { typeof(MeshData), typeof(Vec3i), typeof(int), typeof(Sphere) }));
+        });
+
+        Check("the triangle histogram bands and the foliage range cap are what they say", () =>
+        {
+            // bands: the boundaries the report names, closed below and open above
+            if (FastCuller.BandOf(0) != 0 || FastCuller.BandOf(63.9 * 63.9) != 0) throw new Exception("0-64 band");
+            if (FastCuller.BandOf(64.0 * 64.0) != 1 || FastCuller.BandOf(210.9 * 210.9) != 1) throw new Exception("64-211 band");
+            if (FastCuller.BandOf(211.0 * 211.0) != 2 || FastCuller.BandOf(639.9 * 639.9) != 2) throw new Exception("211-640 band");
+            if (FastCuller.BandOf(640.0 * 640.0) != 3 || FastCuller.BandOf(1e9) != 3) throw new Exception("640+ band");
+
+            // every (pass, band, lod) lands inside the table, unknown passes and lods in the last slot
+            var seen = new HashSet<int>();
+            for (var p = -1; p <= FastCuller.HistPasses + 2; p++)
+                for (var b = 0; b < FastCuller.HistBands; b++)
+                    for (var l = -1; l <= 6; l++)
+                    {
+                        var i = FastCuller.HistIndex(p, b, l);
+                        if (i < 0 || i >= FastCuller.HistSize) throw new Exception($"index {i} for ({p},{b},{l})");
+                        seen.Add(i);
+                    }
+            if (seen.Count != FastCuller.HistSize) throw new Exception($"{seen.Count} of {FastCuller.HistSize} slots reachable");
+
+            // the cap never widens a bound and caps every level
+            var hi = new double[FastCuller.LodLevels];
+            new[] { 211.0 * 211.0 + 1024, 1536.0 * 1536.0, 640.0 * 640.0, 1536.0 * 1536.0, 1536.0 * 1536.0, 640.0 * 640.0 }.CopyTo(hi, 0);
+            var before = (double[])hi.Clone();
+            FastCuller.CapLodBounds(hi, 600.0 * 600.0);
+            for (var l = 0; l < 6; l++)
+            {
+                if (hi[l] > before[l]) throw new Exception("the cap widened a bound");
+                if (hi[l] > 600.0 * 600.0) throw new Exception($"lod {l} not capped");
+            }
+            FastCuller.CapLodBounds(hi, 4000.0 * 4000.0);
+            for (var l = 0; l < 6; l++)
+                if (hi[l] > 600.0 * 600.0 + 1e-9) throw new Exception("a cap above the bounds changed them");
+
+            // only the two foliage passes are foliage
+            if (!FastCuller.IsFoliagePass((int)EnumChunkRenderPass.OpaqueNoCull)) throw new Exception("OpaqueNoCull is foliage");
+            if (!FastCuller.IsFoliagePass((int)EnumChunkRenderPass.BlendNoCull)) throw new Exception("BlendNoCull is foliage");
+            if (FastCuller.IsFoliagePass((int)EnumChunkRenderPass.Opaque)) throw new Exception("Opaque is not foliage");
+            if (FastCuller.IsFoliagePass(-1)) throw new Exception("unknown is not foliage");
+
+            // and the pass prefix binds against the real assembly
+            PoolPassPatches.Apply(harmony);
+            ForceJit(AccessTools.Method(typeof(MeshDataPoolManager), "Render",
+                new[] { typeof(Vec3d), typeof(string), typeof(EnumFrustumCullMode) }));
+        });
+
+        Check("the gpu pass probe takes every third frame, reads a finished slot, and binds", () =>
+        {
+            // The schedule: probe frames are exactly every Nth, and never when off.
+            var probes = 0;
+            for (long f = 1; f <= 300; f++) if (GpuPassProbe.IsProbeFrame(f, 3)) probes++;
+            if (probes != 100) throw new Exception($"{probes} probe frames in 300 at every 3rd");
+            for (long f = 1; f <= 30; f++) if (GpuPassProbe.IsProbeFrame(f, 0)) throw new Exception("every = 0 must never probe");
+
+            // The ring: the slot read at probe k is the one written at probe k-3, and it is
+            // never the slot about to be written - a read of the slot being reused would find
+            // a query that was just reset.
+            for (long k = 0; k < 40; k++)
+            {
+                if (GpuPassProbe.ReadSlot(k) == GpuPassProbe.WriteSlot(k))
+                    throw new Exception($"probe {k} reads the slot it writes");
+                if (GpuPassProbe.ReadSlot(k) != GpuPassProbe.WriteSlot(k - 3 + 4))
+                    throw new Exception($"probe {k} does not read what probe {k - 3} wrote");
+            }
+
+            // And the brackets bind against the real assembly. RenderShadow's postfix and the
+            // pool manager's prefix went on with ShadowCullPatches.Apply earlier in this run;
+            // the camera pass and the particle upload split are bound here.
+            ChunkPassProbePatches.Apply(harmony);
+            ParticlePatches.Apply(harmony);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ClientPlatformWindows), "UpdateMesh",
+                new[] { typeof(MeshRef), typeof(MeshData) }));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ParticlePoolQuads), "OnNewFrame",
+                new[] { typeof(float), typeof(Vec3d) }));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ChunkRenderer), "RenderOpaque", new[] { typeof(float) }));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ChunkRenderer), "RenderShadow", new[] { typeof(float) }));
+            ForceJit(AccessTools.Method(typeof(MeshDataPoolManager), "Render",
+                new[] { typeof(Vec3d), typeof(string), typeof(EnumFrustumCullMode) }));
+        });
+
+        Check("the near shadow pass keeps every caster that can reach a visible receiver", () =>
+        {
+            // Same rule: bind against the real assembly and JIT the patched method, so that a
+            // parameter spelled differently from the engine's ("fb", "___game") is caught here.
+            ShadowFootprintPatches.Apply(harmony, enabled: true);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.SystemRenderShadowMap),
+                "PrepareForShadowRendering", new[] { typeof(double), typeof(EnumFrameBuffer), typeof(float) }));
+
+            // The property, stated once: a caster shades a receiver only along the light, so
+            // in light space it shares the receiver's (x, y). The four lateral clip planes are
+            // planes of constant light-space x and y; pulling them in to the visible receiver
+            // region's extent must keep every caster whose sun ray hits that region, and must
+            // never touch the two depth planes. Checked against random rays, not argued.
+            var rnd = new Random(7);
+            var sun = new double[3];
+            var lightView = Mat4d.Create();
+            var camView = Mat4d.Create();
+            var proj = Mat4d.Create();
+            var corners = new double[15];
+            var savedAny = false;
+
+            foreach (var elevation in new[] { 12.0, 35.0, 60.0 })
+                foreach (var azimuth in new[] { 0.0, 70.0, 200.0 })
+                    foreach (var yaw in new[] { 0.0, 90.0, 180.0, 250.0 })
+                        foreach (var pitch in new[] { 0.0, -35.0, 30.0 })
+                        {
+                            var e = elevation * Math.PI / 180.0;
+                            var a = azimuth * Math.PI / 180.0;
+                            sun[0] = Math.Cos(e) * Math.Cos(a);
+                            sun[1] = Math.Sin(e);
+                            sun[2] = Math.Cos(e) * Math.Sin(a);
+
+                            // the engine's frame: the light look-at from 50 blocks up-sun of the
+                            // camera at the origin, the ortho box 63 x 50 x 236 around it
+                            Mat4d.LookAt(lightView, new[] { sun[0] * 50, sun[1] * 50, sun[2] * 50 },
+                                         new double[3], new double[] { 0, 1, 0 });
+                            double w = 63, h = 50, l = 236;
+                            var planes = OrthoPlanes(lightView, w, h, l);
+
+                            // the camera: a view matrix from yaw/pitch, a 70 deg 16:9 projection
+                            var y = yaw * Math.PI / 180.0;
+                            var pt = pitch * Math.PI / 180.0;
+                            var fwd = new[] { Math.Cos(pt) * Math.Sin(y), Math.Sin(pt), Math.Cos(pt) * Math.Cos(y) };
+                            Mat4d.LookAt(camView, new double[3], fwd, new double[] { 0, 1, 0 });
+                            Mat4d.Perspective(proj, 70 * Math.PI / 180.0, 16.0 / 9.0, 0.1, 3000);
+
+                            const double reach = 1.15 * 39.0;
+                            if (!ShadowFootprintPatches.SliceCorners(camView, proj, 0, 0, 0, reach,
+                                    ShadowFootprintPatches.PadDegrees, corners))
+                                throw new Exception("no slice corners");
+
+                            var before = (Plane[])planes.Clone();
+                            var fraction = ShadowFootprintPatches.Tighten(planes, sun[0], sun[1], sun[2],
+                                0, 0, 0, corners, reach + ShadowFootprintPatches.PadBlocks,
+                                ShadowFootprintPatches.PadBlocks, out var moved);
+                            if (fraction < 1) savedAny = true;
+
+                            // 1. the depth planes never move
+                            for (var i = 0; i < 6; i++)
+                            {
+                                var along = before[i].normalX * sun[0] + before[i].normalY * sun[1] + before[i].normalZ * sun[2];
+                                if (Math.Abs(along) > 0.5 && Math.Abs(planes[i].D - before[i].D) > 1e-12)
+                                    throw new Exception("a depth plane moved");
+                            }
+
+                            // 2. every caster on a sun ray through a visible receiver survives.
+                            //    Receivers: random points in the UNPADDED frustum slice inside
+                            //    the ball; casters: those points moved up-sun by 0..200.
+                            for (var n = 0; n < 1500; n++)
+                            {
+                                var d = rnd.NextDouble() * reach;
+                                var sx = (rnd.NextDouble() * 2 - 1) / proj[0];
+                                var sy = (rnd.NextDouble() * 2 - 1) / proj[5];
+                                double rx = camView[0], ry = camView[4], rz = camView[8];
+                                double ux = camView[1], uy = camView[5], uz = camView[9];
+                                double fx = -camView[2], fy = -camView[6], fz = -camView[10];
+                                var px = fx * d + rx * sx * d + ux * sy * d;
+                                var py = fy * d + ry * sx * d + uy * sy * d;
+                                var pz = fz * d + rz * sx * d + uz * sy * d;
+                                if (px * px + py * py + pz * pz > reach * reach) continue;
+
+                                var t = rnd.NextDouble() * 200;
+                                var cx = px + sun[0] * t;
+                                var cy = py + sun[1] * t;
+                                var cz = pz + sun[2] * t;
+                                if (!Inside(before, cx, cy, cz)) continue;   // vanilla clipped it too
+                                if (!Inside(planes, cx, cy, cz))
+                                    throw new Exception($"a caster at ({cx:F1},{cy:F1},{cz:F1}) for a visible receiver was cut "
+                                        + $"at sun {elevation}/{azimuth}, view {yaw}/{pitch}");
+                            }
+                        }
+
+            if (!savedAny) throw new Exception("no view direction ever tightened a plane - not worth a patch");
+        });
+
+        Check("the window's parts sit inside their frame, and the whole of it inside the screen", () =>
+        {
+            // This is the check for the bug that looked like a rendering fault and was a layout
+            // one: ForkBoundingParent MOVES the bounds it is called on, so the scrollbar, the
+            // buttons and the text panel - all derived from the inset before the fork - stayed
+            // 43 units above and 8 left of the frame they belong in. On screen that put the
+            // page's first line behind the title bar. Nothing about the panel's own drawing was
+            // wrong, which is why it survived two builds; a bounds tree can be checked without
+            // a screen, so it is checked here.
+            var wasScale = RuntimeEnv.GUIScale;
+            try
+            {
+                (int w, int h, float scale)[] screens =
+                {
+                    (1920, 1080, 1f), (1920, 1080, 1.25f), (2560, 1440, 0.75f), (1600, 900, 1f),
+                    (1366, 768, 1f), (1280, 720, 1f), (949, 616, 1f), (800, 600, 1f),
+                };
+
+                foreach ((var w, var h, var scale) in screens)
+                    foreach (var hasGraph in new[] { false, true })
+                    {
+                        RuntimeEnv.GUIScale = scale;
+                        (var cw, var ch) = Komet.Gui.KometDialog.ContentSizeFor(w, h, scale);
+                        var l = Komet.Gui.KometDialog.BuildLayout(cw, ch, hasGraph);
+                        l.Dialog.ParentBounds = new FakeScreen(w, h);
+                        l.Dialog.CalcWorldBounds();
+
+                        var where = $"{w}x{h} @ {scale}" + (hasGraph ? " with graph" : "");
+
+                        void Inside(string what, ElementBounds inner, ElementBounds outer)
+                        {
+                            if (inner.absX < outer.absX - 0.5 || inner.absY < outer.absY - 0.5
+                                || inner.absX + inner.OuterWidth > outer.absX + outer.OuterWidth + 0.5
+                                || inner.absY + inner.OuterHeight > outer.absY + outer.OuterHeight + 0.5)
+                                throw new Exception($"{where}: {what} is not inside its frame - "
+                                    + $"{inner.absX:F0},{inner.absY:F0} {inner.OuterWidth:F0}x{inner.OuterHeight:F0} "
+                                    + $"against {outer.absX:F0},{outer.absY:F0} {outer.OuterWidth:F0}x{outer.OuterHeight:F0}");
+                        }
+
+                        Inside("the text panel", l.Text, l.Inset);
+                        if (hasGraph) Inside("the frame graph", l.Graph, l.Inset);
+                        Inside("the inset", l.Inset, l.Bg);
+                        Inside("the scrollbar", l.Scroll, l.Bg);
+                        Inside("the action buttons", l.Close, l.Bg);
+
+                        // The tab column hangs to the LEFT of the dialog on purpose - that is
+                        // what the alignment offset makes room for - so only its height is a
+                        // containment question, and it is the one that cuts tabs off.
+                        if (l.Tabs.absY < l.Dialog.absY - 0.5
+                            || l.Tabs.absY + l.Tabs.OuterHeight > l.Dialog.absY + l.Dialog.OuterHeight + 0.5)
+                            throw new Exception($"{where}: the tab strip hangs out of the dialog - "
+                                + $"y {l.Tabs.absY:F0}..{l.Tabs.absY + l.Tabs.OuterHeight:F0} "
+                                + $"against {l.Dialog.absY:F0}..{l.Dialog.absY + l.Dialog.OuterHeight:F0}");
+
+                        // The scrollbar belongs beside the frame, the buttons under it - not on
+                        // top of the page they scroll and act on.
+                        if (l.Scroll.absX < l.Inset.absX + l.Inset.OuterWidth - 0.5)
+                            throw new Exception(where + ": the scrollbar overlaps the inset");
+                        if (l.Close.absY < l.Inset.absY + l.Inset.OuterHeight - 0.5)
+                            throw new Exception(where + ": the action buttons overlap the inset");
+                        if (hasGraph && l.Text.absY < l.Graph.absY + l.Graph.OuterHeight - 0.5)
+                            throw new Exception(where + ": the panel overlaps the graph");
+
+                        // And the whole of it on the screen. The tab column hangs to the left of
+                        // the dialog and the scrollbar sits at its right edge, so the footprint
+                        // is wider than the dialog itself - which is what the alignment offset
+                        // is for, and what made the old fixed size overhang small windows.
+                        var left = Math.Min(l.Dialog.absX, l.Tabs.absX);
+                        var right = Math.Max(l.Dialog.absX + l.Dialog.OuterWidth, l.Scroll.absX + l.Scroll.OuterWidth);
+                        var top = Math.Min(l.Dialog.absY, l.Tabs.absY);
+                        var bottom = Math.Max(l.Dialog.absY + l.Dialog.OuterHeight, l.Tabs.absY + l.Tabs.OuterHeight);
+                        if (left < -0.5 || top < -0.5 || right > w + 0.5 || bottom > h + 0.5)
+                            throw new Exception($"{where}: the window overhangs the screen - "
+                                + $"x {left:F0}..{right:F0} of {w}, y {top:F0}..{bottom:F0} of {h}");
+                    }
+
+                // The size is what the screen has room for, up to the size it was designed at,
+                // and never below the floor - a window twice as wide does not get a wider page.
+                if (Komet.Gui.KometDialog.ContentSizeFor(3840, 2160, 1f) != (860.0, 528.0))
+                    throw new Exception("a big screen no longer gets the designed size");
+                (var narrowW, _) = Komet.Gui.KometDialog.ContentSizeFor(640, 1080, 1f);
+                if (narrowW != 420.0) throw new Exception("the width floor moved: " + narrowW);
+                // A minimised window reports zero and must not produce negative bounds.
+                (var zeroW, var zeroH) = Komet.Gui.KometDialog.ContentSizeFor(0, 0, 1f);
+                if (zeroW <= 0 || zeroH <= 0) throw new Exception($"a zero-sized window gave {zeroW}x{zeroH}");
+            }
+            finally
+            {
+                RuntimeEnv.GUIScale = wasScale;
+            }
+        });
+
+        Check("the switches page fits its frame at every window size, and no row runs over the next", () =>
+        {
+            // The bug this pins: the page was laid out for the size the window was DESIGNED at
+            // and drawn at whatever size the screen allows. Two ways out of the frame at once.
+            //
+            // Down: thirteen switches at a fixed 32-unit pitch start 44 below the top and end
+            // 460 down; the content box's own floor is 443, so the last rows and the entire
+            // message panel were drawn below the frame.
+            //
+            // Across: a blocked switch's reason was appended to its row and handed to the
+            // engine's static text element, which autobreaks to the box WIDTH and then keeps
+            // drawing past the box HEIGHT - a sentence-long reason was drawn straight across
+            // the row underneath it, which is what the screenshot showed. A row is one line
+            // now, cut to the cells its box holds, and the sentence stays reachable in the
+            // panel below.
+            var sys = KometModSystem.ForTest(new KometConfig());
+            var groups = Enum.GetValues<Komet.Runtime.ToggleGroup>();
+
+            (int w, int h, float scale)[] screens =
+            {
+                (1920, 1080, 1f), (1920, 1080, 1.25f), (2560, 1440, 0.75f), (1600, 900, 1f),
+                (1366, 768, 1f), (1280, 720, 1f), (949, 616, 1f), (800, 600, 1f), (640, 480, 1f),
+            };
+
+            // The widest a group button can get: the longest label any translation might hand
+            // it. Checked well past the English names, because a German or Russian one is
+            // longer and the row must wrap rather than run off the edge.
+            var buttonWidths = new[] { 58.0, 102.4, 160.0, 240.0 };
+
+            foreach ((var w, var h, var scale) in screens)
+            {
+                (var cw, var ch) = Komet.Gui.KometDialog.ContentSizeFor(w, h, scale);
+                foreach (var groupWidth in buttonWidths)
+                    foreach (Komet.Runtime.ToggleGroup g in groups)
+                    {
+                        var rows = sys.Toggles.CountIn(g);
+                        var page = Komet.Gui.KometDialog.LayOutToggles(cw, ch, groups.Length, groupWidth, rows);
+                        var where = $"{w}x{h}@{scale} {g} ({rows} rows, button {groupWidth})";
+
+                        if (page.GroupsPerRow < 1) throw new Exception(where + ": no group button fits");
+                        var buttonsRight = 6 + Math.Min(page.GroupsPerRow, groups.Length) * (page.GroupWidth + 6) - 6;
+                        if (buttonsRight > cw + 0.5)
+                            throw new Exception($"{where}: the group buttons run to {buttonsRight:F0} of {cw:F0}");
+                        var buttonsBottom = 4 + page.GroupRows * 26 - 4;
+                        if (buttonsBottom > page.RowsTop + 0.5)
+                            throw new Exception($"{where}: the group buttons reach into the first switch row");
+
+                        if (page.RowsBottom > ch + 0.5)
+                            throw new Exception($"{where}: the switches end at {page.RowsBottom:F0} of {ch:F0}");
+                        // A switch must not reach into the row under it, or two of them share a
+                        // click - the failure the fixed pitch produced once the pitch shrank.
+                        if (page.SwitchSize > page.RowPitch - 0.5)
+                            throw new Exception($"{where}: a {page.SwitchSize:F0} switch in a {page.RowPitch:F0} row");
+                        if (page.LabelLeft < page.SwitchSize + 0.5)
+                            throw new Exception(where + ": the label starts inside the switch");
+                        if (page.LabelLeft + page.LabelWidth > cw + 0.5)
+                            throw new Exception($"{where}: the labels reach {page.LabelLeft + page.LabelWidth:F0} of {cw:F0}");
+
+                        if (page.PanelTop < page.RowsBottom - 0.5)
+                            throw new Exception(where + ": the panel overlaps the last switch row");
+                        if (page.PanelBottom > ch + 0.5)
+                            throw new Exception($"{where}: the panel ends at {page.PanelBottom:F0} of {ch:F0}");
+                        if (page.PanelHeight < 20)
+                            throw new Exception($"{where}: the message panel is {page.PanelHeight:F0} units tall");
+
+                        // And every row's text within its own box - the across half of the bug.
+                        foreach (var e in sys.Toggles.InGroup(g))
+                        {
+                            var label = e.Label + "  ." + e.Key + "  [draws]"
+                                        + "  - " + new string('r', 160);   // a worst-case reason
+                            var drawn = Komet.Gui.TextPanel.Ellipsize(label, page.LabelCells);
+                            if (drawn.Length > page.LabelCells)
+                                throw new Exception($"{where}: '{e.Key}' draws {drawn.Length} cells "
+                                                    + $"into {page.LabelCells}");
+                            if (drawn.Length * Komet.Gui.KometDialog.CellWidth > page.LabelWidth + 0.5)
+                                throw new Exception($"{where}: '{e.Key}' is wider than its box");
+                        }
+                    }
+            }
+
+            // The cut itself: nothing is dropped while it fits, and what is cut says so.
+            if (Komet.Gui.TextPanel.Ellipsize("abcdef", 6) != "abcdef")
+                throw new Exception("a line that fits was cut anyway");
+            if (Komet.Gui.TextPanel.Ellipsize("abcdef", 4) != "abc\u2026")
+                throw new Exception("the cut line does not end in an ellipsis");
+            if (Komet.Gui.TextPanel.Ellipsize("abcdef", 1) != "\u2026")
+                throw new Exception("a one-cell box did not get the ellipsis alone");
+            if (Komet.Gui.TextPanel.Ellipsize(null, 8) != "" || Komet.Gui.TextPanel.Ellipsize("x", 0) != "")
+                throw new Exception("the cut did not survive a degenerate box");
+        });
+
+        Check("every page of the window fits its panel, and nothing is lost to the break", () =>
+        {
+            // The rows come from writers built for the F7 overlay, which sizes its box to the
+            // longest line it produced. The window's panel cannot grow, and the same rows ran
+            // off its right border and were cut off mid-word by the surface edge - the
+            // tick-listener line lost its list of listeners, the main-thread line lost its
+            // budget figures, and a cut-off line does not look cut off, it looks broken.
+            var sys = KometModSystem.ForTest(new KometConfig());
+            var mod = new TestMod();
+            typeof(Mod).GetProperty("Info").SetValue(mod, new ModInfo { Version = "1.2.0-verify" });
+            typeof(ModSystem).GetProperty("Mod").SetValue(sys, mod);
+
+            const int columns = Komet.Gui.KometDialog.NominalColumns;
+            var sb = new System.Text.StringBuilder(8192);
+            var drawn = new List<string>(256);
+
+            foreach (Komet.Gui.KometView view in Enum.GetValues<Komet.Gui.KometView>())
+            {
+                sb.Clear();
+                using (DebugHud.WideText(columns)) sys.ComposeView(view, sb, null);
+
+                foreach (var line in sb.ToString().Split('\n'))
+                {
+                    drawn.Clear();
+                    Komet.Gui.TextPanel.WrapInto(drawn, line.TrimEnd(), columns);
+
+                    foreach (var piece in drawn)
+                        if (piece.Length > columns)
+                            throw new Exception($"the {view} page draws a line of {piece.Length} cells "
+                                                + $"into a panel of {columns}: {piece}");
+
+                    // Wrapping may add leading spaces and drop the ones it broke at; every word
+                    // has to survive, in order. A break that eats a figure is worse than none.
+                    var before = string.Join(" ", line.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                    var after = string.Join(" ", string.Join(" ", drawn)
+                        .Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                    if (before != after)
+                        throw new Exception($"the {view} page loses text in the break:\n  {before}\n  {after}");
+                }
+            }
+
+            // The awkward shapes, at the widths a resized panel or a GUI scale of 2 produces.
+            // A word longer than the panel has nowhere to break - a type name, a file path -
+            // and must be cut rather than pushed past the border; a row whose own indent is
+            // most of the panel must still make progress rather than loop.
+            var shapes = new[]
+            {
+                new string('x', 260),
+                "    " + new string('y', 200),
+                " label" + new string(' ', 30) + "a b c d e f g h i j k l m n o p q r s t u v w",
+                "   ",
+                "",
+            };
+            foreach (var width in new[] { 8, 12, 20, 48, 100 })
+                foreach (var shape in shapes)
+                {
+                    drawn.Clear();
+                    Komet.Gui.TextPanel.WrapInto(drawn, shape, width);
+                    if (drawn.Count == 0) throw new Exception("nothing came back for a line of " + shape.Length);
+                    foreach (var piece in drawn)
+                        if (piece.Length > width)
+                            throw new Exception($"a {piece.Length}-cell piece for a panel of {width}: {piece}");
+                    var want = string.Join(" ", shape.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                    var got = string.Join(" ", string.Join(" ", drawn)
+                        .Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                    if (want.Replace(" ", "") != got.Replace(" ", ""))
+                        throw new Exception($"the break lost text at {width} cells:\n  {want}\n  {got}");
+                }
+
+            // The wide geometry belongs to the window's compose and to nothing else: the
+            // overlay sizes its own box, and a rule that outgrew it would widen every F7 box.
+            if (DebugHud.LabelWidth != 13)
+                throw new Exception("the wide layout leaked out of the window's compose");
+            var overlay = new System.Text.StringBuilder(256);
+            DebugHud.Section(overlay, "frame");
+            if (overlay.ToString().TrimEnd('\n').Length != 48)
+                throw new Exception("the overlay's section rule is no longer 48 cells: " + overlay);
+        });
+
         Check("every UI string has a key, and both language files carry exactly those keys", () =>
         {
             // The set of keys is read from the SOURCE, not from what this run happened to
@@ -5885,7 +7294,13 @@ internal static class Program
             // two ways text reaches a player, so those two shapes are the whole vocabulary.
             string root = System.IO.Directory.Exists("Measure") ? "." : "..";
             var used = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var dir in new[] { "", "Measure", "Patches", "Runtime", "Culling", "Guard" })
+            // Kept apart on purpose, so the two ways of naming a string can be checked against
+            // each other below: a Loc.Hud label silently landing on a key some Loc.T already
+            // owns would print that other entry's sentence as a row label, and nothing about
+            // the key sets would look wrong. It happened once, to a section heading.
+            var fromT = new Dictionary<string, string>(StringComparer.Ordinal);
+            var fromHud = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var dir in new[] { "", "Measure", "Patches", "Runtime", "Culling", "Guard", "Gui" })
             {
                 var path = System.IO.Path.Combine(root, dir);
                 if (!System.IO.Directory.Exists(path)) continue;
@@ -5894,12 +7309,32 @@ internal static class Program
                     var text = System.IO.File.ReadAllText(file);
                     foreach (System.Text.RegularExpressions.Match m in
                              System.Text.RegularExpressions.Regex.Matches(text, @"Loc\.T\(\s*""([^""]+)""\s*,\s*""((?:[^""\\]|\\.)*)"""))
+                    {
                         used[m.Groups[1].Value] = m.Groups[2].Value;
+                        fromT[m.Groups[1].Value] = m.Groups[2].Value;
+                    }
                     foreach (System.Text.RegularExpressions.Match m in
                              System.Text.RegularExpressions.Regex.Matches(text, @"Loc\.Hud\(\s*""((?:[^""\\]|\\.)*)""\s*\)"))
+                    {
                         used["komet:hud-" + m.Groups[1].Value.Replace(' ', '-')] = m.Groups[1].Value;
+                        fromHud["komet:hud-" + m.Groups[1].Value.Replace(' ', '-')] = m.Groups[1].Value;
+                    }
+                    // The third shape: the chat command table derives its help key from the
+                    // subcommand's name (Sub/SubArg in KometModSystem.Commands.cs), the same
+                    // way Loc.Hud derives a row's key from its label. Read here too, or the
+                    // nineteen command descriptions would look like keys nothing prints.
+                    foreach (System.Text.RegularExpressions.Match m in
+                             System.Text.RegularExpressions.Regex.Matches(text, @"(?<![\w.])Sub(?:Arg)?\(\s*""([a-z]+)""\s*,\s*""((?:[^""\\]|\\.)*)"""))
+                    {
+                        used["komet:cmd-" + m.Groups[1].Value] = m.Groups[2].Value;
+                        fromT["komet:cmd-" + m.Groups[1].Value] = m.Groups[2].Value;
+                    }
                 }
             }
+            foreach (var k in fromHud.Keys)
+                if (fromT.ContainsKey(k))
+                    throw new Exception($"Loc.Hud(\"{fromHud[k]}\") lands on {k}, which Loc.T already owns "
+                                        + $"(\"{fromT[k]}\") - one of the two has to be renamed");
             if (used.Count < 100) throw new Exception($"only {used.Count} UI keys found in the source - wrong working directory?");
 
             var langDir = System.IO.Path.Combine(root, "assets", "komet", "lang");
@@ -5971,6 +7406,735 @@ internal static class Program
         // the regeneration is the answer to it. (The guard sat on the language check for a
         // day after 04.09. - a new patched method then made './build.sh fingerprint' refuse
         // to write the very file that would have satisfied it.)
+        Check("the shadow foliage range narrows the band for foliage passes only, and never widens it", () =>
+        {
+            // The band is the engine's own axis-aligned shadow range, narrowed. Narrowing it
+            // for a solid pass would drop terrain out of the shadow map (holes in the shade);
+            // widening it for any pass would draw casters vanilla rejects.
+            int[] foliage = { (int)EnumChunkRenderPass.OpaqueNoCull, (int)EnumChunkRenderPass.BlendNoCull };
+            int[] solid = { (int)EnumChunkRenderPass.Opaque, (int)EnumChunkRenderPass.TopSoil,
+                            (int)EnumChunkRenderPass.Transparent, (int)EnumChunkRenderPass.Liquid, -1 };
+
+            // off: every pass keeps the engine's range exactly
+            var all = new List<int>(foliage); all.AddRange(solid);
+            foreach (var pass in all)
+            {
+                FastCuller.ShadowBandFor(pass, 220.0, 240.0, 0, out var x, out var z);
+                if (x != 220.0 || z != 240.0) throw new Exception($"pass {pass} changed with the range off");
+            }
+
+            // on: foliage narrows, everything else does not
+            foreach (var pass in solid)
+            {
+                FastCuller.ShadowBandFor(pass, 220.0, 240.0, 100.0 * 100.0, out var x, out var z);
+                if (x != 220.0 || z != 240.0) throw new Exception($"a solid pass ({pass}) was narrowed - that is holes in the shade");
+            }
+            foreach (var pass in foliage)
+            {
+                FastCuller.ShadowBandFor(pass, 220.0, 240.0, 100.0 * 100.0, out var x, out var z);
+                if (Math.Abs(x - 100.0) > 1e-9 || Math.Abs(z - 100.0) > 1e-9)
+                    throw new Exception($"foliage pass {pass} band is {x} x {z}, wanted 100 x 100");
+
+                // never widens, on either axis independently
+                FastCuller.ShadowBandFor(pass, 40.0, 240.0, 100.0 * 100.0, out var x2, out var z2);
+                if (x2 != 40.0) throw new Exception($"the range widened a narrow axis: {x2} from 40");
+                if (Math.Abs(z2 - 100.0) > 1e-9) throw new Exception($"the wide axis was not narrowed: {z2}");
+                FastCuller.ShadowBandFor(pass, 220.0, 240.0, 4000.0 * 4000.0, out var x3, out var z3);
+                if (x3 != 220.0 || z3 != 240.0) throw new Exception("a range past the cascade changed the band");
+            }
+
+            // and the verifier is told to look away for exactly those sweeps. A pool learns its
+            // pass from CurrentPass on the next sweep, which is what the manager prefix sets.
+            var pool = NewPool();
+            var culler = NewCuller();
+            var before = FastCuller.ShadowFoliageRangeSq;
+            try
+            {
+                FastCuller.CurrentPass = (int)EnumChunkRenderPass.OpaqueNoCull;
+                FastCuller.Cull(pool, culler, EnumFrustumCullMode.CullNormal);
+                FastCuller.ShadowFoliageRangeSq = 100.0 * 100.0;
+                if (!FastCuller.IsFoliageCapped(pool, EnumFrustumCullMode.CullInstantShadowPassNear))
+                    throw new Exception("the verifier would compare a narrowed near shadow sweep against vanilla");
+                if (!FastCuller.IsFoliageCapped(pool, EnumFrustumCullMode.CullInstantShadowPassFar))
+                    throw new Exception("the verifier would compare a narrowed far shadow sweep against vanilla");
+                if (FastCuller.IsFoliageCapped(pool, EnumFrustumCullMode.CullNormal))
+                    throw new Exception("the camera pass is not changed by the SHADOW foliage range");
+
+                FastCuller.CurrentPass = (int)EnumChunkRenderPass.Opaque;
+                FastCuller.Cull(pool, culler, EnumFrustumCullMode.CullNormal);
+                if (FastCuller.IsFoliageCapped(pool, EnumFrustumCullMode.CullInstantShadowPassNear))
+                    throw new Exception("a solid shadow sweep must still be verified");
+
+                FastCuller.ShadowFoliageRangeSq = 0;
+                FastCuller.CurrentPass = (int)EnumChunkRenderPass.OpaqueNoCull;
+                FastCuller.Cull(pool, culler, EnumFrustumCullMode.CullNormal);
+                if (FastCuller.IsFoliageCapped(pool, EnumFrustumCullMode.CullInstantShadowPassNear))
+                    throw new Exception("with the range off every shadow sweep must be verified");
+            }
+            finally
+            {
+                FastCuller.ShadowFoliageRangeSq = before;
+                FastCuller.CurrentPass = -1;
+                FastCuller.ForgetAllPools();
+            }
+
+            // And the whole point, driven through the real sweep: the triangles actually
+            // emitted for a shadow pass have to FALL when the range is narrowed. The first
+            // field test reported no difference at all, so a pure-function check of the band
+            // is not enough - this counts what the pool ends up drawing.
+            var wide = NewCuller();
+            wide.shadowRangeX = 300.0;
+            wide.shadowRangeZ = 300.0;
+            var spread = NewPool();
+            var spreadLocs = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(spread);
+            spreadLocs.Clear();
+            for (var i = 0; i < 26; i++)
+                spreadLocs.Add(new ModelDataPoolLocation
+                {
+                    IndicesStart = i * 300, IndicesEnd = i * 300 + 300, LodLevel = 1,
+                    FrustumCullSphere = Sphere.BoundingSphereForCube(10 + i * 10, 140, 0, 8)
+                });
+            try
+            {
+                FastCuller.ShadowFoliageRangeSq = 0;
+                FastCuller.CurrentPass = (int)EnumChunkRenderPass.OpaqueNoCull;
+                FastCuller.ForgetAllPools();
+                FastCuller.Cull(spread, wide, EnumFrustumCullMode.CullInstantShadowPassNear);
+                var vanillaTris = spread.RenderedTriangles;
+                if (vanillaTris <= 0) throw new Exception("the spread pool draws nothing even at the full range - the check would prove nothing");
+
+                FastCuller.ShadowFoliageRangeSq = 100.0 * 100.0;
+                FastCuller.Cull(spread, wide, EnumFrustumCullMode.CullInstantShadowPassNear);
+                var cappedTris = spread.RenderedTriangles;
+                if (cappedTris >= vanillaTris)
+                    throw new Exception($"the near shadow pass drew {cappedTris} triangles at a 100 block foliage range and {vanillaTris} at the full range - the range does not reach the sweep");
+
+                FastCuller.Cull(spread, wide, EnumFrustumCullMode.CullInstantShadowPassFar);
+                if (spread.RenderedTriangles >= vanillaTris)
+                    throw new Exception("the far shadow pass ignores the foliage range");
+
+                // a solid pool in the same place keeps every triangle
+                FastCuller.CurrentPass = (int)EnumChunkRenderPass.Opaque;
+                FastCuller.ForgetAllPools();
+                FastCuller.Cull(spread, wide, EnumFrustumCullMode.CullInstantShadowPassNear);
+                if (spread.RenderedTriangles != vanillaTris)
+                    throw new Exception($"a solid pass lost triangles to the foliage range: {spread.RenderedTriangles} of {vanillaTris}");
+            }
+            finally
+            {
+                FastCuller.ShadowFoliageRangeSq = before;
+                FastCuller.CurrentPass = -1;
+                FastCuller.ForgetAllPools();
+            }
+        });
+
+        Check("the far lod turns a plateau into cells that copy the source face's appearance", () =>
+        {
+            // A synthetic chunk part in the tesselator's layout: four vertices per face in a
+            // fixed corner order, six indices in the 0,1,2,0,2,3 pattern, per-vertex light,
+            // one colour map int per vertex, and for topsoil two shorts per vertex.
+            var top = FarLodTest.Normal(1, true);
+            var m1 = FarLodTest.Empty(256, false);
+            for (var z = 0; z < 16; z++) for (var x = 0; x < 16; x++)
+                FarLodTest.Face(m1, 1, 5f, z, x, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 0x1234);
+            var src = new[] { FarLodTest.Source(m1, false) };
+            if (!FarLod.Build(src, 1, 1, false)) throw new Exception("a plateau must build");
+            var far = src[0].Output ?? throw new Exception("the plateau's part owns nothing?");
+            if (m1.VerticesCount != 256 * 4) throw new Exception("the source mesh must stay as the engine made it");
+            if (far.VerticesCount != 64 * 4 || far.IndicesCount != 64 * 6)
+                throw new Exception($"8x8 cells expected, got {far.VerticesCount / 4} faces");
+            var seen = new HashSet<(int, int)>();
+            for (var q = 0; q < 64; q++)
+            {
+                if (!FarLodTest.Decode(far, q, out var axis, out var plane, out var minB, out var minC, out var size, out var positive))
+                    throw new Exception($"face {q} is not an axis-aligned square");
+                if (axis != 1 || !positive || plane != 6f || size != 2f)
+                    throw new Exception($"face {q}: axis {axis} plane {plane} size {size} positive {positive}, wanted a 2x2 top at y=6");
+                if (minB % 2 != 0 || minC % 2 != 0 || minB < 0 || minB >= 16 || minC < 0 || minC >= 16)
+                    throw new Exception($"face {q} at ({minC},{minB}) is not on the cell grid");
+                if (!seen.Add(((int)minB, (int)minC))) throw new Exception("a cell got two top faces");
+                for (var j = 0; j < 4; j++)
+                {
+                    var uu = far.Uv[(q * 4 + j) * 2]; var vv = far.Uv[(q * 4 + j) * 2 + 1];
+                    if ((uu != 0.1f && uu != 0.2f) || (vv != 0.2f && vv != 0.3f)) throw new Exception("the uv is not the source tile's");
+                    if (far.Flags[q * 4 + j] != top || far.CustomInts.Values[q * 4 + j] != 0x1234) throw new Exception("flags or colour map data changed");
+                    if (far.Rgba[(q * 4 + j) * 4] != 255) throw new Exception("the light changed");
+                }
+                // the source's corner order: (v1 - v0) x (v3 - v0) keeps its sign, and the SSBO
+                // face packing needs v2 = v1 + v3 - v0
+                if (Math.Sign(FarLodTest.Winding(far, q, 1)) != Math.Sign(FarLodTest.Winding(m1, 0, 1))) throw new Exception("the winding differs from the source's");
+                for (var k = 0; k < 3; k++)
+                    if (Math.Abs(far.xyz[(q * 4 + 2) * 3 + k] - (far.xyz[(q * 4 + 1) * 3 + k] + far.xyz[(q * 4 + 3) * 3 + k] - far.xyz[q * 12 + k])) > 1e-5)
+                        throw new Exception("not a parallelogram in vertex order");
+                for (var k = 0; k < 6; k++) if (far.Indices[q * 6 + k] != q * 4 + new[] { 0, 1, 2, 0, 2, 3 }[k]) throw new Exception("index pattern changed");
+            }
+            // the plateau's sides: the padding is the neighbour, about which the faces say
+            // nothing, so no boundary wall is invented - and the mesh grows no side faces
+            // between its own cells because every cell of the plateau is solid
+            far.Dispose();
+
+            // what is not the tesselator's quad layout is refused untouched
+            var odd = new MeshData(8) { VerticesPerFace = 4, IndicesPerFace = 6, VerticesCount = 6, IndicesCount = 9 };
+            odd.CustomInts = new CustomMeshDataPartInt(8);
+            var srcOdd = new[] { FarLodTest.Source(odd, false) };
+            if (FarLod.Build(srcOdd, 1, 1, false) || !srcOdd[0].Refused) throw new Exception("six vertices are not quads");
+            var srcNull = new[] { FarLodTest.Source(null, false) };
+            if (FarLod.Build(srcNull, 1, 1, false)) throw new Exception("null must be refused");
+        });
+
+        Check("the far lod of a heightfield is exactly its cell picture, in both tiers, per pass", () =>
+        {
+            // A random rolling terrain, tesselated the way the engine does it: one top face per
+            // column, side faces where a neighbour column is lower, nothing at the chunk
+            // boundary (the neighbour continues at the same height). Grass tops in a TopSoil
+            // part, everything else in an Opaque part. The expected picture is computed from
+            // the heightmap alone: a cell is solid if any of its blocks is, and a solid cell
+            // faces every air neighbour. The build must reproduce exactly that set - and put
+            // each face into the part whose source face it copies.
+            var rnd = new Random(1907);
+            for (var trial = 0; trial < 12; trial++)
+            {
+                var h = new int[32, 32];
+                var baseH = 4 + rnd.Next(20);
+                for (var x = 0; x < 32; x++) for (var z = 0; z < 32; z++)
+                {
+                    var v = baseH + (int)(3.0 * Math.Sin(x * 0.4 + trial) + 2.5 * Math.Cos(z * 0.3 - trial * 0.7)) + rnd.Next(3) - 1;
+                    if (trial % 3 == 2 && x > 12 && x < 20) v += 6; // a ridge with cliffs
+                    h[x, z] = Math.Clamp(v, 0, 31);
+                }
+                var topsoil = FarLodTest.Empty(32 * 32, true);
+                var opaque = FarLodTest.Empty(32 * 32 * 8, false);
+                FarLodTest.Terrain(h, topsoil, opaque);
+                var sources = new[] { FarLodTest.Source(topsoil, true), FarLodTest.Source(opaque, false) };
+                if (!FarLod.Build(sources, 2, 1, false)) throw new Exception($"trial {trial}: the terrain must build");
+
+                // tier 1: cells of two
+                var expected = FarLodTest.ExpectedCells(h, 2);
+                var got = FarLodTest.DecodeCells(sources, 2, out var topsIn, out var sidesIn, out var topsInTopsoil, out var sidesInOpaque);
+                FarLodTest.SameSet(expected, got, $"trial {trial} tier 1");
+                if (topsIn != topsInTopsoil) throw new Exception($"trial {trial}: {topsIn - topsInTopsoil} top faces landed outside the TopSoil part");
+                if (sidesIn != sidesInOpaque) throw new Exception($"trial {trial}: {sidesIn - sidesInOpaque} side faces landed outside the Opaque part");
+                // every top copies the highest source face of its cell: the uv encodes the column
+                var tsOut = sources[0].Output ?? throw new Exception("no topsoil output");
+                for (var q = 0; q < tsOut.VerticesCount / 4; q++)
+                {
+                    FarLodTest.Decode(tsOut, q, out _, out var plane, out var minB, out var minC, out _, out _);
+                    var col = FarLodTest.ColumnOf(tsOut, q);
+                    var cx = (int)minC / 2; var cz = (int)minB / 2;
+                    var max = -1;
+                    for (var dx = 0; dx < 2; dx++) for (var dz = 0; dz < 2; dz++) max = Math.Max(max, h[cx * 2 + dx, cz * 2 + dz]);
+                    if (h[col.x, col.z] != max) throw new Exception($"trial {trial}: a top face copies column ({col.x},{col.z}) at height {h[col.x, col.z]}, the cell's highest is {max}");
+                    if (plane != ((max >> 1) * 2 + 2)) throw new Exception($"trial {trial}: a top face at {plane} over a cell whose highest block is {max}");
+                    // the grass uv rides along, per vertex
+                    for (var j = 0; j < 4; j++)
+                        if (tsOut.CustomShorts.Values[(q * 4 + j) * 2] == 0) throw new Exception("the topsoil shorts were not copied");
+                }
+                var total = 0; foreach (var s2 in sources) total += (s2.Output?.VerticesCount ?? 0) / 4;
+                var inFaces = (topsoil.VerticesCount + opaque.VerticesCount) / 4;
+                if (total * 3 > inFaces) throw new Exception($"trial {trial}: {total} faces from {inFaces} - the picture saves less than 3x on rolling terrain");
+
+                // tier 2 from tier 1's outputs: cells of four, the same rule at twice the unit
+                var s2s = new[] { FarLodTest.Source(sources[0].Output, true), FarLodTest.Source(sources[1].Output, false) };
+                var n2 = 0; var picked = new FarLodSource[2];
+                foreach (var x in s2s) if (x.Mesh != null) picked[n2++] = x;
+                if (!FarLod.Build(picked, n2, 2, false)) throw new Exception($"trial {trial}: tier 2 must build");
+                var expected2 = FarLodTest.ExpectedCells(h, 4);
+                var got2 = FarLodTest.DecodeCells(picked, 4, out _, out _, out _, out _);
+                FarLodTest.SameSet(expected2, got2, $"trial {trial} tier 2");
+                foreach (var x in picked) x.Output?.Dispose();
+                foreach (var x in sources) x.Output?.Dispose();
+            }
+        });
+
+        Check("the far lod keeps one rest block per cell, doubled, standing on the cell's top", () =>
+        {
+            // A plateau at y=4 with a plant cross on every block above it: four plants per
+            // cell become one, scaled by two about the cell's corner and floor - so it stands
+            // on the fattened cell top (y=6) instead of inside it.
+            var top = FarLodTest.Normal(1, true);
+            var opaque = FarLodTest.Empty(256, false);
+            for (var z = 0; z < 16; z++) for (var x = 0; x < 16; x++)
+                FarLodTest.Face(opaque, 1, 5f, z, x, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 0x1234);
+            var plants = FarLodTest.Empty(256 * 2, false);
+            var rnd = new Random(77);
+            for (var z = 0; z < 16; z++) for (var x = 0; x < 16; x++)
+            {
+                var ox = x + 0.15f + (float)rnd.NextDouble() * 0.2f;
+                var oz = z + 0.15f + (float)rnd.NextDouble() * 0.2f;
+                var flags = 2 << 25; // wind
+                FarLodTest.Quad(plants, new[] { ox, 5f, oz, ox + 0.7f, 5f, oz + 0.7f, ox + 0.7f, 6f, oz + 0.7f, ox, 6f, oz }, flags, 0x40 | (x << 16));
+                FarLodTest.Quad(plants, new[] { ox + 0.7f, 5f, oz, ox, 5f, oz + 0.7f, ox, 6f, oz + 0.7f, ox + 0.7f, 6f, oz }, flags, 0x40 | (x << 16));
+            }
+            var sources = new[] { FarLodTest.Source(opaque, false), FarLodTest.Source(plants, false) };
+            if (!FarLod.Build(sources, 2, 1, false)) throw new Exception("must build");
+            var rest = sources[1].Output ?? throw new Exception("the plants vanished");
+            if (rest.VerticesCount != 64 * 2 * 4) throw new Exception($"one plant (two quads) per cell expected, got {rest.VerticesCount / 8}");
+            for (var q = 0; q < rest.VerticesCount / 4; q++)
+            {
+                for (var j = 0; j < 4; j++)
+                {
+                    var o = (q * 4 + j) * 3;
+                    var y = rest.xyz[o + 1];
+                    if (y < 6f - 1e-4 || y > 8f + 1e-4) throw new Exception($"a plant vertex at y={y}: it should stand on the cell top (6) and be two blocks tall");
+                    var cx = (int)Math.Floor(rest.xyz[o] / 2) * 2; var cz = (int)Math.Floor(rest.xyz[o + 2] / 2) * 2;
+                    if (rest.xyz[o] < cx || rest.xyz[o] > cx + 2 || rest.xyz[o + 2] < cz || rest.xyz[o + 2] > cz + 2) throw new Exception("a plant left its cell's footprint");
+                    if ((rest.Flags[q * 4 + j] & (2 << 25)) == 0) throw new Exception("the wind flag was lost");
+                }
+                // the cross's two quads are the same size as before, doubled
+                var dx = rest.xyz[q * 12 + 3] - rest.xyz[q * 12];
+                var dz = rest.xyz[q * 12 + 5] - rest.xyz[q * 12 + 2];
+                if (Math.Abs(Math.Abs(dx) - 1.4f) > 1e-3 || Math.Abs(Math.Abs(dz) - 1.4f) > 1e-3) throw new Exception($"a cross quad spans {dx} x {dz}, wanted 1,4 (0,7 doubled)");
+            }
+            // the plateau itself is untouched by the plants: 64 cell tops
+            if ((sources[0].Output?.VerticesCount ?? 0) != 64 * 4) throw new Exception("the plateau under the plants changed");
+            foreach (var x in sources) x.Output?.Dispose();
+        });
+
+        Check("a shell-only build leaves the chunk's centre alone", () =>
+        {
+            // The engine re-tesselates a chunk's two-block shell on its own when a neighbour
+            // changes; the centre's parts are not in that build. The centre must then count
+            // as unknown: the flood must not run through it, so no face is invented towards
+            // it - the centre's own picture, still in the pools, covers that side. What a
+            // shell face says about a centre block (its front is air) still counts.
+            var top = FarLodTest.Normal(1, true);
+            var m = FarLodTest.Empty(300, false);
+            for (var z = 0; z < 32; z++) for (var x = 0; x < 32; x++)
+            {
+                var shell = x < 2 || x >= 30 || z < 2 || z >= 30;
+                if (!shell) continue;
+                FarLodTest.Face(m, 1, 5f, z, x, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 1);
+            }
+            // a bump at (0,7,8) with its top and its +X face: its +X neighbour cell (2..3, 6..7)
+            // has no shell face pointing into it, so only the flood could call it air
+            FarLodTest.Face(m, 1, 8f, 8, 0, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 1);
+            FarLodTest.Face(m, 0, 1f, 7, 8, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, FarLodTest.Normal(0, true), 1);
+            // the shell block (1,4,20)'s +X face: the tesselator emitted it, so (2,4,20) IS air
+            FarLodTest.Face(m, 0, 2f, 4, 20, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, FarLodTest.Normal(0, true), 1);
+
+            static (int tops, int seeded, int flooded, int others) Count(MeshData far)
+            {
+                int tops = 0, seeded = 0, flooded = 0, others = 0;
+                for (var q = 0; q < far.VerticesCount / 4; q++)
+                {
+                    FarLodTest.Decode(far, q, out var axis, out var plane, out var minB, out var minC, out _, out var positive);
+                    if (axis == 1 && positive) { tops++; continue; }
+                    if (axis == 0 && positive && plane == 2f && minB == 4f && minC == 20f) { seeded++; continue; }
+                    if (axis == 0 && positive && plane == 2f && minB == 6f && minC == 8f) { flooded++; continue; }
+                    others++;
+                }
+                return (tops, seeded, flooded, others);
+            }
+
+            var src = new[] { FarLodTest.Source(m, false) };
+            if (!FarLod.Build(src, 1, 1, true)) throw new Exception("must build");
+            var far = src[0].Output ?? throw new Exception("the shell owns nothing?");
+            var c = Count(far);
+            // 60 shell cells; the bump's cell sits on the plateau cell under it, whose top is
+            // then covered and not emitted, and the bump's own top takes its place
+            if (c.tops != 16 * 16 - 14 * 14) throw new Exception($"{c.tops} tops in the shell-only build, wanted 60 (59 plateau cells and the bump)");
+            if (c.seeded != 1) throw new Exception("the face a shell face vouches for (its front is air) is missing in the shell-only build");
+            if (c.flooded != 0) throw new Exception("the shell-only build invented a face towards the unknown centre");
+            if (c.others != 0) throw new Exception($"{c.others} unexpected faces in the shell-only build");
+            far.Dispose();
+
+            // the same shell in a FULL build with nothing in the centre: the flood reaches the
+            // centre, which is then air, and the bump faces it
+            var src2 = new[] { FarLodTest.Source(m, false) };
+            if (!FarLod.Build(src2, 1, 1, false)) throw new Exception("must build");
+            var c2 = Count(src2[0].Output);
+            if (c2.tops != 60 || c2.seeded != 1) throw new Exception("the full build lost the tops or the vouched-for face");
+            if (c2.flooded != 1) throw new Exception("with the centre known to be air, the bump must face it");
+            if (c2.others != 0) throw new Exception($"{c2.others} unexpected faces in the full build");
+            src2[0].Output.Dispose();
+        });
+
+        Check("the far lod hands its pictures over before the engine disposes the part, and levels them", () =>
+        {
+            // The bug this exists for: TesselatedChunkPart.AddToPools ends by calling Dispose(),
+            // so a postfix on Dispose - which is how a part that never reaches the pools is
+            // cleaned up - runs BEFORE the AddToPools postfix. It used to throw the pictures
+            // away. The handover therefore happens in a PREFIX, and this drives the real
+            // methods in the engine's real order to prove it.
+            var lod1Ref = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunkPart, MeshData>("modelDataLod1");
+            var passRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunkPart, EnumChunkRenderPass>("pass");
+            var centerRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunk, Vintagestory.Client.NoObf.TesselatedChunkPart[]>("centerParts");
+            var edgeRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunk, Vintagestory.Client.NoObf.TesselatedChunkPart[]>("edgeParts");
+
+            static MeshData Plateau()
+            {
+                var mesh = FarLodTest.Empty(256, false);
+                var top = FarLodTest.Normal(1, true);
+                for (var z = 0; z < 16; z++) for (var x = 0; x < 16; x++)
+                    FarLodTest.Face(mesh, 1, 5f, z, x, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 0x1234);
+                return mesh;
+            }
+            static Vintagestory.Client.NoObf.TesselatedChunkPart Part(MeshData m, EnumChunkRenderPass pass,
+                AccessTools.FieldRef<Vintagestory.Client.NoObf.TesselatedChunkPart, MeshData> lod1Ref,
+                AccessTools.FieldRef<Vintagestory.Client.NoObf.TesselatedChunkPart, EnumChunkRenderPass> passRef)
+            {
+                var p = new Vintagestory.Client.NoObf.TesselatedChunkPart();
+                lod1Ref(p) = m;
+                passRef(p) = pass;
+                return p;
+            }
+
+            var wasEnabled = FarMesh.Enabled;
+            var wasTier2 = FarMesh.Tier2;
+            FarMesh.Enabled = true;
+            FarMesh.Tier2 = true;
+            try
+            {
+                // a chunk with a centre part and a shell part
+                var center = Part(Plateau(), EnumChunkRenderPass.Opaque, lod1Ref, passRef);
+                var edge = Part(Plateau(), EnumChunkRenderPass.OpaqueNoCull, lod1Ref, passRef);
+                // a TopSoil part whose mesh has no grass uv is not the tesselator's layout: refused, carries nothing, stays at level 1
+                var refused = Part(Plateau(), EnumChunkRenderPass.TopSoil, lod1Ref, passRef);
+                var chunk = new Vintagestory.Client.NoObf.TesselatedChunk();
+                centerRef(chunk) = new[] { center };
+                edgeRef(chunk) = new[] { edge, refused };
+                FarMeshPatches.AfterProcess(chunk, false);
+                if (FarMeshPatches.Peek(refused, out _, out _, out _)) throw new Exception("a refused part must carry nothing");
+                if (!FarMeshPatches.Peek(center, out var t1, out var level, out var pictures2)) throw new Exception("the centre part carries nothing");
+                if (t1 == null || t1.VerticesCount == 0) throw new Exception("the centre part's tier 1 is empty");
+                if (level != FarMesh.LodFar) throw new Exception($"tier 1 levelled {level}, wanted {FarMesh.LodFar} (it has a tier 2 sibling)");
+                if (pictures2 == 0) throw new Exception("the centre part hosts no tier 2");
+                if (!FarMeshPatches.Peek(edge, out _, out var levelE, out var pictures2E)) throw new Exception("the shell part carries nothing");
+                if (levelE != FarMesh.LodFar || pictures2E != 0) throw new Exception("the shell part must be levelled like the centre and host no tier 2");
+                if (lod1Ref(center).VerticesCount != 256 * 4) throw new Exception("the engine's mesh was modified");
+
+                // the engine's order: AddToPools' prefix, then its body (which disposes the
+                // part, firing the Dispose postfix), then its postfix
+                var locations = new List<ModelDataPoolLocation>();
+                FarMeshPatches.BeforeAddToPools(center, locations, out var state);
+                if (state == null) throw new Exception("the prefix did not take the pictures - they would be lost");
+                FarMeshPatches.BeforeAddToPools(center, locations, out var again);
+                if (again != null) throw new Exception("the prefix left the pictures in the table - Dispose will recycle them under the postfix");
+                FarMeshPatches.AfterDispose(center);
+                if (state == null) throw new Exception("the Dispose postfix cleared the handed-over state");
+
+                // a shell-only re-tesselation of the same chunk: tier 2 stays on the centre,
+                // the new shell part is levelled to stop where it begins and hosts none
+                var edge2 = Part(Plateau(), EnumChunkRenderPass.OpaqueNoCull, lod1Ref, passRef);
+                var chunk2 = new Vintagestory.Client.NoObf.TesselatedChunk();
+                edgeRef(chunk2) = new[] { edge2 };
+                FarMeshPatches.AfterProcess(chunk2, true);
+                if (!FarMeshPatches.Peek(edge2, out _, out var level2, out var pictures22)) throw new Exception("the re-tesselated shell carries nothing");
+                if (level2 != FarMesh.LodFar) throw new Exception($"shell tier 1 levelled {level2} after a shell-only pass, wanted {FarMesh.LodFar}");
+                if (pictures22 != 0) throw new Exception("a shell-only pass rebuilt a centre-hosted tier 2");
+                FarMeshPatches.AfterDispose(edge2);
+                FarMeshPatches.AfterDispose(edge);
+
+                // a chunk with only a shell part: tier 2 lives on the shell and is rebuilt with it
+                var edge3 = Part(Plateau(), EnumChunkRenderPass.Opaque, lod1Ref, passRef);
+                var chunk3 = new Vintagestory.Client.NoObf.TesselatedChunk();
+                AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunk, int>("positionX")(chunk3) = 64;
+                edgeRef(chunk3) = new[] { edge3 };
+                FarMeshPatches.AfterProcess(chunk3, false);
+                if (!FarMeshPatches.Peek(edge3, out _, out var level3, out var pictures23) || pictures23 == 0 || level3 != FarMesh.LodFar)
+                    throw new Exception("a chunk without a centre must host tier 2 on its shell part");
+                FarMeshPatches.AfterDispose(edge3);
+                var edge4 = Part(Plateau(), EnumChunkRenderPass.Opaque, lod1Ref, passRef);
+                edgeRef(chunk3) = new[] { edge4 };
+                FarMeshPatches.AfterProcess(chunk3, true);
+                if (!FarMeshPatches.Peek(edge4, out _, out var level4, out var pictures24) || pictures24 == 0 || level4 != FarMesh.LodFar)
+                    throw new Exception("a shell-only pass must rebuild a shell-hosted tier 2");
+                FarMeshPatches.AfterDispose(edge4);
+
+                // with tier 2 off, tier 1 carries on to the view distance
+                FarMesh.Tier2 = false;
+                var solo = Part(Plateau(), EnumChunkRenderPass.Opaque, lod1Ref, passRef);
+                var chunk5 = new Vintagestory.Client.NoObf.TesselatedChunk();
+                centerRef(chunk5) = new[] { solo };
+                FarMeshPatches.AfterProcess(chunk5, false);
+                if (!FarMeshPatches.Peek(solo, out _, out var level5, out var pictures25) || pictures25 != 0 || level5 != FarMesh.LodFarSolo)
+                    throw new Exception("without tier 2 the tier 1 picture must be levelled to carry on to the view distance");
+                FarMeshPatches.AfterDispose(solo);
+
+                // a part disposed WITHOUT reaching the pools is cleaned up
+                FarMeshPatches.BeforeAddToPools(solo, locations, out var state2);
+                if (state2 != null) throw new Exception("a disposed part still holds its pictures - they leak");
+
+                // the prefix exists on the real method, so the handover cannot be patched away
+                var info = Harmony.GetPatchInfo(AccessTools.Method(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "AddToPools"));
+                if (info == null || info.Prefixes == null || info.Prefixes.Count == 0)
+                    throw new Exception("AddToPools has no prefix - the handover depends on patch order again");
+            }
+            finally
+            {
+                FarMesh.Enabled = wasEnabled;
+                FarMesh.Tier2 = wasTier2;
+                FarMeshPatches.Reset();
+            }
+        });
+
+        Check("the far lod's output arrays come from a pool and are given back exactly once", () =>
+        {
+            // MeshData.Dispose nulls CustomInts/CustomShorts before recycling, so every output
+            // mesh would otherwise need a fresh int[]: the alloc sample put 31 MB/s of Int32[]
+            // on the tesselation thread with the far lod on. The bench measures the effect
+            // (45,6 KB per chunk build without the pool, 0,8 KB with it); this pins the
+            // contract the pool needs to be safe.
+            var pool = new ArrayPoolByClass<int>(sizeof(int)) { BudgetMb = 4 };
+            var a = pool.RentBlank(1000);
+            if (a.Length < 1000) throw new Exception("RentBlank gave a short array");
+            if ((a.Length & (a.Length - 1)) != 0) throw new Exception("a rented array must be a class size, or Return refuses it");
+            pool.Return(a);
+            if (pool.HeldBytes != (long)a.Length * sizeof(int)) throw new Exception("Return did not take the array");
+            if (!ReferenceEquals(pool.RentBlank(1000), a)) throw new Exception("the pool did not hand the array back");
+            pool.Return(a);
+            pool.Return(new int[1000]);   // not a class size
+            if (pool.HeldBytes != (long)a.Length * sizeof(int)) throw new Exception("an array that is not a class size must be refused");
+            pool.BudgetMb = 0;
+            pool.Clear();
+            pool.Return(a);
+            if (pool.HeldBytes != 0) throw new Exception("the budget is not honoured");
+
+            // Release: arrays back, and a second Release must not hand the same ones out twice
+            var wasPooling = FarLod.PoolArrays;
+            FarLod.PoolArrays = true;
+            try
+            {
+                FarLod.Ints.Clear();
+                FarLod.Shorts.Clear();
+                var mesh = FarLodTest.Empty(64, true);
+                mesh.CustomInts.Values = FarLod.Ints.RentBlank(256);
+                mesh.CustomShorts.Values = FarLod.Shorts.RentBlank(512);
+                var ints = mesh.CustomInts.Values;
+                FarLod.Release(mesh);
+                if (mesh.CustomInts != null || mesh.CustomShorts != null) throw new Exception("Release left the custom parts on the mesh");
+                var held = FarLod.PooledBytes;
+                if (held == 0) throw new Exception("Release did not return the arrays");
+                FarLod.Release(mesh);
+                if (FarLod.PooledBytes != held) throw new Exception("a second Release returned the same arrays again - two renters would share one array");
+                if (!ReferenceEquals(FarLod.Ints.RentBlank(256), ints)) throw new Exception("the returned array did not come back");
+                FarLod.ClearPools();
+                if (FarLod.PooledBytes != 0) throw new Exception("ClearPools left memory held");
+            }
+            finally { FarLod.PoolArrays = wasPooling; }
+        });
+
+        Check("a part too small for a picture keeps its own mesh, and the pictures get pool lanes of their own", () =>
+        {
+            var lod1Ref = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunkPart, MeshData>("modelDataLod1");
+            var passRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunkPart, EnumChunkRenderPass>("pass");
+            var centerRef = AccessTools.FieldRefAccess<Vintagestory.Client.NoObf.TesselatedChunk, Vintagestory.Client.NoObf.TesselatedChunkPart[]>("centerParts");
+
+            static MeshData Plateau(int side)
+            {
+                var mesh = FarLodTest.Empty(side * side, false);
+                var top = FarLodTest.Normal(1, true);
+                for (var z = 0; z < side; z++) for (var x = 0; x < side; x++)
+                    FarLodTest.Face(mesh, 1, 5f, z, x, 0.1f, 0.2f, 0.2f, 0.3f, FarLodTest.Flat, top, 0x1234);
+                return mesh;
+            }
+
+            var wasEnabled = FarMesh.Enabled;
+            FarMesh.Enabled = true;
+            SpatialPools.Lane = 0;
+            try
+            {
+                // 8x8 = 64 faces, under the threshold: no picture, and nothing re-levelled -
+                // the part keeps drawing its own mesh at every distance, as before
+                var small = new Vintagestory.Client.NoObf.TesselatedChunkPart();
+                lod1Ref(small) = Plateau(8);
+                passRef(small) = EnumChunkRenderPass.Opaque;
+                var chunk = new Vintagestory.Client.NoObf.TesselatedChunk();
+                centerRef(chunk) = new[] { small };
+                var before = FarMeshPatches.StatTooSmall;
+                FarMeshPatches.AfterProcess(chunk, false);
+                if (FarMeshPatches.Peek(small, out _, out _, out _)) throw new Exception("a part under the threshold got a picture");
+                if (FarMeshPatches.StatTooSmall != before + 1) throw new Exception("the skipped part was not counted");
+                if (lod1Ref(small).VerticesCount != 64 * 4) throw new Exception("the engine's mesh was touched");
+
+                // 16x16 = 256 faces, over it
+                var big = new Vintagestory.Client.NoObf.TesselatedChunkPart();
+                lod1Ref(big) = Plateau(16);
+                passRef(big) = EnumChunkRenderPass.Opaque;
+                centerRef(chunk) = new[] { big };
+                FarMeshPatches.AfterProcess(chunk, false);
+                if (!FarMeshPatches.Peek(big, out var t1, out _, out _) || t1 == null) throw new Exception("a part over the threshold got no picture");
+
+                // the lane: set for the engine's own meshes across the engine's body, cleared after
+                var locations = new List<ModelDataPoolLocation>();
+                FarMeshPatches.BeforeAddToPools(big, locations, out var state);
+                if (SpatialPools.Lane == 0) throw new Exception("the engine's meshes are not lane-routed - the pictures would interleave with them again");
+                var engineLane = SpatialPools.Lane;
+                FarMeshPatches.AfterAddToPools(state, null, locations, null, 0, default, null);
+                if (SpatialPools.Lane != 0) throw new Exception("the lane leaked past AddToPools");
+                // and a lane always routes, whether or not the region routing is on
+                var wasRouting = SpatialPools.Enabled;
+                SpatialPools.Enabled = false;
+                try
+                {
+                    if (SpatialPools.Routes(0)) throw new Exception("lane 0 routes with the region routing off");
+                    if (!SpatialPools.Routes(engineLane)) throw new Exception("a lane must route even with the region routing off");
+                }
+                finally { SpatialPools.Enabled = wasRouting; }
+                FarMeshPatches.AfterDispose(big);
+                FarMeshPatches.AfterDispose(small);
+            }
+            finally
+            {
+                FarMesh.Enabled = wasEnabled;
+                SpatialPools.Lane = 0;
+                FarMeshPatches.Reset();
+            }
+        });
+
+        Check("the far lod patches bind against the real assemblies and its LOD levels sit in the culler's tables", () =>
+        {
+            FarMeshPatches.Apply(harmony, enabled: true, distanceBlocks: 0, tier2: true, log: null);
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ChunkTesselator), "NowProcessChunk",
+                new[] { typeof(int), typeof(int), typeof(int), typeof(Vintagestory.Client.NoObf.TesselatedChunk), typeof(bool) }));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "AddToPools"));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.TesselatedChunkPart), "Dispose"));
+            ForceJit(AccessTools.Method(typeof(Vintagestory.Client.NoObf.ChunkRenderer), "RenderOpaque", new[] { typeof(float) }));
+            ForceJit(AccessTools.Method(typeof(MeshDataPool), nameof(MeshDataPool.RemoveLocation)));
+            if (!FarMeshPatches.Installed) throw new Exception("not installed after Apply");
+            if (!FarMesh.Enabled || FarMesh.DistanceSq != 0 || !FarMesh.Tier2) throw new Exception("Apply did not carry the configuration");
+
+            // The default rule: 0,35 of the view distance with a floor of 400 blocks. It must
+            // leave a band at every ordinary view distance, and say when it does not.
+            foreach (var viewDist in new[] { 512, 768, 1024, 1536, 2048 })
+            {
+                var c2 = new FrustumCulling();
+                c2.UpdateViewDistance(viewDist);
+                var eff = Math.Sqrt(FarMesh.EffectiveDistanceSq(c2));
+                var want = Math.Max(FarMesh.DefaultFloor, viewDist * FarMesh.DefaultFraction);
+                if (Math.Abs(eff - want) > 0.5) throw new Exception($"at view distance {viewDist} the default distance is {eff:F0}, the rule says {want:F0}");
+                if (!FarMesh.HasBand(c2)) throw new Exception($"at view distance {viewDist} the rule leaves no band");
+                if (Math.Sqrt(FarMesh.EffectiveDistance2Sq(c2)) < eff * 1.99) throw new Exception("tier 2 is not at twice the distance");
+            }
+            var c256 = new FrustumCulling();
+            c256.UpdateViewDistance(256);
+            if (FarMesh.HasBand(c256)) throw new Exception("at view distance 256 the floor is past the view distance - there is no band");
+            // an explicit distance is used as given
+            FarMesh.DistanceSq = 300.0 * 300.0;
+            if (Math.Abs(Math.Sqrt(FarMesh.EffectiveDistanceSq(NewCuller())) - 300.0) > 1e-6)
+                throw new Exception("an explicit distance must be used as given");
+            FarMesh.DistanceSq = 0;
+            // the levels the engine never assigns, and the culler's bucket arity has room for them
+            foreach (var lvl in new[] { FarMesh.LodFar, FarMesh.LodNear, FarMesh.LodFar2, FarMesh.LodFarSolo })
+            {
+                if (lvl >= FastCuller.LodLevels) throw new Exception("a far lod level exceeds the bucket arity");
+                if (lvl < 4) throw new Exception("a far lod level collides with the engine's");
+                if (FastCuller.HistLods <= lvl) throw new Exception("the histogram has no row for a far lod level");
+            }
+            // vanilla's own range test never draws them - the fallback the design rests on
+            var culler = NewCuller();
+            var sphere = Sphere.BoundingSphereForCube(64, 140, 0, 32);
+            foreach (var lvl in new[] { FarMesh.LodFar, FarMesh.LodNear, FarMesh.LodFar2, FarMesh.LodFarSolo })
+                if (culler.InFrustumAndRange(sphere, false, lvl)) throw new Exception($"the engine draws LOD level {lvl} - the fallback is not safe");
+            if (!culler.InFrustumAndRange(sphere, false, 1)) throw new Exception("the test sphere must be visible at LOD 1 for the check to mean anything");
+            if (!FarMesh.IsPicture(FarMesh.LodFar) || !FarMesh.IsPicture(FarMesh.LodFar2) || !FarMesh.IsPicture(FarMesh.LodFarSolo) || FarMesh.IsPicture(FarMesh.LodNear) || FarMesh.IsPicture(1))
+                throw new Exception("IsPicture does not name the three picture levels");
+            FarMesh.Enabled = false;
+            FarMesh.Active = false;
+        });
+
+        Check("the sweep draws the far lod's levels in their bands, and never as shadow casters", () =>
+        {
+            // One pool with a part at every far lod level at a range of distances; the sweep's
+            // answer per part must be the rule: 5 within the distance, 4 between the distance
+            // and twice it, 6 beyond that, 7 from the distance on - and none of the pictures
+            // in either shadow pass, where 5 casts like 1.
+            FastCuller.ForgetAllPools();
+            FastCuller.Parallel = false;
+            var culler = NewCuller();   // view distance 512
+            var pool = NewPool();
+            var locs = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(pool);
+            locs.Clear();
+            var wasActive = FarMesh.Active; var wasDist = FarMesh.DistanceSq; var wasTier2 = FarMesh.Tier2;
+            FarMesh.Active = true;
+            FarMesh.DistanceSq = 100.0 * 100.0;
+            FarMesh.Tier2 = true;
+            // the parts a sweep emitted, from its ranges (adjacent visible parts are merged into one)
+            static HashSet<int> Drawn(MeshDataPool p)
+            {
+                var set = new HashSet<int>();
+                for (var g = 0; g < p.indicesGroupsCount; g++)
+                {
+                    var start = p.indicesStartsByte[g * 2] / 4;
+                    var end = start + p.indicesSizes[g];
+                    for (var i = start / 300; i * 300 < end; i++) set.Add(i);
+                }
+                return set;
+            }
+            try
+            {
+                var levels = new[] { 1, FarMesh.LodFar, FarMesh.LodNear, FarMesh.LodFar2, FarMesh.LodFarSolo };
+                var dists = new[] { 40, 90, 110, 190, 210, 300 };
+                var idx = 0;
+                foreach (var d in dists)
+                    foreach (var lvl in levels)
+                    {
+                        locs.Add(new ModelDataPoolLocation
+                        {
+                            IndicesStart = idx * 300, IndicesEnd = idx * 300 + 300, VerticesStart = idx * 200, VerticesEnd = idx * 200 + 200,
+                            LodLevel = lvl, FrustumCullSphere = Sphere.BoundingSphereForCube(d, 124, -16, 32),
+                        });
+                        idx++;
+                    }
+                foreach (var mode in new[] { EnumFrustumCullMode.CullNormal, EnumFrustumCullMode.CullInstantShadowPassNear, EnumFrustumCullMode.CullInstantShadowPassFar })
+                {
+                    FastCuller.Cull(pool, culler, mode);
+                    var drawn = Drawn(pool);
+                    idx = 0;
+                    foreach (var d in dists)
+                        foreach (var lvl in levels)
+                        {
+                            var loc = locs[idx];
+                            var expect = CullVerifier.VanillaVisible(loc, mode, culler);
+                            // the rule, spelled out independently of the verifier
+                            var dd = FastCuller.PlayerPosOf(culler).HorDistanceSqTo(loc.FrustumCullSphere.x, loc.FrustumCullSphere.z);
+                            bool rule;
+                            if (mode == EnumFrustumCullMode.CullNormal)
+                                rule = lvl switch
+                                {
+                                    1 => true,
+                                    FarMesh.LodNear => dd <= 100.0 * 100.0,
+                                    FarMesh.LodFar => dd > 100.0 * 100.0 && dd <= 200.0 * 200.0,
+                                    FarMesh.LodFar2 => dd > 200.0 * 200.0,
+                                    _ => dd > 100.0 * 100.0,
+                                } && culler.InFrustumAndRange(loc.FrustumCullSphere, false, 1);
+                            else
+                                rule = !FarMesh.IsPicture(lvl) && culler.InFrustumShadowPass(loc.FrustumCullSphere);
+                            if (rule != expect) throw new Exception($"{mode}: the verifier's rule for level {lvl} at {d} blocks says {expect}, the design says {rule}");
+                            if (drawn.Contains(idx) != rule) throw new Exception($"{mode}: level {lvl} at {d} blocks drawn={drawn.Contains(idx)}, wanted {rule}");
+                            idx++;
+                        }
+                }
+                // tier 2 off: 4 carries on, 6 never shows
+                FarMesh.Tier2 = false;
+                FastCuller.InvalidateAll();
+                FastCuller.Cull(pool, culler, EnumFrustumCullMode.CullNormal);
+                var drawn2 = Drawn(pool);
+                idx = 0;
+                foreach (var d in dists)
+                    foreach (var lvl in levels)
+                    {
+                        var dd = FastCuller.PlayerPosOf(culler).HorDistanceSqTo(locs[idx].FrustumCullSphere.x, locs[idx].FrustumCullSphere.z);
+                        var rule = lvl switch
+                        {
+                            1 => true,
+                            FarMesh.LodNear => dd <= 100.0 * 100.0,
+                            FarMesh.LodFar2 => false,
+                            _ => dd > 100.0 * 100.0,
+                        } && culler.InFrustumAndRange(locs[idx].FrustumCullSphere, false, 1);
+                        if (drawn2.Contains(idx) != rule) throw new Exception($"tier 2 off: level {lvl} at {d} blocks drawn={drawn2.Contains(idx)}, wanted {rule}");
+                        if (CullVerifier.VanillaVisible(locs[idx], EnumFrustumCullMode.CullNormal, culler) != rule) throw new Exception("tier 2 off: the verifier disagrees");
+                        idx++;
+                    }
+            }
+            finally
+            {
+                FarMesh.Active = wasActive; FarMesh.DistanceSq = wasDist; FarMesh.Tier2 = wasTier2;
+                FastCuller.Parallel = true;
+                FastCuller.ForgetAllPools();
+            }
+        });
+
         if (!fingerprintMode)
         Check("the engine fingerprint matches the game on disk (else: ./build.sh fingerprint)", () =>
         {
@@ -6058,8 +8222,6 @@ internal static class Program
         return failures == 0 ? 0 : 1;
     }
 
-    /// <summary>Records that it was called, so dispatch order and count can be checked.</summary>
-    /// <summary>A named, slow tick listener: gives the tick profiler a method to name.</summary>
     /// <summary>Stands in for another mod's code: what matters is that it is a ModSystem in an
     /// assembly the fake mod entry claims, which is exactly how the real mapping works.</summary>
     private sealed class ProbeModSystem : ModSystem
@@ -6124,9 +8286,12 @@ internal static class Program
         Fill("medievalexpansion", 0.31, 0.03, 188, 0, 0, 0, 0, 240, 760, "assets");
     }
 
+    /// <summary>Records that it was called, so dispatch order and count can be checked.</summary>
     private sealed class TickProbe
     {
         public int Calls;
+
+        /// <summary>A named, slow tick listener: gives the tick profiler a method to name.</summary>
         public void Slow(float dt)
         {
             Calls++;
@@ -6269,6 +8434,66 @@ internal static class Program
     /// awkward cases too: an out-of-range LOD level (vanilla: never visible), hidden parts, and
     /// parts whose chunk the occlusion pass marked invisible.
     /// </summary>
+    /// <summary>
+    /// A pool the size and shape a real client keeps: parts ordered by distance from the
+    /// player, so consecutive ones ring the origin instead of clustering, which is what makes
+    /// the spatial grid build many cells rather than one.
+    /// </summary>
+    private static MeshDataPool WidePool(int count)
+    {
+        ConstructorInfo ctor = typeof(MeshDataPool).GetConstructor(
+            BindingFlags.NonPublic | BindingFlags.Instance, null,
+            new[] { typeof(int), typeof(int), typeof(int) }, null);
+        var pool = (MeshDataPool)ctor.Invoke(new object[] { 500000, 750000, count + 8 });
+        pool.indicesStartsByte = new int[(count + 8) * 2];
+        pool.indicesSizes = new int[count + 8];
+
+        var locations = AccessTools.FieldRefAccess<MeshDataPool, List<ModelDataPoolLocation>>("poolLocations")(pool);
+        var rnd = new Random(20260906);
+        int indices = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int cx = (i * 7) % 41 - 20;
+            int cz = (i * 11) % 41 - 20;
+            int len = 300 + rnd.Next(3000);
+            len -= len % 3;
+            var loc = new ModelDataPoolLocation
+            {
+                IndicesStart = indices,
+                IndicesEnd = indices + len,
+                // 0..3 are the engine's; every 313th part gets a level no switch case covers
+                LodLevel = (i % 313) == 0 ? 7 : (i + 1) % 4,
+                Hide = (i % 97) == 0,
+                FrustumCullSphere = Sphere.BoundingSphereForCube(cx * 32, (3 + rnd.Next(3)) * 32, cz * 32, 32)
+            };
+            if ((i % 11) == 0) loc.CullVisible = new Bools(false, false);
+            locations.Add(loc);
+            indices += len;
+        }
+        return pool;
+    }
+
+    /// <summary>A culler looking in the given direction over a view distance wide enough that
+    /// the pool above spans several LOD bands as well as several cells.</summary>
+    private static FrustumCulling WideCuller(double yaw)
+    {
+        var culler = new FrustumCulling();
+        culler.UpdateViewDistance(1024);
+        culler.lod0BiasSq = 211f * 211f;
+        culler.lod2BiasSq = 480.0 * 480.0;
+        culler.shadowRangeX = culler.shadowRangeZ = 220.0;
+
+        double[] proj = Mat4d.Create();
+        Mat4d.Perspective(proj, 70.0 * Math.PI / 180.0, 16.0 / 9.0, 0.3, 1229.0);
+        double[] view = Mat4d.Create();
+        Mat4d.LookAt(view,
+            new double[] { 0, 140, 0 },
+            new double[] { Math.Sin(yaw) * 100.0, 130, Math.Cos(yaw) * 100.0 },
+            new double[] { 0, 1, 0 });
+        culler.CalcFrustumEquations(new BlockPos(0, 140, 0, 0), proj, view);
+        return culler;
+    }
+
     private static MeshDataPool OddPool(int count)
     {
         ConstructorInfo ctor = typeof(MeshDataPool).GetConstructor(
@@ -6303,6 +8528,19 @@ internal static class Program
     /// ones coalesced, plus the triangle counters. Two pools with the same string draw the same
     /// triangles in the same order, whether or not either merged its ranges.
     /// </summary>
+    /// <summary>
+    /// Where two <see cref="Runs"/> strings first part company, in one line. A wide pool draws
+    /// well over a hundred ranges, and printing both lists in full buries the one that differs.
+    /// </summary>
+    private static string FirstRunDifference(string want, string got)
+    {
+        string[] a = want.Split(' '), b = got.Split(' ');
+        for (int i = 0; i < Math.Min(a.Length, b.Length); i++)
+            if (a[i] != b[i])
+                return $"range {i} is '{a[i]}' in vanilla and '{b[i]}' here ({a.Length}/{b.Length} ranges)";
+        return $"the shorter list agrees; vanilla has {a.Length} ranges, this has {b.Length}";
+    }
+
     private static string Runs(MeshDataPool p)
     {
         var runs = new List<(int start, int end)>();
@@ -6352,6 +8590,235 @@ internal static class Program
             if (ly > maxY) maxY = ly;
         }
         return Math.Max(maxX - minX, maxY - minY);
+    }
+
+    /// <summary>
+    /// Synthetic chunk parts in the tesselator's layout, and the far lod's expected picture
+    /// of a heightfield, for the far lod checks.
+    /// </summary>
+    private static class FarLodTest
+    {
+        public static uint Grey(int v) => (uint)(v | (v << 8) | (v << 16) | (255 << 24));
+        public static readonly uint[] Flat = { Grey(255), Grey(255), Grey(255), Grey(255) };
+
+        public static int Normal(int axis, bool positive)
+        {
+            var sgn = positive ? 1f : -1f;
+            return VertexFlags.PackNormal(new Vec3f(axis == 0 ? sgn : 0, axis == 1 ? sgn : 0, axis == 2 ? sgn : 0));
+        }
+
+        public static FarLodSource Source(MeshData m, bool topsoil) => new FarLodSource { Mesh = m, TopSoil = topsoil };
+
+        public static MeshData Empty(int quads, bool topsoil)
+        {
+            var m = new MeshData(quads * 4) { VerticesPerFace = 4, IndicesPerFace = 6 };
+            m.CustomInts = new CustomMeshDataPartInt(quads * 4) { InterleaveStride = 4 };
+            if (topsoil) m.CustomShorts = new CustomMeshDataPartShort(quads * 8) { InterleaveStride = 4 };
+            return m;
+        }
+
+        /// <summary>A unit face: corner order (db,dc) = (0,0) (1,0) (1,1) (0,1); ab = (axis+1)%3, ac = (axis+2)%3.</summary>
+        public static void Face(MeshData m, int axis, float plane, int b, int c, float u0, float v0, float u1, float v1,
+                                uint[] cornerLight, int flags, int cm, float size = 1f, short[] shorts = null)
+        {
+            int[] db = { 0, 1, 1, 0 }, dc = { 0, 0, 1, 1 };
+            var ab = (axis + 1) % 3; var ac = (axis + 2) % 3;
+            var d = m.VerticesCount;
+            for (var j = 0; j < 4; j++)
+            {
+                var o = (d + j) * 3;
+                m.xyz[o + axis] = plane;
+                m.xyz[o + ab] = b + db[j] * size;
+                m.xyz[o + ac] = c + dc[j] * size;
+                m.Uv[(d + j) * 2] = db[j] == 0 ? u0 : u1;
+                m.Uv[(d + j) * 2 + 1] = dc[j] == 0 ? v0 : v1;
+                var col = cornerLight[db[j] + 2 * dc[j]];
+                m.Rgba[(d + j) * 4] = (byte)col; m.Rgba[(d + j) * 4 + 1] = (byte)(col >> 8);
+                m.Rgba[(d + j) * 4 + 2] = (byte)(col >> 16); m.Rgba[(d + j) * 4 + 3] = (byte)(col >> 24);
+                m.Flags[d + j] = flags;
+                m.CustomInts.Values[d + j] = cm;
+                if (m.CustomShorts != null)
+                {
+                    m.CustomShorts.Values[(d + j) * 2] = shorts != null ? shorts[2 * j] : (short)1000;
+                    m.CustomShorts.Values[(d + j) * 2 + 1] = shorts != null ? shorts[2 * j + 1] : (short)2001;
+                }
+            }
+            Close(m, d);
+        }
+
+        /// <summary>Any quad, from twelve coordinates.</summary>
+        public static void Quad(MeshData m, float[] xyz, int flags, int cm)
+        {
+            var d = m.VerticesCount;
+            for (var j = 0; j < 4; j++)
+            {
+                var o = (d + j) * 3;
+                m.xyz[o] = xyz[j * 3]; m.xyz[o + 1] = xyz[j * 3 + 1]; m.xyz[o + 2] = xyz[j * 3 + 2];
+                m.Uv[(d + j) * 2] = 0.1f + 0.1f * (j & 1);
+                m.Uv[(d + j) * 2 + 1] = 0.2f + 0.1f * (j >> 1);
+                for (var k = 0; k < 4; k++) m.Rgba[(d + j) * 4 + k] = 255;
+                m.Flags[d + j] = flags;
+                m.CustomInts.Values[d + j] = cm;
+                if (m.CustomShorts != null) { m.CustomShorts.Values[(d + j) * 2] = 1000; m.CustomShorts.Values[(d + j) * 2 + 1] = 2001; }
+            }
+            Close(m, d);
+        }
+
+        private static void Close(MeshData m, int d)
+        {
+            m.CustomInts.Count = d + 4;
+            if (m.CustomShorts != null) m.CustomShorts.Count = (d + 4) * 2;
+            var i = m.IndicesCount;
+            m.Indices[i] = d; m.Indices[i + 1] = d + 1; m.Indices[i + 2] = d + 2;
+            m.Indices[i + 3] = d; m.Indices[i + 4] = d + 2; m.Indices[i + 5] = d + 3;
+            m.VerticesCount = d + 4;
+            m.IndicesCount = i + 6;
+        }
+
+        public static float Winding(MeshData m, int q, int axis)
+        {
+            var o = q * 12;
+            float ax = m.xyz[o + 3] - m.xyz[o], ay = m.xyz[o + 4] - m.xyz[o + 1], az = m.xyz[o + 5] - m.xyz[o + 2];
+            float bx = m.xyz[o + 9] - m.xyz[o], by = m.xyz[o + 10] - m.xyz[o + 1], bz = m.xyz[o + 11] - m.xyz[o + 2];
+            float[] cr = { ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx };
+            return cr[axis];
+        }
+
+        /// <summary>Decodes an axis-aligned square face: its axis, plane, min corner along (ab, ac), size and facing.</summary>
+        public static bool Decode(MeshData m, int q, out int axis, out float plane, out float minB, out float minC, out float size, out bool positive)
+        {
+            axis = -1; plane = minB = minC = size = 0; positive = false;
+            var v = q * 12;
+            for (var a = 0; a < 3; a++)
+            {
+                var p0 = m.xyz[v + a];
+                if (Math.Abs(m.xyz[v + 3 + a] - p0) < 1e-4 && Math.Abs(m.xyz[v + 6 + a] - p0) < 1e-4 && Math.Abs(m.xyz[v + 9 + a] - p0) < 1e-4)
+                {
+                    if (axis >= 0) return false;
+                    axis = a;
+                }
+            }
+            if (axis < 0) return false;
+            var ab = (axis + 1) % 3; var ac = (axis + 2) % 3;
+            plane = m.xyz[v + axis];
+            float maxB = float.MinValue, maxC = float.MinValue;
+            minB = float.MaxValue; minC = float.MaxValue;
+            for (var j = 0; j < 4; j++)
+            {
+                minB = Math.Min(minB, m.xyz[v + 3 * j + ab]); maxB = Math.Max(maxB, m.xyz[v + 3 * j + ab]);
+                minC = Math.Min(minC, m.xyz[v + 3 * j + ac]); maxC = Math.Max(maxC, m.xyz[v + 3 * j + ac]);
+            }
+            size = maxB - minB;
+            if (Math.Abs((maxC - minC) - size) > 1e-4) return false;
+            var f = m.Flags[q * 4];
+            var nx = ((f >> 14) & 7) * (((f >> 12) & 2) != 0 ? -1 : 1);
+            var ny = ((f >> 18) & 7) * (((f >> 16) & 2) != 0 ? -1 : 1);
+            var nz = ((f >> 22) & 7) * (((f >> 20) & 2) != 0 ? -1 : 1);
+            positive = (axis == 0 ? nx : axis == 1 ? ny : nz) > 0;
+            return true;
+        }
+
+        /// <summary>The column a terrain top face came from, encoded in its uv by <see cref="Terrain"/>.</summary>
+        public static (int x, int z) ColumnOf(MeshData m, int q)
+        {
+            var u = float.MaxValue;
+            for (var j = 0; j < 4; j++) u = Math.Min(u, m.Uv[(q * 4 + j) * 2]);
+            var col = (int)Math.Round(u * 2048f);
+            return (col / 32, col % 32);
+        }
+
+        /// <summary>
+        /// The engine's tesselation of a heightfield: one top per column (into tops, the
+        /// TopSoil part, its uv naming the column), a side face for every block above a lower
+        /// neighbour column (into sides, the Opaque part), nothing at the chunk boundary.
+        /// </summary>
+        public static void Terrain(int[,] h, MeshData tops, MeshData sides)
+        {
+            short[] grass = { 1000, 2001, 1200, 2001, 1200, 2200, 1000, 2200 };
+            for (var x = 0; x < 32; x++) for (var z = 0; z < 32; z++)
+            {
+                var hh = h[x, z];
+                var u0 = (x * 32 + z) / 2048f;
+                Face(tops, 1, hh + 1, z, x, u0, 0.5f, u0 + 1f / 4096f, 0.6f, Flat, Normal(1, true), 0x1234, 1f, grass);
+                if (x + 1 < 32) for (var y = h[x + 1, z] + 1; y <= hh; y++) Face(sides, 0, x + 1, y, z, 0.7f, 0.2f, 0.8f, 0.3f, Flat, Normal(0, true), 0x1234);
+                if (x - 1 >= 0) for (var y = h[x - 1, z] + 1; y <= hh; y++) Face(sides, 0, x, y, z, 0.7f, 0.2f, 0.8f, 0.3f, Flat, Normal(0, false), 0x1234);
+                if (z + 1 < 32) for (var y = h[x, z + 1] + 1; y <= hh; y++) Face(sides, 2, z + 1, x, y, 0.7f, 0.2f, 0.8f, 0.3f, Flat, Normal(2, true), 0x1234);
+                if (z - 1 >= 0) for (var y = h[x, z - 1] + 1; y <= hh; y++) Face(sides, 2, z, x, y, 0.7f, 0.2f, 0.8f, 0.3f, Flat, Normal(2, false), 0x1234);
+            }
+        }
+
+        /// <summary>
+        /// The picture the far lod must produce for a heightfield at cell size s, computed from
+        /// the heightmap alone: a cell is solid if any of its blocks is; the padding beside
+        /// and below the chunk is unknown and counts as solid, above it is air; every solid
+        /// cell faces every air neighbour. Tuples of (direction, cx, cy, cz).
+        /// </summary>
+        public static HashSet<(int, int, int, int)> ExpectedCells(int[,] h, int s)
+        {
+            var n = 32 / s;
+            bool Solid(int cx, int cy, int cz)
+            {
+                if (cx < 0 || cx >= n || cz < 0 || cz >= n || cy < 0) return true;
+                if (cy >= n) return false;
+                for (var dx = 0; dx < s; dx++) for (var dz = 0; dz < s; dz++)
+                    if (h[cx * s + dx, cz * s + dz] >= cy * s) return true;
+                return false;
+            }
+            var set = new HashSet<(int, int, int, int)>();
+            for (var cx = 0; cx < n; cx++) for (var cy = 0; cy < n; cy++) for (var cz = 0; cz < n; cz++)
+            {
+                if (!Solid(cx, cy, cz)) continue;
+                for (var dir = 0; dir < 6; dir++)
+                {
+                    var axis = dir >> 1; var step = (dir & 1) != 0 ? 1 : -1;
+                    var nx = cx + (axis == 0 ? step : 0); var ny = cy + (axis == 1 ? step : 0); var nz = cz + (axis == 2 ? step : 0);
+                    if (!Solid(nx, ny, nz)) set.Add((dir, cx, cy, cz));
+                }
+            }
+            return set;
+        }
+
+        /// <summary>Every output face as a cell tuple, checking that each is a square of size s on the cell grid.</summary>
+        public static HashSet<(int, int, int, int)> DecodeCells(FarLodSource[] sources, int s, out int tops, out int sides, out int topsInFirst, out int sidesInSecond)
+        {
+            tops = sides = topsInFirst = sidesInSecond = 0;
+            var set = new HashSet<(int, int, int, int)>();
+            for (var i = 0; i < sources.Length; i++)
+            {
+                var m = sources[i]?.Output;
+                if (m == null) continue;
+                for (var q = 0; q < m.VerticesCount / 4; q++)
+                {
+                    if (!Decode(m, q, out var axis, out var plane, out var minB, out var minC, out var size, out var positive))
+                        throw new Exception($"output face {q} of source {i} is not an axis-aligned square");
+                    if (size != s || plane % s != 0 || minB % s != 0 || minC % s != 0)
+                        throw new Exception($"output face {q} of source {i}: size {size} at plane {plane}, corner ({minB},{minC}) - not on the grid of {s}");
+                    var ab = (axis + 1) % 3; var ac = (axis + 2) % 3;
+                    var cell = new int[3];
+                    cell[axis] = positive ? (int)plane / s - 1 : (int)plane / s;
+                    cell[ab] = (int)minB / s;
+                    cell[ac] = (int)minC / s;
+                    var dir = axis * 2 + (positive ? 1 : 0);
+                    if (!set.Add((dir, cell[0], cell[1], cell[2]))) throw new Exception($"cell ({cell[0]},{cell[1]},{cell[2]}) got direction {dir} twice");
+                    if (axis == 1 && positive) { tops++; if (i == 0) topsInFirst++; }
+                    else { sides++; if (i == 1) sidesInSecond++; }
+                }
+            }
+            return set;
+        }
+
+        public static void SameSet(HashSet<(int, int, int, int)> expected, HashSet<(int, int, int, int)> got, string what)
+        {
+            var missing = new List<(int, int, int, int)>();
+            foreach (var e in expected) if (!got.Contains(e)) missing.Add(e);
+            var extra = new List<(int, int, int, int)>();
+            foreach (var g in got) if (!expected.Contains(g)) extra.Add(g);
+            if (missing.Count > 0 || extra.Count > 0)
+            {
+                string Show(List<(int, int, int, int)> l) { var sb = new System.Text.StringBuilder(); for (var i = 0; i < Math.Min(5, l.Count); i++) sb.Append($" (dir {l[i].Item1} cell {l[i].Item2},{l[i].Item3},{l[i].Item4})"); return sb.ToString(); }
+                throw new Exception($"{what}: {got.Count} faces against {expected.Count} expected - {missing.Count} missing{Show(missing)}; {extra.Count} extra{Show(extra)}");
+            }
+        }
     }
 
     private static FrustumCulling NewCuller()

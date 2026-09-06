@@ -279,13 +279,6 @@ public static class HitchLog
     }
 
     /// <summary>
-    /// The pause state at this frame boundary, sampled BEFORE the camera. A pending hitch whose
-    /// frame started or ended paused is dropped: the singleplayer pause menu stops the game
-    /// clock and the frame that spans it (or the one that leaves it) is menu time, not a
-    /// stutter. The previous boundary counts too, because the frame that closes the menu
-    /// begins paused and ends running.
-    /// </summary>
-    /// <summary>
     /// True while a pending hitch spent a quarter or more of its frame in the Ortho stage -
     /// the GUI - so the caller knows whether naming the open dialogs is worth a string.
     /// </summary>
@@ -304,6 +297,13 @@ public static class HitchLog
         if (pending.Buckets[Ortho] >= pending.FrameMs * 0.25) pending.Dialogs = names;
     }
 
+    /// <summary>
+    /// The pause state at this frame boundary, sampled BEFORE the camera. A pending hitch whose
+    /// frame started or ended paused is dropped: the singleplayer pause menu stops the game
+    /// clock and the frame that spans it (or the one that leaves it) is menu time, not a
+    /// stutter. The previous boundary counts too, because the frame that closes the menu
+    /// begins paused and ends running.
+    /// </summary>
     public static void NotePaused(bool paused)
     {
         if (hasPending && (paused || prevPaused))

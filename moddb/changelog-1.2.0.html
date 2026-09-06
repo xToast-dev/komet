@@ -1,0 +1,93 @@
+<!-- Changelog for the ModDB file upload of Komet_v1.2.0.zip. Paste into the file's changelog
+     field; works as plain text too if the field strips markup.
+     {{SHA256_KOMET}}, {{SHA256_BASELINE}} and {{COMMIT}} are filled in by ./build.sh release,
+     which writes the finished file to dist/ - the checksum cannot be committed here, because
+     committing it would change the commit and therefore the checksum.
+     This is the combined changelog for 1.2.0-pre.1 through pre.4 and everything after them. -->
+<p><em>Everything since 1.1.0, in one list.</em> The four pre-releases and the work after them
+add up to: a far LOD that finally fixes the frame rate when you look at the horizon, the GPU
+side of the shadow passes, a worker pool instead of four thread sets, a measurement layer that
+can now answer &ldquo;CPU or GPU?&rdquo; and &ldquo;which of my mods?&rdquo;, and two crashes
+that should never have shipped.</p>
+
+<p><strong>The headline: a far LOD</strong></p>
+<ul>
+<li><strong>Beyond the far distance a chunk is drawn as cells of two blocks, beyond twice that as cells of four.</strong> At view distance 1536 the camera pass drew 16,1 million triangles when looking at the horizon, 12,7 million of them beyond 640 blocks &mdash; where a block covers one to three pixels and the chunk vertex shader still exports thirteen vec4 and evaluates 3D noise for each of them.</li>
+<li><strong>Measured in the same scene, same session: 53 &rarr; 113 fps</strong> (19,0 &rarr; 8,9 ms/frame), camera-pass triangles 16,1 &rarr; 6,9 million, GPU frame 14,9 &rarr; 7,0 ms, and the camera opaque pass &mdash; timed bottom-of-pipe with a GPU elapsed query &mdash; 11,7 &rarr; 4,2 ms.</li>
+<li>The picture is built from what the engine already tesselated, on the tesselation thread: unit faces mark their block solid, air floods through the rest, a cell is solid if any of its blocks is, and each solid cell gets one face per air neighbour carrying a real source face's texture, light and colour map. <strong>No shader is touched.</strong></li>
+<li>Plants, leaves, stairs and fences keep one representative per cell, scaled to fill it &mdash; a tree stays a tree, a house stays a house. The picture is never thinner than the world, only up to a block fatter, which is why chunks at different levels never leave a gap.</li>
+<li>The engine's own meshes are not modified and not re-tesselated: they simply stop at the far distance. Switch the feature off and they are drawn everywhere again on the next frame. The shadow maps always use the engine's meshes, never the pictures.</li>
+<li>Costs about 1,3 ms per chunk on the tesselation thread and roughly a third more vertices in the mesh pools. <code>FarMesh</code>, <code>FarMeshDistance</code>, <code>FarMeshTier2</code>; <code>.komet farmesh &lt;blocks|off|on&gt;</code> and <code>.komet toggle farlod2</code> live.</li>
+</ul>
+
+<p><strong>Faster</strong></p>
+<ul>
+<li><strong>One dynamic worker pool instead of four thread sets that could not see each other.</strong> Five cull helpers, four occlusion helpers, a window-prebuild thread and a prefetch thread became one pool whose workers take whichever job is worth most. Same sweep on fewer threads: <strong>0,70 ms against 0,77 ms</strong>, and the workload that holds cores for milliseconds can no longer starve the one on the frame's deadline.</li>
+<li><strong>The far shadow map is no longer redrawn on every frame while you move.</strong> It was kept for a few frames and reprojected exactly, but a reprojection cannot extend what a kept map <em>covers</em> &mdash; so 15 cm of camera movement forced a redraw and the saving existed only while standing still. The map is now drawn 16 blocks wider than the fade needs, which is exactly the room the camera needs, and the redraw threshold rises with it.</li>
+<li><strong>The near shadow cascade gets a map of its own size</strong> (4096 px). The engine allocated both cascades from one expression, so a cascade covering the 39 blocks around you had over a hundred texels per block against the far map's fifteen.</li>
+<li><strong>The solid shadow passes use a depth-only shader and back-face culling.</strong> The engine's shadow shader samples the terrain texture and discards for every fragment of every pass; a closed block's back faces sit behind its front faces along the light ray too. Same depth map, half the faces, no texture fetch. Leaves and grass keep the engine's shader and cast from both sides.</li>
+<li><strong>The near cascade stops drawing what cannot cast a shadow on anything visible</strong> &mdash; the half of its depth range that faces away from the light, and casters that cannot reach a receiver on screen.</li>
+<li><strong>Far-detail stand-in geometry stays out of the shadow maps</strong> where the detailed version is already in them, decided per grid cell. On by default now; the old per-pool test never fired in a streamed world.</li>
+<li><strong>A new creature type no longer costs a hitch the first time you see one.</strong> The engine builds an animation's frames on the main thread the moment it first plays: 12 ms for a rooster, 53 ms for a pig, always in the frame the animal comes into view. They are now built on a worker while the entity is still held back.</li>
+<li><strong>The edge-repair sweep stopped rehashing the whole tesselation queue</strong> every 50 ms (4,6&times; to 7,3&times; on that sweep), the <strong>neighbour prefetcher</strong> stopped re-walking the same queue front hundreds of times a second, and the <strong>window prebuilder</strong> now predicts the chunk the tesselator will really mesh.</li>
+<li><strong>World joins hitch less</strong> and entities are finished under a per-frame budget, nearest one first. Distant creatures animate every second or third frame with the skipped time folded in &mdash; same speed, sampled less.</li>
+<li><strong>Server packets that are not chunk data</strong> run under a per-frame budget instead of stopping one frame dead, and the hitch that remains names the packet type behind it.</li>
+<li><strong>Less garbage per chunk.</strong> The mesh buffer recycler, tight clones, a pooled extras store and now the far LOD's own output arrays: <strong>45,6 KB &rarr; 0,8 KB allocated per chunk build</strong>, measured against a real recycler.</li>
+<li><strong>Particle instance buffers are renamed instead of waited on</strong>, so a frame does not block on a buffer the GPU is still reading.</li>
+</ul>
+
+<p><strong>New</strong></p>
+<ul>
+<li><strong>A performance window on <code>.komet</code> and Ctrl+F7</strong> &mdash; nineteen pages, one per question, with every switch flippable in place. It takes no measurement of its own; the blocks it draws are the same methods the overlay and the report call.</li>
+<li><strong>A mod profiler with its own HUD (Shift+F7).</strong> Which of <em>your</em> mods costs what per frame, what each one does (patched methods, registered classes) and what it cost during loading, client and integrated server separately. <code>.komet mods</code> prints it as text for a bug report.</li>
+<li><strong>1 % and 0,1 % lows, and a live frametime graph</strong>, next to the averages the mod always showed &mdash; the numbers that describe stutter rather than throughput.</li>
+<li><strong>A three-way answer to &ldquo;CPU-bound or GPU-bound?&rdquo;</strong>: GPU time per render stage, the driver's own busy figure where the system exposes it, and per-pass GPU timings measured bottom-of-pipe with fragment counts &mdash; the one measurement that tells fill rate from geometry without arguing.</li>
+<li><strong>The camera pass's triangles by render pass, distance band and LOD level</strong>, which is what turned &ldquo;the horizon is slow&rdquo; into a number and then into the far LOD.</li>
+<li><strong><code>.komet alloctrace [seconds]</code></strong> &mdash; the process records its own allocations with call stacks into a file next to the logs.</li>
+<li><strong>Komet notices when another mod patches the same engine method</strong> and says so once, with a severity and a reason, and fingerprints the engine at world start so a game update that changed a patched method is named instead of silently misbehaving. <code>.komet conflicts</code> lists it.</li>
+<li><strong>A warning at world join when Optimum or OptiTime is present.</strong> Both replace the same engine code, each unaware of the other; finding that out used to need a bisect. Komet stays enabled &mdash; which side should win is your call.</li>
+<li><strong>The HUD and the chat replies speak German</strong> when the game does. Logs, reports and hitch lines stay English on purpose: they end up in bug reports.</li>
+<li><strong>Server-side sync tuning for singleplayer</strong> &mdash; position updates thin out with distance, entity tracking gets a hysteresis band, attribute paths whose bytes did not change are not sent.</li>
+<li><strong>Live knobs for the visual trades</strong>, all reversible mid-session: <code>.komet farmesh</code>, <code>.komet foliagerange</code>, <code>.komet shadowfoliagerange</code>, <code>.komet shadownear</code>, <code>.komet shadowneardepth</code>, and a toggle table that lists every one of them with what it does.</li>
+</ul>
+
+<p><strong>Fixed</strong></p>
+<ul>
+<li><strong>Crash on joining a world</strong> (<code>NullReferenceException</code> in <code>WeatherSystemClient</code>). The new task budget could spread a join's backlog over frames and let a renderer draw before the packet that initialises it had run. Joining is lifecycle, not load: the budget now starts only once the world is finalised.</li>
+<li><strong>Crash on the first frame with the Optimum client build</strong> (<code>MissingFieldException: ClientMain.MainThreadTasksLock</code>). The fork declares that field with a different type. It is now read by name and locked the way its type demands.</li>
+<li><strong>A German client's log filled with &ldquo;Translation string format exception&rdquo;</strong> &mdash; an error and a warning per HUD refresh for every label with a number, thousands per session.</li>
+<li><strong>Two budgets could stop for good instead of falling back.</strong> If their frame-boundary reset ever stopped arriving, entity tesselation skipped every further shape and held entities never loaded. Both now detect it, run vanilla and count it. A budget that loses its reset has to degrade to slower, never to never.</li>
+<li><strong>The patch guard was quiet about the collisions that matter most</strong> &mdash; where Komet replaces an engine method outright, another mod's transpiler never runs. Reported as high severity now, with the reason.</li>
+<li><strong>One malformed animation no longer costs a creature its whole warm-up</strong>, and the shadow cull range no longer forgot the light eye's 50-block offset.</li>
+<li><strong>Two toggles reported success and did nothing.</strong> Several measurements were booked to the wrong place: particles folded twice, GPU timing and GC statistics while the HUD was closed, mesh pool allocations, hitches in the 2D stage now name the dialog that caused them, and no more false hitch reports while the pause menu is open.</li>
+</ul>
+
+<p><strong>Changed</strong></p>
+<ul>
+<li><strong>Config layout is now version 26</strong> (a great many new settings since 1.1.0). An existing <code>komet.json</code> is backed up next to itself and regenerated from the current defaults &mdash; re-apply your custom values afterwards.</li>
+<li><strong><code>CullingThreads</code> and <code>OcclusionCullingThreads</code> are gone</strong>, replaced by the worker pool's own sizing (physical cores minus two, so the render and tesselation threads keep theirs).</li>
+<li><strong>The mod zip is stored, not compressed</strong> (~180 KB &rarr; ~450 KB). Identical data does not give identical deflate streams across zlib implementations, so compressing would make the checksum below unreproducible on a different machine.</li>
+<li>Minimum game version stays 1.22.0. Built and verified against 1.22.7; on other 1.22.x builds any patch whose engine code changed logs a warning and switches itself off individually.</li>
+</ul>
+
+<p><strong>Internals</strong></p>
+<ul>
+<li>The culling core is still proved <strong>byte-identical to vanilla</strong> on every build &mdash; 3.120/3.120 sweeps with identical triangles in identical order, 1.440/1.440 with the pool-box early-out, 2.304/2.304 pixel-equivalent gap merges &mdash; and the far LOD's picture is checked against the cell picture computed from a heightmap alone, on twelve random terrains, at both levels.</li>
+<li>Every build runs on GitHub Actions: both mods built, the full patch and behaviour suite executed against the real game assemblies, the packaged zips attached to the run.</li>
+<li>Release builds are reproducible: the same commit produces the same bytes, so the checksum below can be recomputed rather than merely trusted.</li>
+</ul>
+
+<p><strong>Verify your download</strong></p>
+<p>SHA-256 of the files on this page:</p>
+<pre>{{SHA256_KOMET}}  Komet_v1.2.0.zip
+{{SHA256_BASELINE}}  KometBaseline_v1.1.0.zip</pre>
+<p>Check it with <code>sha256sum Komet_v1.2.0.zip</code> (Linux) or
+<code>Get-FileHash Komet_v1.2.0.zip</code> (Windows PowerShell).</p>
+<p>This page is not the only place that asserts them.
+<a href="https://github.com/xToast-dev/komet/releases">github.com/xToast-dev/komet/releases</a>
+carries the same numbers in the release notes and as <code>.sha256</code> files next to the
+downloads, written by the build job rather than typed in by hand &mdash; so the checksum here
+and the checksum there have to agree, and neither was produced by whoever wrote this page.</p>
+<p>Beyond comparing, you can reproduce it: check out <code>{{COMMIT}}</code>, run
+<code>./build.sh release</code>, and the file comes out with exactly the checksum above &mdash;
+on any machine.</p>
